@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from cairn.server.source_models import SourceSnapshot
+
 
 class Settings(BaseModel):
     intent_timeout: int = Field(ge=5)
@@ -64,6 +66,7 @@ class ProjectDetail(BaseModel):
     facts: list[Fact]
     intents: list[Intent]
     hints: list[Hint]
+    sources: list[SourceSnapshot] = Field(default_factory=list)
 
 
 class CreateHintInline(BaseModel):

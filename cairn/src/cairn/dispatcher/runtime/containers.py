@@ -50,6 +50,14 @@ class ContainerManager:
             return name
         LOG.info("creating container project=%s container=%s image=%s", project_id, name, self._config.image)
         try:
+            volumes = None
+            if self._config.artifact_volume:
+                volumes = {
+                    self._config.artifact_volume: {
+                        "bind": self._config.artifact_mount_path,
+                        "mode": "ro",
+                    }
+                }
             self._client.containers.run(
                 self._config.image,
                 ["sleep", "infinity"],
@@ -57,6 +65,7 @@ class ContainerManager:
                 name=name,
                 network_mode=self._config.network_mode,
                 cap_add=self._config.cap_add or None,
+                volumes=volumes,
             )
             LOG.info("created container project=%s container=%s", project_id, name)
             return name
@@ -85,6 +94,14 @@ class ContainerManager:
         name = f"{self._STARTUP_PREFIX}{uuid.uuid4().hex[:12]}"
         LOG.debug("creating startup healthcheck container container=%s image=%s", name, self._config.image)
         try:
+            volumes = None
+            if self._config.artifact_volume:
+                volumes = {
+                    self._config.artifact_volume: {
+                        "bind": self._config.artifact_mount_path,
+                        "mode": "ro",
+                    }
+                }
             self._client.containers.run(
                 self._config.image,
                 ["sleep", "infinity"],
@@ -92,6 +109,7 @@ class ContainerManager:
                 name=name,
                 network_mode=self._config.network_mode,
                 cap_add=self._config.cap_add or None,
+                volumes=volumes,
             )
         except DockerException as exc:
             raise RuntimeError(f"failed to create startup container {name}: {exc}") from exc

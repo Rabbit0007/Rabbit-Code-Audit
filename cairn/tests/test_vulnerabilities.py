@@ -684,7 +684,7 @@ def test_export_markdown_content_and_scope(client, populated):
     assert "text/markdown" in resp.headers["content-type"]
     assert "p1.md" in resp.headers["content-disposition"]
     text = resp.text
-    assert text.startswith("# Alpha - 渗透测试漏洞报告")
+    assert text.startswith("# Alpha - 代码审计报告")
     assert "## 报告概览" in text
     assert "## 漏洞清单" in text
     assert "## 项目：Alpha（`p1`）" in text
@@ -777,7 +777,7 @@ def test_export_default_format_is_json(client, populated):
 
 
 def test_refresh_rescans_and_returns_summary(client, temp_db):
-    """POST /refresh re-scans facts and returns the updated summary."""
+    """POST /refresh never promotes fact keywords into reportable findings."""
     _insert_project("p1", "Alpha")
     _insert_fact("f1", "p1", CRITICAL_DESC)
     _insert_fact("f2", "p1", HIGH_DESC)
@@ -787,12 +787,12 @@ def test_refresh_rescans_and_returns_summary(client, temp_db):
 
     resp = client.post("/api/vulnerabilities/refresh")
     assert resp.status_code == 200
-    assert resp.json() == {"critical": 1, "high": 1, "medium": 0, "low": 0}
-    assert _count_vulns() == 2
+    assert resp.json() == {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    assert _count_vulns() == 0
 
 
 def test_refresh_picks_up_new_facts(client, temp_db):
-    """A second refresh reflects facts added after the first scan."""
+    """A second refresh still leaves unreviewed facts out of the report."""
     _insert_project("p1", "Alpha")
     _insert_fact("f1", "p1", CRITICAL_DESC)
     client.post("/api/vulnerabilities/refresh")
@@ -800,4 +800,4 @@ def test_refresh_picks_up_new_facts(client, temp_db):
     _insert_fact("f2", "p1", MEDIUM_DESC)
     resp = client.post("/api/vulnerabilities/refresh")
     assert resp.status_code == 200
-    assert resp.json() == {"critical": 1, "high": 0, "medium": 1, "low": 0}
+    assert resp.json() == {"critical": 0, "high": 0, "medium": 0, "low": 0}

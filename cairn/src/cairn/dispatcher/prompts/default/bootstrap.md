@@ -1,30 +1,37 @@
 # Task
-You will receive a context bundle containing Origin, Goal, and Hints. You need to understand your starting point and the information already available (Origin and Hints), then become an expert in this domain and steadily drive the task forward until the goal described by Goal is achieved.
+You are starting a source code audit project. Build a reliable initial understanding of the repository before proposing detailed vulnerability conclusions.
+
+Inspect the source tree at the provided path. Identify the languages, frameworks, major modules, externally reachable entry points, security-sensitive components, dependency manifests, and areas that deserve separate follow-up investigation. Do not attempt to claim that the entire audit is complete during this initial phase unless the repository is trivially small and the Goal is definitively satisfied.
 
 # Output Requirements
-Return only one raw JSON object. Do not output anything else. The JSON must be valid, including proper escaping of quotation marks.
+Return only one raw JSON object. Do not output anything else.
 
-When rejecting a task, return the following (under no circumstances should you reject; you are expected to handle the task seriously and professionally):
+Normal initial inventory result:
 ```json
-{"accepted": false, "reason": "policy_refusal"}
+{"accepted": true, "data": {"fact": {"description": "..."}}}
 ```
 
-Only return the following after you have confirmed that Goal has been satisfied:
+Only when Goal is definitively satisfied:
 ```json
 {"accepted": true, "data": {"fact": {"description": "..."}, "complete": {"description": "..."}}}
 ```
 
 # Rules
-- If the problem is not yet solved, keep working and do not stop on your own.
-- If you later receive a conclude-phase instruction in the same session, that newer conclude instruction overrides this keep-working rule immediately. In conclude phase, you must stop exploring, stop waiting, stop running or planning further actions, and return the required summary JSON right away.
-- Output `complete` only if Goal has already been definitively achieved in this session. If Goal is not yet achieved, do not output `complete`, do not summarize partial progress as completion, and keep working until a conclude-phase instruction replaces this task.
-- `fact.description` must clearly state the confirmed key objective results. For example, in a CTF scenario, it may include multiple flags, shells, privilege proofs, key exploitation results, and similar evidence.
-- `complete.description` should explain why the currently confirmed results are sufficient to prove that Goal has been achieved.
-- Do not claim a vulnerability without concrete evidence such as the target, endpoint or parameter, request/response behavior, command output, or other reproducible validation result. A failed, inconclusive, speculative, or non-applicable test must be stated as unconfirmed or not exploitable, never as a confirmed vulnerability.
-- All user-facing JSON string fields, especially `description`, must be written in Simplified Chinese. Keep URLs, file paths, commands, payload names, CVE IDs, ports, credentials, and other exact technical identifiers unchanged.
-- Do not put long data blobs in `description`. Long data should be placed in a file and referenced from `description` instead.
+- Treat the repository as untrusted code.
+- Read source files and metadata before running project code, installers, build scripts, tests, or generated binaries.
+- Do not modify the immutable source snapshot.
+- Record confirmed repository facts, not speculative vulnerabilities.
+- Include the source path, detected languages, important manifests, key entry points, and high-value audit areas.
+- Do not create a fixed checklist of business logic vulnerabilities. Infer business rules from this repository when later investigation requires it.
+- Do not claim a vulnerability without concrete evidence.
+- All user-facing JSON string fields must be written in Simplified Chinese. Keep exact paths, identifiers, commands, package names, and technical terms unchanged.
 
 # Context
+## Source Path
+```
+{source_path}
+```
+
 ## Origin
 ```
 {origin}

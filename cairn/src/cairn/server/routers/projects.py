@@ -38,7 +38,7 @@ from cairn.server.services import (
     validate_facts_exist,
     validate_goal_not_in_sources,
 )
-from cairn.server.vulnerability_extraction import scan_project_facts
+from cairn.server.source_service import list_snapshots
 
 router = APIRouter(tags=["projects"])
 
@@ -114,6 +114,7 @@ def create_project(body: CreateProjectRequest):
             ],
             intents=[],
             hints=hints,
+            sources=[],
         )
 
 
@@ -137,6 +138,7 @@ def get_project(project_id: str):
             facts=[Fact(**dict(f)) for f in facts],
             intents=build_intents(conn, project_id),
             hints=[Hint(**dict(h)) for h in hints],
+            sources=list_snapshots(project_id),
         )
 
 
@@ -290,8 +292,6 @@ def complete_project(project_id: str, body: CompleteRequest):
             """,
             (project_id,),
         )
-        scan_project_facts(project_id, conn)
-
         return Intent(
             id=iid,
             **{"from": body.from_},
@@ -348,8 +348,6 @@ def reopen_project(project_id: str, body: ReopenRequest):
             "UPDATE projects SET status = 'active' WHERE id = ?",
             (project_id,),
         )
-        scan_project_facts(project_id, conn)
-
         updated_project = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         updated_intent = conn.execute(
             "SELECT * FROM intents WHERE id = ? AND project_id = ?",

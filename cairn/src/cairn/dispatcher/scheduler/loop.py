@@ -292,6 +292,14 @@ class DispatcherLoop:
                 project.project.status,
             )
             return False
+        if not any(source.status == "ready" for source in project.sources):
+            self._log_changed(
+                f"{skip_scope}:source_not_ready",
+                logging.INFO,
+                "skip project=%s because no ready source snapshot is available",
+                summary.id,
+            )
+            return False
         if self._is_initial_project(project):
             if project.project.reason is not None:
                 return False

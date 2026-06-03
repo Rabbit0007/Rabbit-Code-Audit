@@ -20,9 +20,11 @@ tasks:
     conclude_timeout: 5
 
 container:
-  image: "ghcr.io/oritera/cairn-worker-container:latest"
-  network_mode: "host"
+  image: "rabbit-code-audit-worker:latest"
+  network_mode: "bridge"
   completed_action: "stop"
+  artifact_volume: "rabbit-code-audit-data"
+  artifact_mount_path: "/audit-data"
   cap_add:
     - "NET_RAW"
     - "NET_ADMIN"

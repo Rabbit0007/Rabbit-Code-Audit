@@ -37,8 +37,6 @@ from cairn.server.vulnerabilities_models import (
     VulnerabilityStatus,
     VulnerabilityStatusUpdate,
 )
-from cairn.server.vulnerability_extraction import scan_all_projects
-
 router = APIRouter(prefix="/api/vulnerabilities", tags=["vulnerabilities"])
 
 # Display ordering for the report: most severe first, then most recently
@@ -851,7 +849,7 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
     lines: list[str] = [
         f"# {_report_title(vulnerabilities)}",
         "",
-        "> Rabbit 自动化安全探索生成的漏洞报告。报告按项目和漏洞组织，包含确认事实、关键证据、证明数据包与漏洞浮现过程。",
+        "> Rabbit Code Audit 生成的代码审计报告。报告仅包含经过复核确认的发现，并保留关键证据与审计过程。",
         "",
         "## 目录",
         "",
@@ -981,11 +979,11 @@ _SEVERITY_LABELS = {
 
 def _report_title(vulnerabilities: list[Vulnerability]) -> str:
     if len(vulnerabilities) == 1:
-        return f"{vulnerabilities[0].project_name} - 单漏洞验证报告"
+        return f"{vulnerabilities[0].project_name} - 单项代码审计报告"
     projects = _unique([v.project_name for v in vulnerabilities])
     if len(projects) == 1:
-        return f"{projects[0]} - 渗透测试漏洞报告"
-    return "Rabbit 渗透测试漏洞报告"
+        return f"{projects[0]} - 代码审计报告"
+    return "Rabbit Code Audit 代码审计报告"
 
 
 def _project_groups(vulnerabilities: list[Vulnerability]) -> list[tuple[str, str, list[Vulnerability]]]:
@@ -1024,6 +1022,15 @@ def update_vulnerability_status(
     fact_ids = target.related_fact_ids or [target.fact_id]
     placeholders = ",".join("?" for _ in fact_ids)
     with get_conn() as conn:
+        audit_finding = conn.execute(
+            "SELECT id FROM audit_findings WHERE id = ?",
+            (vulnerability_id,),
+        ).fetchone()
+        if audit_finding is not None and payload.status == "ignored":
+            conn.execute(
+                "UPDATE audit_findings SET status = 'rejected' WHERE id = ?",
+                (vulnerability_id,),
+            )
         conn.execute(
             f"""
             UPDATE vulnerabilities
@@ -1046,7 +1053,7 @@ def update_vulnerability_status(
 def _report_lines(vulnerabilities: list[Vulnerability]) -> list[str]:
     counts = _summarize(vulnerabilities)
     lines = [
-        "Rabbit 漏洞报告",
+        "Rabbit 代码审计报告",
         "",
         "报告概览",
         f"严重：{counts['critical']}  高危：{counts['high']}  中危：{counts['medium']}  低危：{counts['low']}",
@@ -1477,7 +1484,7 @@ def _record_export(
         pass
     record_audit(
         "vulnerability.export",
-        f"导出漏洞报告（{fmt.upper()}）· {scope}",
+        f"导出代码审计报告（{fmt.upper()}）· {scope}",
         target_type="export",
         target_id=filename,
     )
@@ -1626,15 +1633,10 @@ def export_vulnerabilities(
 
 @router.post("/refresh")
 def refresh_vulnerabilities() -> VulnerabilitySummary:
-    """Re-scan all project facts and return the refreshed per-severity summary.
+    """Return the current report summary.
 
-    Delegates to the existing extraction service's
-    :func:`~cairn.server.vulnerability_extraction.scan_all_projects`, which
-    reconciles the ``vulnerabilities`` table against the current facts for every
-    project (re-classifying matches and removing stale findings). The response
-    is the updated summary so callers can reflect the new totals without a
-    separate request to ``/summary``.
+    Code-audit reports are populated only when an audit finding is independently
+    confirmed. Facts remain navigation evidence and are never promoted by a
+    keyword classifier.
     """
-    scan_all_projects()
-
     return vulnerabilities_summary()

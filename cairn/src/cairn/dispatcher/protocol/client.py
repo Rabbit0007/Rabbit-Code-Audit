@@ -128,6 +128,33 @@ class CairnClient:
             json={"from": from_ids, "description": description, "creator": creator, "worker": None},
         )
 
+    def create_audit_finding(self, project_id: str, payload: dict[str, Any]) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/projects/{project_id}/audit-findings",
+            json=payload,
+        )
+
+    def create_tool_finding(self, project_id: str, payload: dict[str, Any]) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/projects/{project_id}/tool-findings",
+            json=payload,
+        )
+
+    def review_audit_finding(
+        self,
+        project_id: str,
+        finding_id: str,
+        reviewer: str,
+        decision: str,
+    ) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/projects/{project_id}/audit-findings/{finding_id}/review",
+            json={"reviewer": reviewer, "decision": decision},
+        )
+
     def _request_json(self, method: str, path: str, json: dict[str, Any]) -> ApiResult:
         try:
             response = self._session().request(

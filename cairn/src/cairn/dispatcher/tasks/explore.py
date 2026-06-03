@@ -156,7 +156,7 @@ def run_explore_task(
             try:
                 model_output = driver.extract_response_text(first.stdout, first.stderr)
                 payload = parse_json_output(model_output)
-                kind, description = validate_explore_payload(payload)
+                kind, result_data = validate_explore_payload(payload)
             except Exception as exc:
                 LOG.warning(
                     "explore parse failed project=%s intent=%s worker=%s error=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -195,12 +195,12 @@ def run_explore_task(
                 )
                 best_effort_release(client, project.project.id, intent.id, worker.name)
                 return "rejected"
-            return write_conclude_result(
+            return _write_explore_result(
                 client,
                 project.project.id,
                 intent.id,
                 worker.name,
-                description,
+                result_data,
                 source="explore_execute",
                 phase_ms=execute_ms,
                 total_ms=int((time.perf_counter() - task_started) * 1000),
@@ -361,7 +361,7 @@ def _try_conclude_fallback(
     try:
         model_output = driver.extract_response_text(result.stdout, result.stderr)
         payload = parse_json_output(model_output)
-        kind, description = validate_explore_payload(payload)
+        kind, result_data = validate_explore_payload(payload)
     except Exception as exc:
         LOG.warning(
             "conclude parse failed project=%s intent=%s worker=%s error=%s conclude_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -386,15 +386,105 @@ def _try_conclude_fallback(
         )
         best_effort_release(client, project_id, intent.id, worker.name)
         return "rejected"
-    return write_conclude_result(
+    return _write_explore_result(
         client,
         project_id,
         intent.id,
         worker.name,
-        description,
+        result_data,
         source="explore_conclude",
         phase_ms=conclude_ms,
     )
+
+
+def _write_explore_result(
+    client: CairnClient,
+    project_id: str,
+    intent_id: str,
+    worker_name: str,
+    result_data: dict | None,
+    *,
+    source: str,
+    phase_ms: int,
+    total_ms: int | None = None,
+) -> str:
+    if not result_data:
+        return "failed"
+    status = write_conclude_result(
+        client,
+        project_id,
+        intent_id,
+        worker_name,
+        result_data["description"],
+        source=source,
+        phase_ms=phase_ms,
+        total_ms=total_ms,
+    )
+    if status != "success":
+        return status
+
+    finding = result_data.get("finding")
+    review = result_data.get("review")
+    tool_findings = result_data.get("tool_findings") or []
+    snapshot = None
+    if finding or tool_findings:
+        project = client.get_project(project_id)
+        snapshot = next((item for item in project.sources if item.status == "ready"), None)
+        if snapshot is None:
+            LOG.warning("skip findings without ready snapshot project=%s worker=%s", project_id, worker_name)
+            return status
+
+    for tool_finding in tool_findings:
+        response = client.create_tool_finding(
+            project_id,
+            {
+                **tool_finding,
+                "snapshot_id": snapshot.id,
+            },
+        )
+        if not response.ok:
+            LOG.warning(
+                "tool finding write failed project=%s worker=%s status=%s body=%s",
+                project_id,
+                worker_name,
+                response.status_code,
+                response.text,
+            )
+
+    if finding:
+        response = client.create_audit_finding(
+            project_id,
+            {
+                **finding,
+                "snapshot_id": snapshot.id,
+                "discovered_by": worker_name,
+            },
+        )
+        if not response.ok:
+            LOG.warning(
+                "audit finding write failed project=%s worker=%s status=%s body=%s",
+                project_id,
+                worker_name,
+                response.status_code,
+                response.text,
+            )
+    elif review:
+        response = client.review_audit_finding(
+            project_id,
+            review["finding_id"],
+            worker_name,
+            review["decision"],
+        )
+        if not response.ok:
+            LOG.warning(
+                "audit finding review failed project=%s finding=%s worker=%s status=%s body=%s",
+                project_id,
+                review["finding_id"],
+                worker_name,
+                response.status_code,
+                response.text,
+            )
+    return status
 
 
 def _run_process(

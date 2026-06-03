@@ -12,10 +12,12 @@ from cairn.server.routers import (
     auth,
     activity,
     export,
+    findings,
     hints,
     intents,
     projects,
     settings,
+    sources,
     templates,
     timeline,
     vulnerabilities,
@@ -34,8 +36,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Cairn",
-    description="Fact-graph based collaborative exploration protocol",
+    title="Rabbit Code Audit",
+    description="Fact-graph based collaborative source code audit system",
     version=__version__,
     lifespan=lifespan,
 )
@@ -56,9 +58,11 @@ _protected = [Depends(require_auth)]
 
 app.include_router(settings.router, dependencies=_protected)
 app.include_router(projects.router, dependencies=_protected)
+app.include_router(sources.router, dependencies=_protected)
 app.include_router(hints.router, dependencies=_protected)
 app.include_router(intents.router, dependencies=_protected)
 app.include_router(export.router, dependencies=_protected)
+app.include_router(findings.router, dependencies=_protected)
 app.include_router(vulnerabilities.router, dependencies=_protected)
 app.include_router(workers.router, dependencies=_protected)
 app.include_router(templates.router, dependencies=_protected)

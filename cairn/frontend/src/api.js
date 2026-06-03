@@ -1,13 +1,14 @@
 export async function apiRequest(path, options = {}) {
   const { method = "GET", body, headers = {} } = options;
+  const formData = body instanceof FormData;
   const response = await fetch(path, {
     method,
     credentials: "same-origin",
     headers: {
-      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+      ...(body !== undefined && !formData ? { "Content-Type": "application/json" } : {}),
       ...headers,
     },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
+    body: body !== undefined ? (formData ? body : JSON.stringify(body)) : undefined,
   });
 
   if (response.status === 204) {

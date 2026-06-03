@@ -88,15 +88,20 @@ def configure(path: Path) -> None:
     _db_path = path
     _db_path.parent.mkdir(parents=True, exist_ok=True)
     with get_conn() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+
+
+def current_path() -> Path:
+    return _db_path or DEFAULT_DB
 
 
 @contextmanager
 def get_conn() -> Generator[sqlite3.Connection, None, None]:
     assert _db_path is not None
-    conn = sqlite3.connect(str(_db_path))
+    conn = sqlite3.connect(str(_db_path), timeout=5.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
     try:
         yield conn

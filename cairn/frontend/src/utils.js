@@ -3,6 +3,7 @@ export const SEVERITY_META = {
   high: { label: "高危", tone: "high" },
   medium: { label: "中危", tone: "medium" },
   low: { label: "低危", tone: "low" },
+  info: { label: "信息", tone: "info" },
 };
 
 export const STATUS_META = {
@@ -38,6 +39,20 @@ export function formatTime(value) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(date);
+}
+
+export function formatBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = bytes;
+  let unit = "B";
+  for (const next of units) {
+    size /= 1024;
+    unit = next;
+    if (size < 1024) break;
+  }
+  return `${size >= 10 ? size.toFixed(1) : size.toFixed(2)} ${unit}`;
 }
 
 export function relativeHeartbeat(seconds) {

@@ -129,6 +129,88 @@ CREATE INDEX IF NOT EXISTS idx_notifications_time
     ON notifications(created_at);
 CREATE INDEX IF NOT EXISTS idx_notifications_read
     ON notifications(read);
+
+CREATE TABLE IF NOT EXISTS source_snapshots (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    source_type TEXT NOT NULL CHECK(source_type IN ('git', 'zip')),
+    original_name TEXT,
+    repository_url TEXT,
+    requested_ref TEXT,
+    resolved_commit TEXT,
+    archive_sha256 TEXT,
+    snapshot_sha256 TEXT,
+    status TEXT NOT NULL CHECK(status IN ('importing', 'ready', 'failed')),
+    file_count INTEGER NOT NULL DEFAULT 0,
+    total_bytes INTEGER NOT NULL DEFAULT 0,
+    detected_languages_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_snapshots_project
+    ON source_snapshots(project_id, created_at);
+
+CREATE TABLE IF NOT EXISTS code_files (
+    snapshot_id TEXT NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    language TEXT,
+    is_binary INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (snapshot_id, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_files_language
+    ON code_files(snapshot_id, language);
+
+CREATE TABLE IF NOT EXISTS tool_findings (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    snapshot_id TEXT NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
+    tool_name TEXT NOT NULL,
+    rule_id TEXT,
+    severity TEXT NOT NULL DEFAULT 'info'
+        CHECK(severity IN ('critical', 'high', 'medium', 'low', 'info')),
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    file_path TEXT,
+    line_start INTEGER,
+    line_end INTEGER,
+    status TEXT NOT NULL DEFAULT 'candidate'
+        CHECK(status IN ('candidate', 'investigating', 'pending_review', 'confirmed', 'rejected', 'needs_more_evidence')),
+    raw_artifact_path TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_findings_project
+    ON tool_findings(project_id, snapshot_id, status);
+
+CREATE TABLE IF NOT EXISTS audit_findings (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    snapshot_id TEXT NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    category TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK(severity IN ('critical', 'high', 'medium', 'low', 'info')),
+    status TEXT NOT NULL DEFAULT 'candidate'
+        CHECK(status IN ('candidate', 'investigating', 'pending_review', 'confirmed', 'rejected', 'needs_more_evidence')),
+    cwe TEXT,
+    file_path TEXT,
+    line_start INTEGER,
+    line_end INTEGER,
+    description TEXT NOT NULL,
+    impact TEXT,
+    evidence TEXT,
+    remediation TEXT,
+    discovered_by TEXT NOT NULL,
+    reviewed_by TEXT,
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_findings_project
+    ON audit_findings(project_id, snapshot_id, status, severity);
 """
 
 VULNERABILITY_COLUMNS: dict[str, str] = {

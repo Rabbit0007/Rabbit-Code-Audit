@@ -41,9 +41,11 @@ def _looks_like_reason_data(payload: dict[str, Any]) -> bool:
 
 
 def _looks_like_bootstrap_execute_data(payload: dict[str, Any]) -> bool:
-    if not isinstance(payload, dict) or set(payload) != {"fact", "complete"}:
+    if not isinstance(payload, dict) or set(payload) not in ({"fact"}, {"fact", "complete"}):
         return False
-    return _is_dict(payload.get("fact")) and _is_dict(payload.get("complete"))
+    return _is_dict(payload.get("fact")) and (
+        "complete" not in payload or _is_dict(payload.get("complete"))
+    )
 
 
 def _looks_like_bootstrap_conclude_data(payload: dict[str, Any]) -> bool:
@@ -56,7 +58,10 @@ def _looks_like_bootstrap_conclude_data(payload: dict[str, Any]) -> bool:
 
 
 def _looks_like_explore_data(payload: dict[str, Any]) -> bool:
-    return isinstance(payload, dict) and set(payload) == {"description"}
+    if not isinstance(payload, dict):
+        return False
+    keys = set(payload)
+    return "description" in keys and keys <= {"description", "tool_findings", "finding", "review"}
 
 
 def validate_reason_payload(
@@ -122,7 +127,7 @@ def validate_bootstrap_execute_payload(payload: dict[str, Any]) -> tuple[str, di
     result = {"fact_description": fact_description.strip()}
     complete = data.get("complete")
     if complete is None:
-        raise ValueError("complete is required")
+        return "fact", result
     if not isinstance(complete, dict):
         raise ValueError("complete must be an object")
     complete_description = complete.get("description")
@@ -154,7 +159,7 @@ def validate_bootstrap_conclude_payload(payload: dict[str, Any]) -> tuple[str, s
     return "fact", fact_description.strip()
 
 
-def validate_explore_payload(payload: dict[str, Any]) -> tuple[str, str | None]:
+def validate_explore_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
     accepted, data = _unwrap_wrapped_payload(payload)
     if accepted is False:
         return "rejected", None
@@ -167,4 +172,36 @@ def validate_explore_payload(payload: dict[str, Any]) -> tuple[str, str | None]:
     description = data.get("description")
     if not isinstance(description, str) or not description.strip():
         raise ValueError("description is required")
-    return "fact", description.strip()
+    finding = data.get("finding")
+    review = data.get("review")
+    tool_findings = data.get("tool_findings")
+    if tool_findings is not None:
+        if not isinstance(tool_findings, list):
+            raise ValueError("tool_findings must be an array")
+        for index, item in enumerate(tool_findings):
+            if not isinstance(item, dict):
+                raise ValueError(f"tool finding at index {index} must be an object")
+            required = ("tool_name", "title", "description")
+            if any(not isinstance(item.get(key), str) or not item[key].strip() for key in required):
+                raise ValueError(f"tool finding at index {index} is missing required fields")
+    if finding is not None and review is not None:
+        raise ValueError("finding and review cannot coexist")
+    if finding is not None:
+        if not isinstance(finding, dict):
+            raise ValueError("finding must be an object")
+        required = ("title", "category", "severity", "description")
+        if any(not isinstance(finding.get(key), str) or not finding[key].strip() for key in required):
+            raise ValueError("finding title, category, severity, and description are required")
+    if review is not None:
+        if not isinstance(review, dict):
+            raise ValueError("review must be an object")
+        if not isinstance(review.get("finding_id"), str) or not review["finding_id"].strip():
+            raise ValueError("review.finding_id is required")
+        if review.get("decision") not in ("confirmed", "rejected", "needs_more_evidence"):
+            raise ValueError("review.decision is invalid")
+    return "fact", {
+        "description": description.strip(),
+        "tool_findings": tool_findings or [],
+        "finding": finding,
+        "review": review,
+    }

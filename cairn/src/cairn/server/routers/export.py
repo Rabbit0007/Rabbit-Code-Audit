@@ -5,6 +5,9 @@ import yaml
 
 from cairn.server.db import get_conn
 from cairn.server.services import expire_reason_leases, expire_workers, get_project_or_404
+from cairn.server.source_service import list_snapshots, snapshot_container_path
+from cairn.server.source_service import list_code_files
+from cairn.server.audit_tools import build_tool_plan
 
 router = APIRouter(tags=["export"])
 
@@ -65,6 +68,60 @@ def _export_yaml(conn, project_id: str) -> str:
             "goal": goal_desc,
         }
     }
+    sources = list_snapshots(project_id)
+    if sources:
+        data["sources"] = [
+            {
+                "id": source.id,
+                "type": source.source_type,
+                "status": source.status,
+                "repository_url": source.repository_url,
+                "requested_ref": source.requested_ref,
+                "resolved_commit": source.resolved_commit,
+                "archive_sha256": source.archive_sha256,
+                "snapshot_sha256": source.snapshot_sha256,
+                "file_count": source.file_count,
+                "total_bytes": source.total_bytes,
+                "detected_languages": source.detected_languages,
+                "container_path": snapshot_container_path(source.id),
+            }
+            for source in sources
+        ]
+        ready_source = next((source for source in sources if source.status == "ready"), None)
+        if ready_source is not None:
+            source_path = snapshot_container_path(ready_source.id)
+            files = list_code_files(project_id, ready_source.id, limit=20_000)
+            data["audit_tool_plan"] = [
+                item.as_dict()
+                for item in build_tool_plan(ready_source, files, source_path)
+            ]
+
+    tool_findings = conn.execute(
+        """
+        SELECT id, snapshot_id, tool_name, rule_id, severity, title, description,
+               file_path, line_start, line_end, status
+        FROM tool_findings
+        WHERE project_id = ?
+        ORDER BY created_at, id
+        """,
+        (project_id,),
+    ).fetchall()
+    if tool_findings:
+        data["tool_findings"] = [dict(row) for row in tool_findings]
+
+    audit_findings = conn.execute(
+        """
+        SELECT id, snapshot_id, title, category, severity, status, cwe, file_path,
+               line_start, line_end, description, impact, evidence, remediation,
+               discovered_by, reviewed_by
+        FROM audit_findings
+        WHERE project_id = ?
+        ORDER BY created_at, id
+        """,
+        (project_id,),
+    ).fetchall()
+    if audit_findings:
+        data["audit_findings"] = [dict(row) for row in audit_findings]
 
     if hints:
         data["hints"] = [

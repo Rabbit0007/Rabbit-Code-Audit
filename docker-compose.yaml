@@ -1,16 +1,27 @@
-name: cairn-021
+name: rabbit-code-audit
+
+volumes:
+  rabbit-code-audit-data:
+    name: rabbit-code-audit-data
 
 services:
+  rabbit-code-audit-worker-image:
+    build:
+      context: ./container
+      dockerfile: Dockerfile
+    image: rabbit-code-audit-worker:latest
+    command: ["true"]
+
   cairn-server:
     build:
       context: .
       dockerfile: Dockerfile
     image: cairn-app
-    container_name: cairn-server
+    container_name: rabbit-code-audit-server
     ports:
       - "8000:8000"
     volumes:
-      - ./datas/cairn/:/root/.local/share/cairn/
+      - rabbit-code-audit-data:/root/.local/share/cairn/
     environment:
       CAIRN_DISPATCHER_INTERNAL_URL: "http://cairn-dispatcher:8989"
       # Timeout (seconds) for the longer-running worker connectivity test and
@@ -35,15 +46,18 @@ services:
       context: .
       dockerfile: Dockerfile
     image: cairn-app
-    container_name: cairn-dispatcher
+    container_name: rabbit-code-audit-dispatcher
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./dispatch.yaml:/cairn/dispatch.yaml
+      - rabbit-code-audit-data:/root/.local/share/cairn/
     environment:
       CAIRN_DISPATCHER_INTERNAL_API: "1"
       CAIRN_DISPATCHER_INTERNAL_HOST: "0.0.0.0"
       CAIRN_DISPATCHER_INTERNAL_PORT: "8989"
     depends_on:
+      rabbit-code-audit-worker-image:
+        condition: service_completed_successfully
       cairn-server:
         condition: service_healthy
     restart: unless-stopped

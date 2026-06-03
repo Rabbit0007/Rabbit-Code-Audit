@@ -52,6 +52,7 @@ import {
   TASK_TYPES,
   clampText,
   cn,
+  formatBytes,
   formatTime,
   go,
   parseHash,
@@ -65,9 +66,20 @@ try {
   // Vite HMR may register the extension more than once.
 }
 
-const APP_NAME = "Rabbit";
+const APP_NAME = "Rabbit Code Audit";
 const HUMAN_WORKER = "Human";
 const SECRET_MASK = "********";
+
+function formatFindingStatus(status) {
+  return {
+    candidate: "候选",
+    investigating: "调查中",
+    pending_review: "待独立复核",
+    confirmed: "已确认",
+    rejected: "已拒绝",
+    needs_more_evidence: "需更多证据",
+  }[status] || status;
+}
 
 function useRoute() {
   const [route, setRoute] = useState(parseHash);
@@ -236,7 +248,7 @@ export default function App() {
 function TopNav({ route, user, theme, onToggleTheme, onLogout, onPassword, onSettings, setToast }) {
   const mainNav = [
     ["projects", "项目", Folder],
-    ["vulnerabilities", "漏洞报告", AlertTriangle],
+    ["vulnerabilities", "审计报告", AlertTriangle],
     ["workers", "工作节点", Monitor],
     ["templates", "模板", FileText],
   ];
@@ -855,24 +867,24 @@ function AuthPage({ onAuthed, setToast }) {
           </div>
           <div className="auth-copy">
             <h2>
-              持续安全探索
+              持续代码审计
               <br />
-              让攻击<span>无处遁形</span>
+              让证据<span>清晰可核验</span>
             </h2>
-            <p>Rabbit 帮助安全团队自动化资产发现、漏洞验证和攻击面管理，让安全探索更清晰。</p>
+            <p>Rabbit Code Audit 帮助安全团队导入源码、建立事实图、执行多语言审计并复核关键发现。</p>
           </div>
           <div className="auth-capabilities">
             <span>
               <ShieldAlert size={16} />
-              资产发现
+              源码索引
             </span>
             <span>
               <CheckCircle2 size={16} />
-              漏洞验证
+              独立复核
             </span>
             <span>
               <Network size={16} />
-              攻击面管理
+              事实图协作
             </span>
           </div>
         </aside>
@@ -885,8 +897,8 @@ function AuthPage({ onAuthed, setToast }) {
             </button>
           )}
           <div className="auth-title align-left">
-            <h1>{mode === "login" ? "欢迎回来" : "创建账户"} <span>👋</span></h1>
-            <p>{mode === "login" ? "登录以继续安全探索工作流" : "加入 Rabbit 安全探索平台"}</p>
+            <h1>{mode === "login" ? "欢迎回来" : "创建账户"}</h1>
+            <p>{mode === "login" ? "登录以继续代码审计工作流" : "加入 Rabbit Code Audit"}</p>
           </div>
           {mode === "login" && (
             <div className="segmented auth-login-tabs">
@@ -1089,8 +1101,8 @@ function DashboardPage({ runAction, setToast }) {
   }, [projects]);
 
   const quickActions = [
-    { key: "new", label: "新建项目", desc: "定义起点、目标和提示", icon: Plus, onClick: () => setNewOpen(true) },
-    { key: "vulns", label: "漏洞报告", desc: "查看与管理漏洞", icon: AlertTriangle, onClick: () => go("#/vulnerabilities") },
+    { key: "new", label: "新建项目", desc: "导入源码并定义审计目标", icon: Plus, onClick: () => setNewOpen(true) },
+    { key: "vulns", label: "审计报告", desc: "查看已复核的安全发现", icon: AlertTriangle, onClick: () => go("#/vulnerabilities") },
     { key: "workers", label: "工作节点", desc: "状态与模型配置", icon: Monitor, onClick: () => go("#/workers") },
     { key: "templates", label: "模板", desc: "复用项目模板", icon: FileText, onClick: () => go("#/templates") },
   ];
@@ -1100,7 +1112,7 @@ function DashboardPage({ runAction, setToast }) {
       <PageHeader
         icon={Home}
         title="仪表盘"
-        subtitle="安全探索全局概览：漏洞态势、趋势与最近活动"
+        subtitle="代码审计全局概览：已确认发现、趋势与最近活动"
         actions={
           <>
             <div className="status-pill">
@@ -1277,8 +1289,8 @@ function ProjectsPage({ runAction, setToast, confirmAction }) {
     <>
       <PageHeader
         icon={Network}
-        title="项目"
-        subtitle="面向目标的事实图探索工作区"
+        title="代码审计项目"
+        subtitle="源码快照、审计事实、调查方向与复核过程"
         actions={
           <>
             <div className="status-pill">
@@ -1308,8 +1320,8 @@ function ProjectsPage({ runAction, setToast, confirmAction }) {
         ) : projects.length === 0 ? (
           <EmptyState
             icon={Folder}
-            title="还没有项目"
-            subtitle="创建一个项目后，Rabbit 会围绕起点、目标和提示生成事实图。"
+            title="还没有代码审计项目"
+            subtitle="导入公共 Git 仓库或 ZIP 源码后，Rabbit Code Audit 会建立不可变源码快照。"
             action={
               <button className="primary-button compact" type="button" onClick={() => setNewOpen(true)}>
                 <Plus size={18} />
@@ -1434,9 +1446,13 @@ function ProjectCard({ project, onDelete, onStop, onStart, onReopen }) {
 function NewProjectModal({ onClose, onCreated, runAction, initial = null }) {
   const [form, setForm] = useState({
     title: initial?.title || "",
-    origin: initial?.origin || "",
-    goal: initial?.goal || "",
+    origin: initial?.origin || "待审计源码将在导入后生成不可变快照。",
+    goal: initial?.goal || "完成指定源码范围的安全审计，记录已确认漏洞、审计覆盖和剩余不确定性。",
     hints: initial?.hints?.map((hint) => hint.content).join("\n") || "",
+    sourceType: "git",
+    repositoryUrl: "",
+    ref: "",
+    archive: null,
   });
   const [saving, setSaving] = useState(false);
 
@@ -1455,6 +1471,26 @@ function NewProjectModal({ onClose, onCreated, runAction, initial = null }) {
           },
         }),
       );
+      if (form.sourceType === "git") {
+        await runAction("Git 源码已导入", () =>
+          apiRequest(`/api/projects/${detail.project.id}/sources/git`, {
+            method: "POST",
+            body: {
+              repository_url: form.repositoryUrl,
+              ref: form.ref || null,
+            },
+          }),
+        );
+      } else {
+        const upload = new FormData();
+        upload.append("archive", form.archive);
+        await runAction("ZIP 源码已导入", () =>
+          apiRequest(`/api/projects/${detail.project.id}/sources/zip`, {
+            method: "POST",
+            body: upload,
+          }),
+        );
+      }
       onCreated(detail.project.id);
     } finally {
       setSaving(false);
@@ -1462,12 +1498,64 @@ function NewProjectModal({ onClose, onCreated, runAction, initial = null }) {
   };
 
   return (
-    <Modal title="新建项目" subtitle="只需要定义起点、目标和必要提示，Worker 会围绕事实图推进。" onClose={onClose} wide>
+    <Modal title="新建代码审计项目" subtitle="导入源码快照后，Worker 会围绕事实图、代码索引和工具线索推进审计。" onClose={onClose} wide>
       <form className="stack-form modal-body" onSubmit={submit}>
         <label>
           <span>项目名称</span>
           <input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} required />
         </label>
+        <fieldset className="source-import-panel">
+          <legend>源码来源</legend>
+          <div className="source-type-switch" role="tablist" aria-label="源码来源">
+            <button
+              className={cn(form.sourceType === "git" && "active")}
+              type="button"
+              onClick={() => setForm({ ...form, sourceType: "git" })}
+            >
+              Git 仓库
+            </button>
+            <button
+              className={cn(form.sourceType === "zip" && "active")}
+              type="button"
+              onClick={() => setForm({ ...form, sourceType: "zip" })}
+            >
+              ZIP 上传
+            </button>
+          </div>
+          {form.sourceType === "git" ? (
+            <div className="two-col tight">
+              <label>
+                <span>公共仓库 URL</span>
+                <input
+                  type="url"
+                  value={form.repositoryUrl}
+                  onChange={(event) => setForm({ ...form, repositoryUrl: event.target.value })}
+                  placeholder="https://github.com/example/project.git"
+                  required
+                />
+              </label>
+              <label>
+                <span>Branch、Tag 或 Commit（可选）</span>
+                <input
+                  value={form.ref}
+                  onChange={(event) => setForm({ ...form, ref: event.target.value })}
+                  placeholder="main"
+                />
+              </label>
+            </div>
+          ) : (
+            <label className="source-file-input">
+              <span>ZIP 压缩包</span>
+              <input
+                type="file"
+                accept=".zip,application/zip"
+                onChange={(event) => setForm({ ...form, archive: event.target.files?.[0] || null })}
+                required
+              />
+              <small>压缩文件最大 1 GB，解压后最大 5 GB。源码会生成不可变快照。</small>
+            </label>
+          )}
+        </fieldset>
         <div className="two-col">
           <label>
             <span>起点</span>
@@ -1503,7 +1591,7 @@ function NewProjectModal({ onClose, onCreated, runAction, initial = null }) {
           </button>
           <button className="primary-button compact" type="submit" disabled={saving}>
             {saving ? <Loader2 className="spin" size={18} /> : <Plus size={18} />}
-            创建项目
+            创建并导入源码
           </button>
         </div>
       </form>
@@ -1514,6 +1602,9 @@ function NewProjectModal({ onClose, onCreated, runAction, initial = null }) {
 function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
   const [detail, setDetail] = useState(null);
   const [timeline, setTimeline] = useState([]);
+  const [toolPlan, setToolPlan] = useState([]);
+  const [toolFindings, setToolFindings] = useState([]);
+  const [auditFindings, setAuditFindings] = useState([]);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState(null);
   const [tab, setTab] = useState("details");
@@ -1522,12 +1613,21 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
 
   const load = useCallback(async () => {
     try {
-      const [project, events] = await Promise.all([
+      const [project, events, projectToolFindings, projectAuditFindings] = await Promise.all([
         apiRequest(`/projects/${projectId}`),
         apiRequest(`/api/projects/${projectId}/timeline`).catch(() => []),
+        apiRequest(`/api/projects/${projectId}/tool-findings`).catch(() => []),
+        apiRequest(`/api/projects/${projectId}/audit-findings`).catch(() => []),
       ]);
+      const readySource = (project.sources || []).find((source) => source.status === "ready");
+      const plan = readySource
+        ? await apiRequest(`/api/projects/${projectId}/sources/${readySource.id}/tool-plan`).catch(() => [])
+        : [];
       setDetail(project);
       setTimeline(events);
+      setToolPlan(plan);
+      setToolFindings(projectToolFindings);
+      setAuditFindings(projectAuditFindings);
     } catch (error) {
       setToast({ type: "danger", message: error.message || "项目加载失败" });
     } finally {
@@ -1550,6 +1650,8 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
   const project = detail?.project;
   const facts = detail?.facts || [];
   const intents = detail?.intents || [];
+  const sources = detail?.sources || [];
+  const currentSource = sources.find((source) => source.status === "ready") || sources[0] || null;
   const selectedFactIds = selected?.type === "fact" ? [selected.id] : facts.length ? ["origin"] : [];
   const selectedIntent = selected?.type === "intent" ? intents.find((intent) => intent.id === selected.id) : null;
 
@@ -1666,6 +1768,26 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
       </section>
       <section className="workspace-layout">
         <div className="graph-panel">
+          {currentSource && (
+            <div className="source-snapshot-bar">
+              <div>
+                <span>源码快照</span>
+                <strong>{currentSource.resolved_commit || currentSource.snapshot_sha256 || currentSource.id}</strong>
+              </div>
+              <div>
+                <span>语言</span>
+                <strong>{Object.keys(currentSource.detected_languages || {}).join(" / ") || "未识别"}</strong>
+              </div>
+              <div>
+                <span>文件</span>
+                <strong>{currentSource.file_count}</strong>
+              </div>
+              <div>
+                <span>大小</span>
+                <strong>{formatBytes(currentSource.total_bytes)}</strong>
+              </div>
+            </div>
+          )}
           <div className="graph-toolbar floating">
             <select value={layout} onChange={(event) => setLayout(event.target.value)}>
               <option value="dagre">Dagre</option>
@@ -1706,6 +1828,9 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
           tab={tab}
           setTab={setTab}
           timeline={timeline}
+          toolPlan={toolPlan}
+          toolFindings={toolFindings}
+          auditFindings={auditFindings}
           onRefresh={load}
           runAction={runAction}
         />
@@ -1848,7 +1973,6 @@ function GraphCanvas({ detail, selected, onSelect, layout }) {
     const cy = cytoscape({
       container: containerRef.current,
       elements,
-      wheelSensitivity: 0.18,
       minZoom: 0.35,
       maxZoom: 2.2,
       style: [
@@ -1856,9 +1980,9 @@ function GraphCanvas({ detail, selected, onSelect, layout }) {
           selector: "node",
           style: {
             label: "data(label)",
-            "font-family": "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+            "font-family": "sans-serif",
             "font-size": 15,
-            "font-weight": 620,
+            "font-weight": 600,
             color: "#fff",
             "text-wrap": "wrap",
             "text-max-width": 190,
@@ -1870,9 +1994,6 @@ function GraphCanvas({ detail, selected, onSelect, layout }) {
             "background-color": "#007aff",
             "background-opacity": 0.96,
             "border-width": 0,
-            "shadow-blur": 16,
-            "shadow-color": "rgba(0, 122, 255, .22)",
-            "shadow-opacity": 1,
           },
         },
         {
@@ -1945,8 +2066,6 @@ function GraphCanvas({ detail, selected, onSelect, layout }) {
           style: {
             "border-width": 5,
             "border-color": "#ffffff",
-            "shadow-blur": 30,
-            "shadow-color": "rgba(0, 122, 255, .36)",
           },
         },
       ],
@@ -1997,7 +2116,19 @@ function GraphCanvas({ detail, selected, onSelect, layout }) {
   return <div className="graph-canvas" ref={containerRef} />;
 }
 
-function Inspector({ detail, selected, setSelected, tab, setTab, timeline, onRefresh, runAction }) {
+function Inspector({
+  detail,
+  selected,
+  setSelected,
+  tab,
+  setTab,
+  timeline,
+  toolPlan,
+  toolFindings,
+  auditFindings,
+  onRefresh,
+  runAction,
+}) {
   const facts = detail.facts;
   const intents = detail.intents;
   const fact = selected?.type === "fact" ? facts.find((item) => item.id === selected.id) : null;
@@ -2005,6 +2136,8 @@ function Inspector({ detail, selected, setSelected, tab, setTab, timeline, onRef
   const tabs = [
     ["details", "详情", null],
     ["hints", "提示", detail.hints.length],
+    ["tools", "工具", toolPlan.length],
+    ["findings", "发现", auditFindings.length],
     ["logs", "日志", intents.length],
     ["timeline", "时间线", timeline.length],
   ];
@@ -2106,6 +2239,55 @@ function Inspector({ detail, selected, setSelected, tab, setTab, timeline, onRef
                   </small>
                 </article>
               ))
+            )}
+          </div>
+        )}
+        {tab === "tools" && (
+          <div className="timeline-list">
+            {toolPlan.length === 0 ? (
+              <EmptyState title="暂无工具计划" subtitle="源码快照准备完成后会生成多语言工具计划。" />
+            ) : (
+              toolPlan.map((tool) => (
+                <article className="timeline-item" key={`${tool.category}-${tool.name}`}>
+                  <span>{tool.category}</span>
+                  <p>{tool.name}</p>
+                  <small>{tool.reason}</small>
+                  <code>{tool.command.join(" ")}</code>
+                </article>
+              ))
+            )}
+            {toolFindings.length > 0 && (
+              <div className="detail-card">
+                <span>工具候选</span>
+                <h3>{toolFindings.length}</h3>
+                <p>扫描器结果仅用于导航，必须经过代码证据验证后才能形成审计发现。</p>
+              </div>
+            )}
+          </div>
+        )}
+        {tab === "findings" && (
+          <div className="timeline-list">
+            {auditFindings.length === 0 ? (
+              <EmptyState title="暂无审计发现" subtitle="Worker 验证代码证据后会在这里记录候选与复核状态。" />
+            ) : (
+              auditFindings.map((finding) => {
+                const severity = SEVERITY_META[finding.severity] || SEVERITY_META.info;
+                return (
+                  <article className="timeline-item" key={finding.id}>
+                    <span>{finding.id}</span>
+                    <p>{finding.title}</p>
+                    <div className="button-row">
+                      <Badge tone={severity.tone}>{severity.label}</Badge>
+                      <Badge tone={finding.status === "confirmed" ? "success" : finding.status === "rejected" ? "muted" : "warning"}>
+                        {formatFindingStatus(finding.status)}
+                      </Badge>
+                    </div>
+                    <small>
+                      {finding.file_path || finding.category} · {finding.discovered_by}
+                    </small>
+                  </article>
+                );
+              })
             )}
           </div>
         )}
@@ -2327,7 +2509,7 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
       setVulnerabilities(list);
       setProjects(projectList);
     } catch (error) {
-      if (!silent) setToast({ type: "danger", message: error.message || "漏洞报告加载失败" });
+      if (!silent) setToast({ type: "danger", message: error.message || "审计报告加载失败" });
     } finally {
       if (!silent) setLoading(false);
     }
@@ -2353,7 +2535,7 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
   }, [load]);
 
   const refresh = async () => {
-    await runAction("漏洞报告已刷新", () => apiRequest("/api/vulnerabilities/refresh", { method: "POST" }));
+    await runAction("审计报告已刷新", () => apiRequest("/api/vulnerabilities/refresh", { method: "POST" }));
     await load();
   };
 
@@ -2447,8 +2629,8 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
     <>
       <PageHeader
         compact
-        title={`漏洞报告 / ${viewTitle}`}
-        subtitle="查看和管理所有漏洞报告，跟踪漏洞处理进度和状态"
+        title={`审计报告 / ${viewTitle}`}
+        subtitle="仅展示经过复核确认的代码审计发现"
         actions={
           <button
             className="ghost-button report-export-button"
@@ -2543,7 +2725,7 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
           </button>
         </div>
         {loading ? (
-          <EmptyState icon={Loader2} title="正在分析漏洞报告" />
+          <EmptyState icon={Loader2} title="正在加载审计报告" />
         ) : visibleVulnerabilities.length === 0 ? (
           <EmptyState icon={CheckCircle2} title="没有匹配的漏洞" subtitle="当前筛选范围内尚未发现漏洞。" />
         ) : (
@@ -2724,7 +2906,7 @@ function ExportRecordsView({ setToast, confirmAction }) {
     <>
       <PageHeader
         compact
-        title="漏洞报告 / 导出记录"
+        title="审计报告 / 导出记录"
         subtitle="查看历史导出操作，包括导出范围、格式和时间"
       />
       <section className="content-wrap vulnerability-report-page">
@@ -2732,7 +2914,7 @@ function ExportRecordsView({ setToast, confirmAction }) {
           <header className="vuln-table-title">
             <div>
               <h2>导出记录</h2>
-              <p>每次导出漏洞报告都会在此留痕</p>
+              <p>每次导出审计报告都会在此留痕</p>
             </div>
             <div className="button-row">
               <button
@@ -3455,7 +3637,7 @@ const WORKER_PRESETS = [
     type: "pi",
     env: {
       PI_MODEL: "deepseekv4",
-      PI_BASE_URL: "http://10.2.8.77:3000/v1",
+      PI_BASE_URL: "http://127.0.0.1:3000/v1",
       PI_API_KEY: "",
       PI_PROVIDER_API: "openai-completions",
     },
@@ -3842,18 +4024,18 @@ function TemplatesPage({ runAction, setToast, confirmAction }) {
 
 const TEMPLATE_CATEGORIES = [
   { key: "all", label: "全部模板" },
-  { key: "web", label: "Web渗透" },
-  { key: "internal", label: "内网渗透" },
-  { key: "recon", label: "信息收集" },
-  { key: "ctf", label: "CTF挑战" },
+  { key: "web", label: "Web 源码" },
+  { key: "backend", label: "API 后端" },
+  { key: "supply", label: "依赖供应链" },
+  { key: "repository", label: "完整仓库" },
   { key: "custom", label: "自定义" },
 ];
 
 const TEMPLATE_CATEGORY_META = {
-  web: { label: "Web渗透", tone: "info" },
-  internal: { label: "内网渗透", tone: "high" },
-  recon: { label: "信息收集", tone: "medium" },
-  ctf: { label: "CTF挑战", tone: "critical" },
+  web: { label: "Web 源码", tone: "info" },
+  backend: { label: "API 后端", tone: "high" },
+  supply: { label: "依赖供应链", tone: "medium" },
+  repository: { label: "完整仓库", tone: "critical" },
   custom: { label: "自定义", tone: "success" },
 };
 
@@ -3863,10 +4045,9 @@ const TEMPLATE_CATEGORY_META = {
 function templateCategory(template) {
   if (!template.is_builtin) return "custom";
   const text = `${template.title || ""} ${template.origin || ""} ${template.goal || ""}`;
-  if (/CTF/i.test(text)) return "ctf";
-  if (/web/i.test(text)) return "web";
-  if (text.includes("内网")) return "internal";
-  if (text.includes("外网") || text.includes("信息收集") || text.includes("侦察")) return "recon";
+  if (text.includes("供应链") || text.includes("依赖")) return "supply";
+  if (text.includes("API") || text.includes("后端")) return "backend";
+  if (text.includes("完整仓库") || text.includes("多语言")) return "repository";
   return "web";
 }
 

@@ -1213,6 +1213,53 @@ select:focus {
   justify-content: space-between;
 }
 
+.source-import-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin: 0;
+  padding: 16px;
+}
+
+.source-import-panel legend {
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
+  padding: 0 8px;
+}
+
+.source-type-switch {
+  background: #e8edf4;
+  border-radius: 7px;
+  display: inline-grid;
+  gap: 2px;
+  grid-template-columns: repeat(2, minmax(120px, 1fr));
+  margin-bottom: 16px;
+  padding: 3px;
+}
+
+.source-type-switch button {
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  color: var(--muted);
+  cursor: pointer;
+  font-weight: 700;
+  padding: 9px 16px;
+}
+
+.source-type-switch button.active {
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
+  color: var(--text);
+}
+
+.source-file-input small {
+  color: var(--muted);
+  display: block;
+  font-size: 13px;
+  margin-top: 8px;
+}
+
 /* --- Password modal ------------------------------------------ */
 
 .password-form .input-affix {
@@ -1336,6 +1383,62 @@ select:focus {
   position: relative;
   border-right: 1px solid var(--line);
   overflow: hidden;
+}
+
+.source-snapshot-bar {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.96);
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  gap: 20px;
+  grid-template-columns: minmax(220px, 2fr) minmax(160px, 1fr) 100px 110px;
+  left: 0;
+  padding: 12px 18px;
+  position: absolute;
+  right: 0;
+  top: 0;
+  z-index: 4;
+}
+
+.source-snapshot-bar div {
+  min-width: 0;
+}
+
+.source-snapshot-bar span,
+.source-snapshot-bar strong {
+  display: block;
+}
+
+.source-snapshot-bar span {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 3px;
+}
+
+.source-snapshot-bar strong {
+  color: var(--text);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-snapshot-bar + .graph-toolbar {
+  top: 86px;
+}
+
+.source-snapshot-bar ~ .graph-actions {
+  top: 86px;
+}
+
+.timeline-item code {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  padding-top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .graph-canvas {
@@ -2584,6 +2687,172 @@ pre {
 
   .vuln-detail {
     padding-left: 22px;
+  }
+}
+
+@media (max-width: 760px) {
+  .top-utility {
+    height: 56px;
+    padding: 0 12px;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+  }
+
+  .brand {
+    font-size: 16px;
+  }
+
+  .brand-mark {
+    width: 30px;
+    height: 30px;
+  }
+
+  .top-section-label,
+  .global-search-wrap,
+  .top-utility .user-name,
+  .top-utility .notification-button {
+    display: none;
+  }
+
+  .top-utility .nav-actions {
+    gap: 6px;
+  }
+
+  .top-utility .user-chip {
+    width: 36px;
+    min-width: 36px;
+    padding: 0 4px;
+  }
+
+  .top-nav {
+    inset: 56px 0 auto 0;
+    width: 100%;
+    height: 58px;
+    padding: 8px 10px;
+    display: block;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .nav-tabs {
+    display: flex;
+    gap: 6px;
+    width: max-content;
+  }
+
+  .nav-group {
+    display: block;
+  }
+
+  .nav-tab {
+    width: auto;
+    white-space: nowrap;
+  }
+
+  .nav-caret,
+  .sub-nav,
+  .sidebar-foot {
+    display: none;
+  }
+
+  .app-main {
+    padding-left: 0;
+    padding-top: 114px;
+  }
+
+  .workspace-header {
+    height: auto;
+    min-height: 104px;
+    padding: 10px 12px;
+    display: flex;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .workspace-title {
+    flex: 1 1 calc(100% - 52px);
+  }
+
+  .workspace-title button {
+    max-width: 100%;
+    overflow: hidden;
+    font-size: 17px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .workspace-actions {
+    width: 100%;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 2px;
+  }
+
+  .workspace-actions > * {
+    flex: 0 0 auto;
+  }
+
+  .workspace-layout {
+    height: auto;
+    min-height: calc(100vh - 218px);
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(420px, 56vh) minmax(360px, auto);
+  }
+
+  .graph-panel {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .source-snapshot-bar {
+    gap: 12px;
+    grid-template-columns: minmax(180px, 2fr) minmax(120px, 1fr) 64px 84px;
+    overflow-x: auto;
+    padding: 10px 12px;
+  }
+
+  .source-snapshot-bar + .graph-toolbar,
+  .source-snapshot-bar ~ .graph-actions {
+    top: 76px;
+  }
+
+  .floating {
+    left: 10px;
+  }
+
+  .floating.right {
+    left: auto;
+    right: 10px;
+  }
+
+  .graph-actions {
+    max-width: calc(100% - 174px);
+    overflow-x: auto;
+  }
+
+  .graph-actions > * {
+    flex: 0 0 auto;
+  }
+
+  .inspector {
+    min-width: 0;
+  }
+
+  .inspector-tabs {
+    display: flex;
+    overflow-x: auto;
+    padding: 10px;
+  }
+
+  .inspector-tabs button {
+    flex: 0 0 auto;
+    padding: 0 12px;
+  }
+
+  .inspector-body {
+    padding: 12px;
   }
 }
 

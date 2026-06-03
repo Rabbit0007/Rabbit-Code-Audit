@@ -16,13 +16,9 @@ Templates"). Only user-created custom templates are persisted (in the
 this constant list with a user's stored custom templates when answering
 ``GET /api/templates``.
 
-Each built-in template satisfies requirements 12.1 and 12.2:
-
-* 12.1 -- at minimum the four templates Web Application Assessment, Internal
-  Network Pentest, External Network Pentest, and CTF Challenge are provided.
-* 12.2 -- each template carries a title, an ``origin`` fact, a ``goal`` fact, and
-  between 1 and 10 initial ``hints`` where every hint is a ``{content, creator}``
-  mapping whose ``creator`` is ``"template"``.
+Each built-in template carries a title, an ``origin`` fact, a ``goal`` fact, and
+between 1 and 10 initial ``hints`` where every hint is a ``{content, creator}``
+mapping whose ``creator`` is ``"template"``.
 
 The shapes mirror :class:`cairn.server.templates_models.TemplateResponse`:
 built-in templates use ``is_builtin=True`` and leave ``user_id`` as ``None``.
@@ -45,72 +41,52 @@ def _hint(content: str) -> dict[str, str]:
 BUILTIN_TEMPLATES: list[dict] = [
     {
         "id": "builtin-web-app",
-        "title": "Web 应用评估",
-        "origin": "目标 Web 应用，地址为 [URL]，技术栈为 [technology stack]",
-        "goal": "识别并记录 Web 应用中所有可利用的漏洞",
+        "title": "Web 应用源码审计",
+        "origin": "待审计 Web 应用源码，技术栈为 [technology stack]，重点范围为 [scope]",
+        "goal": "识别并记录源码中可被证明的安全漏洞、受影响路径和修复建议",
         "hints": [
-            _hint(
-                "从侦察开始：枚举子域名、目录和所用技术"
-            ),
-            _hint("测试身份认证机制是否存在绕过漏洞"),
-            _hint("检查所有用户输入是否存在注入点"),
+            _hint("先建立路由、认证、权限和数据访问层的代码索引"),
+            _hint("结合静态扫描结果追踪外部输入到敏感操作的数据流"),
+            _hint("对高危和严重发现安排独立 Worker 复核"),
         ],
         "is_builtin": True,
         "user_id": None,
     },
     {
-        "id": "builtin-internal-network",
-        "title": "内网渗透测试",
-        "origin": "可从假定已突破的立足点访问的内网网段 [CIDR]",
-        "goal": "实现域控制权获取，并记录横向移动和权限提升路径",
+        "id": "builtin-api-backend",
+        "title": "API 与后端服务审计",
+        "origin": "待审计 API 或后端服务源码，框架为 [framework]，重点业务为 [business scope]",
+        "goal": "验证接口鉴权、资源授权、数据校验和敏感操作中的安全缺陷",
         "hints": [
-            _hint(
-                "枚举内网网段中的存活主机和服务"
-            ),
-            _hint(
-                "识别 Active Directory 资产：域控制器、用户和用户组"
-            ),
-            _hint(
-                "在共享、脚本和服务配置中搜寻凭据"
-            ),
-            _hint(
-                "梳理通往域管理员的横向移动和权限提升路径"
-            ),
+            _hint("建立控制器、中间件、服务层和 ORM 查询之间的调用关系"),
+            _hint("关注对象级授权、批量操作、状态转换和多租户隔离"),
+            _hint("不要使用固定逻辑漏洞模板，依据实际业务不变量提出假设"),
         ],
         "is_builtin": True,
         "user_id": None,
     },
     {
-        "id": "builtin-external-network",
-        "title": "外网渗透测试",
-        "origin": "[organization] 面向互联网的资产：在范围内的 IP 段和域名",
-        "goal": "发现并利用对外暴露的服务，以获得初始立足点",
+        "id": "builtin-dependency-supply-chain",
+        "title": "依赖与供应链审计",
+        "origin": "待审计代码仓库及其依赖清单、构建脚本和发布配置",
+        "goal": "识别高风险依赖、凭据泄露、构建链和发布流程中的安全问题",
         "hints": [
-            _hint(
-                "枚举外部攻击面：开放端口、服务和暴露的应用"
-            ),
-            _hint(
-                "识别服务版本指纹，并检查是否存在已知可利用的漏洞"
-            ),
-            _hint(
-                "测试暴露的登录入口是否使用弱口令或默认凭据"
-            ),
-            _hint(
-                "检查 TLS 配置和证书是否存在错误配置"
-            ),
+            _hint("识别所有语言生态的依赖锁文件和包管理器配置"),
+            _hint("检查仓库历史之外的当前快照是否包含密钥和敏感配置"),
+            _hint("验证构建脚本、代码生成和发布权限边界"),
         ],
         "is_builtin": True,
         "user_id": None,
     },
     {
-        "id": "builtin-ctf",
-        "title": "CTF 挑战",
-        "origin": "CTF 挑战目标，地址为 [host:port]，类别为 [web/pwn/crypto/forensics]",
-        "goal": "解出挑战并取得 flag",
+        "id": "builtin-full-repository",
+        "title": "完整仓库代码审计",
+        "origin": "待审计多语言代码仓库，核心组件和边界尚未明确",
+        "goal": "建立仓库安全视图，完成重点风险区域审计并记录剩余不确定性",
         "hints": [
-            _hint("确定挑战类别，并收集所有提供的文件或接口"),
-            _hint("针对该类别探测预期的漏洞类型"),
-            _hint("开发漏洞利用或解题方案并夺取 flag"),
+            _hint("先识别语言、框架、入口、配置、生成代码和原生组件"),
+            _hint("使用工具结果导航，但不要把扫描器告警直接当作漏洞"),
+            _hint("按风险和可达性拆分审计意图，逐步补全事实图"),
         ],
         "is_builtin": True,
         "user_id": None,
