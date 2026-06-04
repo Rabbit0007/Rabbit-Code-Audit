@@ -39,6 +39,34 @@ from cairn.server.vulnerabilities_models import (
 )
 router = APIRouter(prefix="/api/vulnerabilities", tags=["vulnerabilities"])
 
+_MISSING_PROOF_MESSAGE = (
+    "缺少原始证明数据包，不能作为交付证明；"
+    "需复测补充完整 payload、请求数据包、响应/回显。"
+)
+_STATIC_POC_NOTE = (
+    "以下 PoC 基于源码静态推导，适合作为复现步骤和复测模板；"
+    "它不是动态抓包结果。"
+)
+_REPORT_ENRICHMENT_PACKET_NOTE = (
+    "以下验证请求根据已确认漏洞、审计日志、时间线和源码证据静态推测，"
+    "不是实测抓包；不能替代真实 proof_packets。"
+)
+_REPORT_ENRICHMENT_POC_NOTE = (
+    "以下 PoC 来自报告补充阶段，仅用于指导复测和交付说明；"
+    "没有写回漏洞确认记录。"
+)
+_PROOF_PLACEHOLDER_RE = re.compile(
+    r"(\.\.\.|未记录|待补充|需复测|placeholder|todo|example\.com|target\.local|"
+    r"<\s*(?:target|host|hostname|payload|url|path|port|项目事实[^>]*|[^>]{0,20}待补充[^>]*)\s*>)",
+    re.IGNORECASE,
+)
+_HTTP_REQUEST_RE = re.compile(
+    r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\S+\s+HTTP/\d(?:\.\d)?",
+    re.IGNORECASE | re.MULTILINE,
+)
+_HTTP_HOST_RE = re.compile(r"^Host:\s*\S+", re.IGNORECASE | re.MULTILINE)
+_HTTP_RESPONSE_RE = re.compile(r"^HTTP/\d(?:\.\d)?\s+\d{3}\b", re.IGNORECASE | re.MULTILINE)
+
 # Display ordering for the report: most severe first, then most recently
 # discovered, with the id as a final deterministic tiebreaker. Implemented as a
 # SQL ``CASE`` so the ordering is applied in the database rather than in Python.
@@ -79,7 +107,9 @@ def _vulnerability_select(where_sql: str) -> str:
                 v.source_worker AS source_worker,
                 v.source_fact_ids_json AS source_fact_ids_json,
                 v.evidence_json AS evidence_json,
-                v.process_json AS process_json
+                v.process_json AS process_json,
+                v.proof_packets_json AS proof_packets_json,
+                v.reproduction_poc_json AS reproduction_poc_json
             FROM vulnerabilities v
             JOIN projects p ON p.id = v.project_id
             {where_sql}
@@ -92,7 +122,19 @@ def _row_to_vulnerability(row) -> Vulnerability:
     data["source_fact_ids"] = _decode_json_list(data.pop("source_fact_ids_json", None))
     data["evidence"] = _decode_json_list(data.pop("evidence_json", None))
     data["process"] = _decode_json_list(data.pop("process_json", None))
+    data["proof_packets"] = _decode_json_list(data.pop("proof_packets_json", None))
+    data["reproduction_poc"] = _decode_json_dict(data.pop("reproduction_poc_json", None))
     return Vulnerability(**data)
+
+
+def _decode_json_dict(raw: str | None) -> dict:
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 _SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -167,6 +209,181 @@ def _merge_process(vulns: list[Vulnerability]) -> list[dict[str, str]]:
             seen.add(key)
             merged.append(step)
     return merged
+
+
+def _merge_stored_proof_packets(vulns: list[Vulnerability]) -> list[dict[str, str]]:
+    merged: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    ordered = sorted(vulns, key=lambda item: _fact_rank(item.fact_id))
+    for vuln in ordered:
+        for packet in vuln.proof_packets or []:
+            if not isinstance(packet, dict):
+                continue
+            normalized = {
+                str(key): str(value).strip()
+                for key, value in packet.items()
+                if value is not None and str(value).strip()
+            }
+            if not _is_complete_proof_packet(normalized):
+                continue
+            key = (
+                normalized.get("title", ""),
+                normalized.get("request", ""),
+                normalized.get("payload", ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(normalized)
+    return merged
+
+
+def _merge_reproduction_poc(vulns: list[Vulnerability]) -> dict[str, object]:
+    ordered = sorted(vulns, key=lambda item: _fact_rank(item.fact_id))
+    fallback: dict[str, object] = {}
+    for vuln in ordered:
+        poc = vuln.reproduction_poc or {}
+        if not isinstance(poc, dict) or not poc:
+            continue
+        normalized = _normalize_reproduction_poc(poc)
+        if not normalized:
+            continue
+        if _is_complete_reproduction_poc(normalized):
+            return normalized
+        if not fallback:
+            fallback = normalized
+    return fallback
+
+
+def _normalize_reproduction_poc(poc: dict) -> dict[str, object]:
+    normalized: dict[str, object] = {}
+    for key, value in poc.items():
+        name = str(key).strip()
+        if not name or value is None:
+            continue
+        if isinstance(value, list):
+            items = [str(item).strip() for item in value if str(item).strip()]
+            if items:
+                normalized[name] = items
+            continue
+        text = str(value).strip()
+        if text:
+            normalized[name] = text
+    return normalized
+
+
+def _is_complete_proof_packet(packet: dict[str, str]) -> bool:
+    title = str(packet.get("title") or "").strip()
+    request = str(packet.get("request") or "").strip()
+    response = str(packet.get("response") or "").strip()
+    payload = str(packet.get("payload") or "").strip()
+    note = str(packet.get("note") or packet.get("verification") or "").strip()
+    if not title or not request or not response or not payload:
+        return False
+    combined = "\n".join([title, request, response, payload, note])
+    if _PROOF_PLACEHOLDER_RE.search(combined):
+        return False
+    is_http_request = _HTTP_REQUEST_RE.search(request) is not None
+    is_command = request.lstrip().startswith(("curl ", "python ", "python3 "))
+    if not is_http_request and not is_command:
+        return False
+    if is_http_request and (_HTTP_HOST_RE.search(request) is None or _HTTP_RESPONSE_RE.search(response) is None):
+        return False
+    return True
+
+
+_STATIC_POC_PLACEHOLDER_RE = re.compile(r"(\.\.\.|未记录|待补充|placeholder|todo)", re.IGNORECASE)
+
+
+def _is_complete_reproduction_poc(poc: dict[str, object]) -> bool:
+    payload = _poc_text(poc, "payload")
+    request_template = (
+        _poc_text(poc, "request_template")
+        or _poc_text(poc, "curl")
+        or _poc_text(poc, "command")
+    )
+    expected_result = _poc_text(poc, "expected_result") or _poc_text(poc, "expected_response")
+    steps = _poc_list(poc, "steps")
+    verification = _poc_text(poc, "verification")
+    combined = "\n".join([payload, request_template, expected_result, verification, *steps])
+    if _STATIC_POC_PLACEHOLDER_RE.search(combined):
+        return False
+    return bool(payload and request_template and expected_result and (steps or verification))
+
+
+def _load_report_enrichments(vulnerabilities: list[Vulnerability]) -> dict[str, dict[str, object]]:
+    finding_ids = _unique(
+        [
+            finding_id
+            for vuln in vulnerabilities
+            for finding_id in [*(vuln.related_fact_ids or []), vuln.fact_id, vuln.id]
+        ]
+    )
+    if not finding_ids:
+        return {}
+    placeholders = ",".join("?" for _ in finding_ids)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, project_id, finding_id, worker, completed_at, created_at,
+                   packet_templates_json, reproduction_poc_json,
+                   evidence_chain_json, report_sections_json, delivery_notes_json
+            FROM report_enrichment_tasks
+            WHERE status = 'completed'
+              AND finding_id IN ({placeholders})
+            ORDER BY finding_id,
+                     datetime(completed_at) DESC,
+                     datetime(created_at) DESC,
+                     id DESC
+            """,
+            finding_ids,
+        ).fetchall()
+    latest: dict[str, dict[str, object]] = {}
+    for row in rows:
+        finding_id = str(row["finding_id"])
+        if finding_id in latest:
+            continue
+        latest[finding_id] = {
+            "id": row["id"],
+            "project_id": row["project_id"],
+            "finding_id": finding_id,
+            "worker": row["worker"],
+            "completed_at": row["completed_at"],
+            "created_at": row["created_at"],
+            "packet_templates": _decode_json_list(row["packet_templates_json"]),
+            "reproduction_poc": _decode_json_dict(row["reproduction_poc_json"]),
+            "evidence_chain": [
+                str(item).strip()
+                for item in _decode_json_list(row["evidence_chain_json"])
+                if str(item).strip()
+            ],
+            "report_sections": _decode_json_dict(row["report_sections_json"]),
+            "delivery_notes": [
+                str(item).strip()
+                for item in _decode_json_list(row["delivery_notes_json"])
+                if str(item).strip()
+            ],
+        }
+    return latest
+
+
+def _report_enrichments_for_vulnerability(
+    vuln: Vulnerability, enrichments: dict[str, dict[str, object]]
+) -> list[dict[str, object]]:
+    finding_ids = _unique([*(vuln.related_fact_ids or []), vuln.fact_id, vuln.id])
+    return [enrichments[finding_id] for finding_id in finding_ids if finding_id in enrichments]
+
+
+def _poc_text(poc: dict[str, object], key: str) -> str:
+    value = poc.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _poc_list(poc: dict[str, object], key: str) -> list[str]:
+    value = poc.get(key)
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 _FILESYSTEM_PATH_PREFIXES = (
@@ -510,8 +727,13 @@ def _reconstructed_http_packets(vulns: list[Vulnerability]) -> list[dict[str, st
 
 
 def _proof_packets(vulns: list[Vulnerability]) -> list[dict[str, str]]:
-    """Reconstruct proof packets from same-project facts without fixed payloads."""
-    return _reconstructed_http_packets(vulns)
+    """Return only stored, complete proof packets.
+
+    Older fact-derived report rows do not contain original traffic. The report
+    must not invent request/response packets from prose because that produces
+    placeholder material that looks deliverable but is not reproducible.
+    """
+    return _merge_stored_proof_packets(vulns)
 
 
 def _evidence_score(text: str) -> int:
@@ -565,6 +787,7 @@ def _merge_vulnerabilities(vulnerabilities: list[Vulnerability]) -> list[Vulnera
         )
         process = _merge_process(items)
         proof_packets = _proof_packets(items)
+        reproduction_poc = _merge_reproduction_poc(items)
 
         description = winner.description
         if len(items) > 1:
@@ -584,6 +807,7 @@ def _merge_vulnerabilities(vulnerabilities: list[Vulnerability]) -> list[Vulnera
                     "evidence": evidence,
                     "process": process,
                     "proof_packets": proof_packets,
+                    "reproduction_poc": reproduction_poc,
                 }
             )
         )
@@ -837,6 +1061,141 @@ def _md_escape(text: str) -> str:
     return str(text or "").replace("|", "\\|")
 
 
+def _append_static_poc_lines(lines: list[str], poc: dict[str, object]) -> None:
+    payload = _poc_text(poc, "payload")
+    if payload:
+        lines.extend(["Payload：", "", "```text", payload, "```", ""])
+    steps = _poc_list(poc, "steps")
+    if steps:
+        lines.extend(["复现步骤：", ""])
+        for step_index, step in enumerate(steps, start=1):
+            lines.append(f"{step_index}. {step}")
+        lines.append("")
+    request_template = (
+        _poc_text(poc, "request_template")
+        or _poc_text(poc, "curl")
+        or _poc_text(poc, "command")
+    )
+    if request_template:
+        lines.extend(["请求/命令模板：", "", "```bash", request_template, "```", ""])
+    expected_result = _poc_text(poc, "expected_result") or _poc_text(poc, "expected_response")
+    if expected_result:
+        lines.extend(["预期结果：", "", expected_result, ""])
+    verification = _poc_text(poc, "verification")
+    if verification:
+        lines.extend(["判断标准：", "", verification, ""])
+    prerequisites = _poc_list(poc, "prerequisites")
+    if prerequisites:
+        lines.extend(["利用前提：", ""])
+        for item in prerequisites:
+            lines.append(f"- {item}")
+        lines.append("")
+    limitations = _poc_list(poc, "limitations")
+    if limitations:
+        lines.extend(["限制与说明：", ""])
+        for item in limitations:
+            lines.append(f"- {item}")
+        lines.append("")
+
+
+def _append_report_enrichment_packet_templates(
+    lines: list[str], report_enrichments: list[dict[str, object]]
+) -> None:
+    packet_items: list[tuple[str, dict[str, str]]] = []
+    for enrichment in report_enrichments:
+        finding_id = str(enrichment.get("finding_id") or "")
+        for packet in enrichment.get("packet_templates") or []:
+            if isinstance(packet, dict):
+                packet_items.append((finding_id, packet))
+    if not packet_items:
+        return
+
+    lines.extend(["#### 静态推测验证请求", "", f"> {_REPORT_ENRICHMENT_PACKET_NOTE}", ""])
+    for packet_index, (finding_id, packet) in enumerate(packet_items, start=1):
+        title = packet.get("title") or "静态推测验证请求"
+        lines.extend([f"**静态请求 {packet_index}：{title}**", ""])
+        if finding_id:
+            lines.extend([f"来源 finding：`{_md_escape(finding_id)}`", ""])
+        payload = str(packet.get("payload") or "").strip()
+        if payload:
+            lines.extend(["Payload：", "", "```text", payload, "```", ""])
+        request = str(packet.get("request") or "").strip()
+        if request:
+            lines.extend(["请求模板：", "", "```http", request, "```", ""])
+        expected_result = str(packet.get("expected_result") or "").strip()
+        if expected_result:
+            lines.extend(["预期结果：", "", expected_result, ""])
+        verification = str(packet.get("verification") or "").strip()
+        if verification:
+            lines.extend(["判断标准：", "", verification, ""])
+        note = str(packet.get("note") or "").strip()
+        if note:
+            lines.extend(["说明：", "", note, ""])
+
+
+def _append_report_enrichment_pocs(
+    lines: list[str], report_enrichments: list[dict[str, object]]
+) -> None:
+    poc_items = [
+        (str(enrichment.get("finding_id") or ""), enrichment.get("reproduction_poc"))
+        for enrichment in report_enrichments
+        if isinstance(enrichment.get("reproduction_poc"), dict) and enrichment.get("reproduction_poc")
+    ]
+    if not poc_items:
+        return
+
+    lines.extend(["#### 报告补充静态 PoC", "", f"> {_REPORT_ENRICHMENT_POC_NOTE}", ""])
+    for poc_index, (finding_id, poc) in enumerate(poc_items, start=1):
+        if len(poc_items) > 1:
+            lines.extend([f"**补充 PoC {poc_index}**", ""])
+        if finding_id:
+            lines.extend([f"来源 finding：`{_md_escape(finding_id)}`", ""])
+        _append_static_poc_lines(lines, poc)
+
+
+def _append_report_enrichment_notes(
+    lines: list[str], report_enrichments: list[dict[str, object]]
+) -> None:
+    if not any(
+        enrichment.get("evidence_chain")
+        or enrichment.get("report_sections")
+        or enrichment.get("delivery_notes")
+        for enrichment in report_enrichments
+    ):
+        return
+    lines.extend(["#### 报告补充说明", ""])
+    for enrichment in report_enrichments:
+        finding_id = str(enrichment.get("finding_id") or "")
+        if len(report_enrichments) > 1 and finding_id:
+            lines.extend([f"**来源 finding：`{_md_escape(finding_id)}`**", ""])
+        evidence_chain = enrichment.get("evidence_chain") or []
+        if evidence_chain:
+            lines.extend(["证据链：", ""])
+            for item in evidence_chain:
+                lines.append(f"- {item}")
+            lines.append("")
+        report_sections = enrichment.get("report_sections") or {}
+        if isinstance(report_sections, dict) and report_sections:
+            lines.extend(["报告正文补充：", ""])
+            for key, value in report_sections.items():
+                title = str(key).strip()
+                if not title:
+                    continue
+                lines.append(f"**{title}**")
+                if isinstance(value, list):
+                    for item in value:
+                        lines.append(f"- {item}")
+                else:
+                    lines.append(str(value))
+                lines.append("")
+        delivery_notes = enrichment.get("delivery_notes") or []
+        if delivery_notes:
+            lines.extend(["交付说明：", ""])
+            for item in delivery_notes:
+                lines.append(f"- {item}")
+            lines.append("")
+
+
 def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
     """Render a penetration-test style Markdown report.
 
@@ -846,6 +1205,7 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
     dedicated renderer.
     """
     counts = _summarize(vulnerabilities)
+    report_enrichments = _load_report_enrichments(vulnerabilities)
     lines: list[str] = [
         f"# {_report_title(vulnerabilities)}",
         "",
@@ -902,6 +1262,7 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
     for project_id, project_name, items in _project_groups(vulnerabilities):
         lines.extend(["---", "", f"## 项目：{project_name}（`{project_id}`）", ""])
         for index, vuln in enumerate(items, start=1):
+            vuln_report_enrichments = _report_enrichments_for_vulnerability(vuln, report_enrichments)
             lines.extend(
                 [
                     f"### {index}. {vuln.title}",
@@ -932,11 +1293,17 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
             lines.extend(["#### 漏洞证明数据包", ""])
             packets = vuln.proof_packets or []
             if not packets:
-                lines.extend(["未记录真实请求/响应数据包。", ""])
+                lines.extend([_MISSING_PROOF_MESSAGE, ""])
             for packet_index, packet in enumerate(packets, start=1):
                 lines.extend(
                     [
                         f"**证明 {packet_index}：{packet.get('title') or '漏洞证明'}**",
+                        "",
+                        "Payload：",
+                        "",
+                        "```text",
+                        str(packet.get("payload") or "未记录"),
+                        "```",
                         "",
                         "请求数据包：",
                         "",
@@ -954,6 +1321,22 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
                 if packet.get("note"):
                     lines.extend(["", f"说明：{packet['note']}"])
                 lines.append("")
+
+            _append_report_enrichment_packet_templates(lines, vuln_report_enrichments)
+
+            lines.extend(["#### 静态复现 PoC", ""])
+            poc = vuln.reproduction_poc or {}
+            if poc:
+                lines.extend([f"> {_STATIC_POC_NOTE}", ""])
+                _append_static_poc_lines(lines, poc)
+            else:
+                if vuln_report_enrichments:
+                    lines.extend(["确认记录未写入静态复现 PoC。", ""])
+                else:
+                    lines.extend(["未记录静态复现 PoC。", ""])
+
+            _append_report_enrichment_pocs(lines, vuln_report_enrichments)
+            _append_report_enrichment_notes(lines, vuln_report_enrichments)
 
             lines.extend(["#### 漏洞浮现过程", ""])
             for step_index, step in enumerate(vuln.process or [], start=1):

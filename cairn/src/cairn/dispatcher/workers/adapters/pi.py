@@ -5,6 +5,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from cairn.dispatcher.config import WorkerConfig
+from cairn.dispatcher.output_parser import strip_model_reasoning
 from cairn.dispatcher.workers.base import DriverResult, WorkerDriver
 
 
@@ -102,7 +103,7 @@ class PiDriver(WorkerDriver):
         assistant_message = self._assistant_message(events)
         if assistant_message is None:
             return "pi healthcheck did not contain an assistant response"
-        response = self._message_text(assistant_message).strip().lower().rstrip(".!")
+        response = strip_model_reasoning(self._message_text(assistant_message)).strip().lower().rstrip(".!")
         if response != "pong":
             return f"pi healthcheck expected pong, got: {response or '<empty>'}"
         return None

@@ -7,6 +7,23 @@ from cairn.dispatcher.runtime.cancellation import TaskCancellation
 
 
 @dataclass(slots=True)
+class TaskOutcome:
+    status: str
+    error_type: str | None = None
+    error_detail: str | None = None
+    rate_limited: bool = False
+    used_fallback: bool = False
+    stdout_preview: str | None = None
+    stderr_preview: str | None = None
+
+    @property
+    def storage_status(self) -> str:
+        if self.status in {"success", "failed", "rejected", "released"}:
+            return self.status
+        return "failed"
+
+
+@dataclass(slots=True)
 class RunningTask:
     project_id: str
     task_type: str

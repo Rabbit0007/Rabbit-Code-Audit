@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+from pathlib import Path
 from pathlib import PurePosixPath
 import tarfile
 import threading
@@ -41,6 +42,10 @@ class ContainerManager:
 
     def _ensure_running_locked(self, project_id: str, name: str) -> str:
         state = self.inspect_state(name)
+        if state is not None and not self._has_current_artifact_mount(name):
+            LOG.info("recreating container with stale artifact mount project=%s container=%s state=%s", project_id, name, state)
+            self.remove_container(name, force=True)
+            state = None
         if state == "running":
             LOG.debug("container already running project=%s container=%s", project_id, name)
             return name
@@ -50,14 +55,6 @@ class ContainerManager:
             return name
         LOG.info("creating container project=%s container=%s image=%s", project_id, name, self._config.image)
         try:
-            volumes = None
-            if self._config.artifact_volume:
-                volumes = {
-                    self._config.artifact_volume: {
-                        "bind": self._config.artifact_mount_path,
-                        "mode": "ro",
-                    }
-                }
             self._client.containers.run(
                 self._config.image,
                 ["sleep", "infinity"],
@@ -65,7 +62,7 @@ class ContainerManager:
                 name=name,
                 network_mode=self._config.network_mode,
                 cap_add=self._config.cap_add or None,
-                volumes=volumes,
+                volumes=self._container_volumes(),
             )
             LOG.info("created container project=%s container=%s", project_id, name)
             return name
@@ -94,14 +91,6 @@ class ContainerManager:
         name = f"{self._STARTUP_PREFIX}{uuid.uuid4().hex[:12]}"
         LOG.debug("creating startup healthcheck container container=%s image=%s", name, self._config.image)
         try:
-            volumes = None
-            if self._config.artifact_volume:
-                volumes = {
-                    self._config.artifact_volume: {
-                        "bind": self._config.artifact_mount_path,
-                        "mode": "ro",
-                    }
-                }
             self._client.containers.run(
                 self._config.image,
                 ["sleep", "infinity"],
@@ -109,7 +98,7 @@ class ContainerManager:
                 name=name,
                 network_mode=self._config.network_mode,
                 cap_add=self._config.cap_add or None,
-                volumes=volumes,
+                volumes=self._container_volumes(),
             )
         except DockerException as exc:
             raise RuntimeError(f"failed to create startup container {name}: {exc}") from exc
@@ -240,6 +229,25 @@ class ContainerManager:
         if not ok:
             raise RuntimeError(f"failed to write container file {path}")
 
+    def directory_exists(self, container_name: str, path: str) -> bool:
+        self._validate_container_path(path)
+        container = self._require_container(container_name)
+        try:
+            result = container.exec_run(["test", "-d", path], stdout=False, stderr=False)
+        except DockerException as exc:
+            raise RuntimeError(f"failed to check container directory {path}: {exc}") from exc
+        exit_code = getattr(result, "exit_code", None)
+        if exit_code is None and isinstance(result, tuple) and result:
+            exit_code = result[0]
+        return exit_code == 0
+
+    def artifact_mount_description(self) -> str:
+        expected = self._expected_artifact_mount()
+        if expected is None:
+            return f"no artifact mount configured; container_path={self._config.artifact_mount_path}"
+        mount_type, source = expected
+        return f"{mount_type}:{source}->{self._config.artifact_mount_path}"
+
     def remove_container(self, name: str, *, force: bool = True) -> None:
         container = self._get_container(name)
         if container is None:
@@ -276,6 +284,54 @@ class ContainerManager:
             raise RuntimeError(f"container not found: {name}")
         return container
 
+    def _container_volumes(self) -> dict[str, dict[str, str]] | None:
+        mount = self._expected_artifact_mount()
+        if mount is None:
+            return None
+        mount_type, source = mount
+        if mount_type == "bind" and not Path(source).exists():
+            raise RuntimeError(f"artifact_host_path does not exist: {source}")
+        return {
+            source: {
+                "bind": self._config.artifact_mount_path,
+                "mode": "ro",
+            }
+        }
+
+    def _has_current_artifact_mount(self, name: str) -> bool:
+        expected = self._expected_artifact_mount()
+        if expected is None:
+            return True
+        expected_type, expected_source = expected
+        container = self._require_container(name)
+        try:
+            container.reload()
+        except DockerException as exc:
+            raise RuntimeError(f"failed to inspect container mounts {name}: {exc}") from exc
+        for mount in container.attrs.get("Mounts", []) or []:
+            if mount.get("Destination") != self._config.artifact_mount_path:
+                continue
+            if expected_type == "volume":
+                return mount.get("Type") == "volume" and mount.get("Name") == expected_source
+            if mount.get("Type") != "bind":
+                return False
+            current_source = mount.get("Source")
+            if not isinstance(current_source, str) or not current_source:
+                return False
+            try:
+                return Path(current_source).resolve() == Path(expected_source).resolve()
+            except OSError:
+                return current_source == expected_source
+        return False
+
+    def _expected_artifact_mount(self) -> tuple[str, str] | None:
+        if self._config.artifact_host_path:
+            host_path = Path(self._config.artifact_host_path).expanduser().resolve()
+            return ("bind", str(host_path))
+        if self._config.artifact_volume:
+            return ("volume", self._config.artifact_volume)
+        return None
+
     @staticmethod
     def _is_name_conflict(exc: APIError) -> bool:
         status_code = getattr(getattr(exc, "response", None), "status_code", None)
@@ -283,13 +339,19 @@ class ContainerManager:
         return status_code == 409 or "is already in use" in explanation
 
     @staticmethod
-    def _text_file_archive(path: str, content: str) -> tuple[str, bytes]:
+    def _validate_container_path(path: str) -> PurePosixPath:
         target = PurePosixPath(path)
         if not target.is_absolute() or target.name in ("", ".", ".."):
             raise ValueError(f"container file path must be absolute: {path}")
         parts = target.parts[1:]
         if not parts or any(part in ("", ".", "..") for part in parts):
             raise ValueError(f"invalid container file path: {path}")
+        return target
+
+    @staticmethod
+    def _text_file_archive(path: str, content: str) -> tuple[str, bytes]:
+        target = ContainerManager._validate_container_path(path)
+        parts = target.parts[1:]
         if len(parts) == 1:
             archive_path = "/"
             archive_parts = parts

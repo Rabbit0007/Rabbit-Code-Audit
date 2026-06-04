@@ -11,11 +11,13 @@ from cairn.server.middleware.auth import require_auth
 from cairn.server.routers import (
     auth,
     activity,
+    business_graph,
     export,
     findings,
     hints,
     intents,
     projects,
+    report_enrichments,
     settings,
     sources,
     templates,
@@ -64,10 +66,12 @@ app.include_router(intents.router, dependencies=_protected)
 app.include_router(export.router, dependencies=_protected)
 app.include_router(findings.router, dependencies=_protected)
 app.include_router(vulnerabilities.router, dependencies=_protected)
+app.include_router(report_enrichments.router, dependencies=_protected)
 app.include_router(workers.router, dependencies=_protected)
 app.include_router(templates.router, dependencies=_protected)
 app.include_router(timeline.router, dependencies=_protected)
 app.include_router(activity.router, dependencies=_protected)
+app.include_router(business_graph.router, dependencies=_protected)
 
 
 @app.get("/", include_in_schema=False)

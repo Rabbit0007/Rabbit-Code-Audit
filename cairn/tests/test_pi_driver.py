@@ -95,6 +95,12 @@ def test_pi_driver_healthcheck_accepts_pong(response):
     assert PiDriver().healthcheck_error(0, stdout, "") is None
 
 
+def test_pi_driver_healthcheck_accepts_pong_after_model_reasoning():
+    stdout = _jsonl(_agent_end("I should answer with pong.</think>pong"))
+
+    assert PiDriver().healthcheck_error(0, stdout, "") is None
+
+
 def test_startup_healthcheck_marks_pi_agent_error_unhealthy(monkeypatch):
     stdout = _jsonl(
         _agent_end("", stop_reason="error", error_message="No API provider registered for api: openai")

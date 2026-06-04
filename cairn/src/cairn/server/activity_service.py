@@ -9,6 +9,7 @@ wrapped in a try/except that swallows database errors.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timezone
 
 from cairn.server.db import get_conn
@@ -28,18 +29,15 @@ def record_audit(
     target_type: str | None = None,
     target_id: str | None = None,
     detail: str | None = None,
+    conn: sqlite3.Connection | None = None,
 ) -> None:
     """Append a single audit-log row. Best-effort; never raises."""
     try:
-        with get_conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO audit_log
-                    (created_at, actor, action, target_type, target_id, summary, detail)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (_now(), actor or "admin", action, target_type, target_id, summary, detail),
-            )
+        if conn is not None:
+            _insert_audit(conn, action, summary, actor, target_type, target_id, detail)
+            return
+        with get_conn() as own_conn:
+            _insert_audit(own_conn, action, summary, actor, target_type, target_id, detail)
     except Exception:  # pragma: no cover - logging must not break the operation
         pass
 
@@ -50,18 +48,51 @@ def record_notification(
     level: str = "info",
     body: str | None = None,
     link: str | None = None,
+    conn: sqlite3.Connection | None = None,
 ) -> None:
     """Append a single notification row. Best-effort; never raises."""
     if level not in _NOTIFICATION_LEVELS:
         level = "info"
     try:
-        with get_conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO notifications (created_at, level, title, body, link, read)
-                VALUES (?, ?, ?, ?, ?, 0)
-                """,
-                (_now(), level, title, body, link),
-            )
+        if conn is not None:
+            _insert_notification(conn, title, level, body, link)
+            return
+        with get_conn() as own_conn:
+            _insert_notification(own_conn, title, level, body, link)
     except Exception:  # pragma: no cover - logging must not break the operation
         pass
+
+
+def _insert_audit(
+    conn: sqlite3.Connection,
+    action: str,
+    summary: str,
+    actor: str,
+    target_type: str | None,
+    target_id: str | None,
+    detail: str | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO audit_log
+            (created_at, actor, action, target_type, target_id, summary, detail)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (_now(), actor or "admin", action, target_type, target_id, summary, detail),
+    )
+
+
+def _insert_notification(
+    conn: sqlite3.Connection,
+    title: str,
+    level: str,
+    body: str | None,
+    link: str | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO notifications (created_at, level, title, body, link, read)
+        VALUES (?, ?, ?, ?, ?, 0)
+        """,
+        (_now(), level, title, body, link),
+    )

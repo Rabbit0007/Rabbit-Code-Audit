@@ -48,6 +48,7 @@ class Vulnerability(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     process: list[dict[str, str]] = Field(default_factory=list)
     proof_packets: list[dict[str, str]] = Field(default_factory=list)
+    reproduction_poc: dict[str, object] = Field(default_factory=dict)
 
 
 class VulnerabilitySummary(BaseModel):

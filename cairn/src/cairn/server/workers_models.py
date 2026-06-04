@@ -69,9 +69,55 @@ class WorkerTaskHistoryEntry(BaseModel):
     started_at: str
     duration_seconds: float | None = None
     outcome: Literal["success", "failed", "rejected", "released"]
+    error_type: str | None = None
+    error_detail: str | None = None
+    rate_limited: bool = False
+    used_fallback: bool = False
+    stdout_preview: str | None = None
+    stderr_preview: str | None = None
 
 
-TaskType = Literal["reason", "explore", "bootstrap"]
+class CreateWorkerTaskHistoryRequest(BaseModel):
+    worker_name: str
+    project_id: str
+    task_type: str
+    intent_id: str | None = None
+    started_at: str
+    completed_at: str | None = None
+    duration_seconds: float | None = None
+    outcome: Literal["success", "failed", "rejected", "released"]
+    error_type: str | None = None
+    error_detail: str | None = None
+    rate_limited: bool = False
+    used_fallback: bool = False
+    stdout_preview: str | None = None
+    stderr_preview: str | None = None
+
+    @field_validator("worker_name", "project_id", "task_type", "started_at")
+    @classmethod
+    def validate_required_text(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("must not be empty")
+        return text
+
+    @field_validator(
+        "intent_id",
+        "completed_at",
+        "error_type",
+        "error_detail",
+        "stdout_preview",
+        "stderr_preview",
+    )
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        return text or None
+
+
+TaskType = Literal["reason", "explore", "bootstrap", "report_enrichment"]
 WorkerType = Literal["claudecode", "codex", "pi", "mock"]
 
 

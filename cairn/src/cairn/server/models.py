@@ -12,6 +12,12 @@ class Settings(BaseModel):
     reason_timeout: int = Field(ge=5)
 
 
+class RuntimeInfo(BaseModel):
+    db_path: str
+    artifact_root: str
+    source_container_root: str
+
+
 class Fact(BaseModel):
     id: str
     description: str

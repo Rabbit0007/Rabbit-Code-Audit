@@ -31,8 +31,12 @@ def run_startup_healthchecks(
     *,
     show_commands: bool = False,
 ) -> list[StartupHealthcheckResult]:
-    container_name = container_manager.create_startup_container()
     workers = [worker for worker in config.workers if worker.enabled]
+    if not workers:
+        LOG.warning("[!] Startup healthcheck skipped: no enabled workers")
+        return []
+
+    container_name = container_manager.create_startup_container()
     parallelism = max(1, min(len(workers), config.runtime.max_workers, 8))
     LOG.info(
         "[*] Startup healthcheck: workers=%s parallelism=%s",

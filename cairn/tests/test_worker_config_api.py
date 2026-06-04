@@ -188,7 +188,7 @@ def test_internal_worker_config_validation_failure_does_not_apply(tmp_path):
     assert [worker.name for worker in loop.config.workers] == ["mock-1"]
 
 
-def test_internal_worker_config_rejects_all_disabled_workers(tmp_path):
+def test_internal_worker_config_allows_all_disabled_workers(tmp_path):
     client, loop = _client(
         tmp_path,
         _config(
@@ -223,8 +223,8 @@ def test_internal_worker_config_rejects_all_disabled_workers(tmp_path):
         },
     )
 
-    assert response.status_code == 422
-    assert loop.config.workers[0].enabled is True
+    assert response.status_code == 200
+    assert loop.config.workers[0].enabled is False
 
 
 def test_write_dispatch_config_falls_back_when_bind_mount_replace_is_busy(

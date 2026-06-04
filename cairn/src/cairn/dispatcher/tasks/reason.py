@@ -22,9 +22,11 @@ from cairn.dispatcher.tasks.common import (
     preview,
     run_healthcheck,
     run_worker_process,
+    task_outcome,
     write_graph_snapshot_reference,
 )
 from cairn.dispatcher.workers.registry import get_driver
+from cairn.dispatcher.models import TaskOutcome
 from cairn.server.models import ProjectDetail
 
 LOG = logging.getLogger(__name__)
@@ -38,7 +40,7 @@ def run_reason_task(
     export_yaml: str,
     worker: WorkerConfig,
     cancellation: TaskCancellation,
-) -> str:
+) -> TaskOutcome:
     driver = get_driver(worker.type)
     task_started = time.perf_counter()
     healthcheck_timeout = config.runtime.healthcheck_timeout
@@ -70,7 +72,7 @@ def run_reason_task(
                 worker.name,
                 cancelled,
             )
-            return "cancelled"
+            return task_outcome("cancelled", error_type="cancelled", error_detail=cancelled, result=healthcheck.result)
         if lease.failure is not None:
             LOG.warning(
                 "heartbeat lost during reason healthcheck project=%s worker=%s status=%s",
@@ -78,7 +80,7 @@ def run_reason_task(
                 worker.name,
                 lease.failure.status_code,
             )
-            return "failed"
+            return task_outcome("failed", error_type="heartbeat_lost", error_detail=f"status={lease.failure.status_code}", result=healthcheck.result)
         healthcheck_error = driver.healthcheck_error(
             healthcheck.result.returncode,
             healthcheck.result.stdout,
@@ -92,7 +94,7 @@ def run_reason_task(
                 healthcheck.duration_ms,
                 preview(healthcheck_error),
             )
-            return "unhealthy"
+            return task_outcome("unhealthy", error_type="healthcheck_failed", error_detail=healthcheck_error, result=healthcheck.result)
         open_intents = [
             {
                 "id": intent.id,
@@ -153,7 +155,7 @@ def run_reason_task(
                 cancelled,
                 execute_ms,
             )
-            return "cancelled"
+            return task_outcome("cancelled", error_type="cancelled", error_detail=cancelled, result=result)
         if lease.failure is not None:
             LOG.warning(
                 "heartbeat lost during reason project=%s worker=%s status=%s execute_ms=%s",
@@ -162,7 +164,7 @@ def run_reason_task(
                 lease.failure.status_code,
                 execute_ms,
             )
-            return "failed"
+            return task_outcome("failed", error_type="heartbeat_lost", error_detail=f"status={lease.failure.status_code}", result=result)
         if did_timeout(result):
             LOG.warning(
                 "reason timed out project=%s worker=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -173,7 +175,7 @@ def run_reason_task(
                 preview(result.stdout),
                 preview(result.stderr),
             )
-            return "failed"
+            return task_outcome("failed", error_type="timeout", result=result)
         if result.returncode != 0:
             LOG.warning(
                 "reason command failed project=%s worker=%s code=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -185,7 +187,7 @@ def run_reason_task(
                 preview(result.stdout),
                 preview(result.stderr),
             )
-            return "failed"
+            return task_outcome("failed", error_type="command_failed", error_detail=f"returncode={result.returncode}", result=result)
         try:
             model_output = driver.extract_response_text(result.stdout, result.stderr)
             payload = parse_json_output(model_output)
@@ -203,7 +205,7 @@ def run_reason_task(
                 preview(result.stdout),
                 preview(result.stderr),
             )
-            return "failed"
+            return task_outcome("failed", error_type="parse_failed", error_detail=str(exc), result=result)
         if kind == "rejected":
             LOG.warning(
                 "reason rejected project=%s worker=%s execute_ms=%s total_ms=%s stdout_preview=%s",
@@ -213,12 +215,12 @@ def run_reason_task(
                 total_ms,
                 preview(result.stdout),
             )
-            return "rejected"
+            return task_outcome("rejected", error_type="model_rejected", result=result)
         if kind == "complete":
             response = client.complete(project.project.id, data["from"], data["description"], worker.name)
             if response.status_code == 403:
                 LOG.info("project became inactive during reason complete project=%s worker=%s", project.project.id, worker.name)
-                return "success"
+                return task_outcome("success")
             if not response.ok:
                 LOG.warning(
                     "reason complete write failed project=%s worker=%s status=%s body=%s",
@@ -227,7 +229,7 @@ def run_reason_task(
                     response.status_code,
                     response.text,
                 )
-                return "failed"
+                return task_outcome("failed", error_type="complete_write_failed", error_detail=f"status={response.status_code}: {response.text}")
             LOG.info(
                 "project completed project=%s worker=%s from=%s execute_ms=%s total_ms=%s",
                 project.project.id,
@@ -236,14 +238,14 @@ def run_reason_task(
                 execute_ms,
                 total_ms,
             )
-            return "success"
+            return task_outcome("success")
         if kind == "intents":
             created = 0
             for intent_data in data:
                 response = client.create_intent(project.project.id, intent_data["from"], intent_data["description"], worker.name)
                 if response.status_code == 403:
                     LOG.info("project became inactive during reason intent create project=%s worker=%s created=%s", project.project.id, worker.name, created)
-                    return "success"
+                    return task_outcome("success")
                 if response.status_code == 409:
                     LOG.info("reason intent lost race project=%s worker=%s from=%s", project.project.id, worker.name, intent_data["from"])
                     continue
@@ -282,8 +284,8 @@ def run_reason_task(
                     execute_ms,
                     total_ms,
                 )
-                return "failed"
-            return "success"
+                return task_outcome("failed", error_type="intent_write_failed", error_detail="reason created no intents")
+            return task_outcome("success")
         LOG.info(
             "reason finished without graph change project=%s worker=%s execute_ms=%s total_ms=%s",
             project.project.id,
@@ -291,7 +293,7 @@ def run_reason_task(
             execute_ms,
             total_ms,
         )
-        return "success"
+        return task_outcome("success")
     finally:
         lease.stop()
         best_effort_release_reason(client, project.project.id, worker.name)

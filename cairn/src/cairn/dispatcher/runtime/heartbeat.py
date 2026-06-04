@@ -70,6 +70,22 @@ class HeartbeatLease:
             interval=interval,
         )
 
+    @classmethod
+    def for_report_enrichment(
+        cls,
+        client: CairnClient,
+        project_id: str,
+        task_id: str,
+        worker_name: str,
+        interval: int,
+    ) -> "HeartbeatLease":
+        return cls(
+            heartbeat=lambda: client.report_enrichment_heartbeat(task_id, worker_name),
+            scope=f"project={project_id} report_enrichment={task_id}",
+            worker_name=worker_name,
+            interval=interval,
+        )
+
     def start(self) -> None:
         self._thread.start()
 

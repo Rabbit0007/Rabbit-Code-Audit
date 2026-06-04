@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS vulnerabilities (
     source_fact_ids_json TEXT NOT NULL DEFAULT '[]',
     evidence_json TEXT NOT NULL DEFAULT '[]',
     process_json TEXT NOT NULL DEFAULT '[]',
+    proof_packets_json TEXT NOT NULL DEFAULT '[]',
+    reproduction_poc_json TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'confirmed' CHECK(status IN ('confirmed', 'ignored')),
     UNIQUE(project_id, fact_id)
 );
@@ -64,7 +66,13 @@ CREATE TABLE IF NOT EXISTS worker_task_history (
     started_at TEXT NOT NULL,
     completed_at TEXT,
     duration_seconds REAL,
-    outcome TEXT NOT NULL CHECK(outcome IN ('success', 'failed', 'rejected', 'released'))
+    outcome TEXT NOT NULL CHECK(outcome IN ('success', 'failed', 'rejected', 'released')),
+    error_type TEXT,
+    error_detail TEXT,
+    rate_limited INTEGER NOT NULL DEFAULT 0,
+    used_fallback INTEGER NOT NULL DEFAULT 0,
+    stdout_preview TEXT,
+    stderr_preview TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_worker_history_worker
@@ -164,6 +172,56 @@ CREATE TABLE IF NOT EXISTS code_files (
 CREATE INDEX IF NOT EXISTS idx_code_files_language
     ON code_files(snapshot_id, language);
 
+CREATE TABLE IF NOT EXISTS code_symbols (
+    id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    language TEXT,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    container TEXT,
+    signature TEXT,
+    line_start INTEGER,
+    line_end INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_symbols_snapshot
+    ON code_symbols(snapshot_id, path, kind);
+CREATE INDEX IF NOT EXISTS idx_code_symbols_name
+    ON code_symbols(snapshot_id, name);
+
+CREATE TABLE IF NOT EXISTS code_entrypoints (
+    id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    language TEXT,
+    kind TEXT NOT NULL,
+    framework TEXT,
+    method TEXT,
+    route TEXT NOT NULL,
+    handler TEXT,
+    line_start INTEGER,
+    evidence TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_entrypoints_snapshot
+    ON code_entrypoints(snapshot_id, path, kind);
+CREATE INDEX IF NOT EXISTS idx_code_entrypoints_route
+    ON code_entrypoints(snapshot_id, route);
+
+CREATE TABLE IF NOT EXISTS dependency_manifests (
+    id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    manifest_type TEXT NOT NULL,
+    package_name TEXT,
+    dependencies_json TEXT NOT NULL DEFAULT '[]',
+    dev_dependencies_json TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE INDEX IF NOT EXISTS idx_dependency_manifests_snapshot
+    ON dependency_manifests(snapshot_id, manifest_type);
+
 CREATE TABLE IF NOT EXISTS tool_findings (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -199,9 +257,14 @@ CREATE TABLE IF NOT EXISTS audit_findings (
     file_path TEXT,
     line_start INTEGER,
     line_end INTEGER,
+    symbol TEXT,
+    entry_point TEXT,
+    business_node_id TEXT REFERENCES business_nodes(id) ON DELETE SET NULL,
     description TEXT NOT NULL,
     impact TEXT,
     evidence TEXT,
+    proof_packets_json TEXT NOT NULL DEFAULT '[]',
+    reproduction_poc_json TEXT NOT NULL DEFAULT '{}',
     remediation TEXT,
     discovered_by TEXT NOT NULL,
     reviewed_by TEXT,
@@ -211,6 +274,125 @@ CREATE TABLE IF NOT EXISTS audit_findings (
 
 CREATE INDEX IF NOT EXISTS idx_audit_findings_project
     ON audit_findings(project_id, snapshot_id, status, severity);
+
+CREATE TABLE IF NOT EXISTS business_nodes (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    node_type TEXT NOT NULL
+        CHECK(node_type IN (
+            'feature', 'role', 'endpoint', 'data_object', 'state',
+            'control', 'asset', 'risk', 'external_system'
+        )),
+    title TEXT NOT NULL,
+    description TEXT,
+    risk_level TEXT NOT NULL DEFAULT 'unknown'
+        CHECK(risk_level IN ('critical', 'high', 'medium', 'low', 'unknown')),
+    review_status TEXT NOT NULL DEFAULT 'unreviewed'
+        CHECK(review_status IN ('unreviewed', 'investigating', 'covered', 'blocked')),
+    coverage_note TEXT,
+    last_intent_id TEXT,
+    risk_tags_json TEXT NOT NULL DEFAULT '[]',
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_business_nodes_project
+    ON business_nodes(project_id, node_type);
+
+CREATE TABLE IF NOT EXISTS business_edges (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    from_node_id TEXT NOT NULL REFERENCES business_nodes(id) ON DELETE CASCADE,
+    to_node_id TEXT NOT NULL REFERENCES business_nodes(id) ON DELETE CASCADE,
+    relation TEXT NOT NULL
+        CHECK(relation IN (
+            'contains', 'exposes', 'calls', 'uses', 'owns',
+            'guards', 'transitions_to', 'depends_on', 'risk_of', 'relates_to'
+        )),
+    description TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_business_edges_project
+    ON business_edges(project_id, relation);
+
+CREATE TABLE IF NOT EXISTS business_node_conclusions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    business_node_id TEXT NOT NULL REFERENCES business_nodes(id) ON DELETE CASCADE,
+    conclusion TEXT NOT NULL
+        CHECK(conclusion IN ('confirmed_finding', 'rejected', 'needs_more_evidence')),
+    summary TEXT NOT NULL,
+    evidence TEXT,
+    audit_finding_id TEXT REFERENCES audit_findings(id) ON DELETE SET NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_business_node_conclusions_project
+    ON business_node_conclusions(project_id, business_node_id, created_at);
+
+CREATE TABLE IF NOT EXISTS audit_candidates (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    snapshot_id TEXT NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    candidate_type TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'unknown'
+        CHECK(severity IN ('critical', 'high', 'medium', 'low', 'info', 'unknown')),
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    file_path TEXT,
+    line_start INTEGER,
+    line_end INTEGER,
+    entry_point TEXT,
+    symbol TEXT,
+    tool_finding_id TEXT REFERENCES tool_findings(id) ON DELETE SET NULL,
+    business_node_id TEXT REFERENCES business_nodes(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'candidate'
+        CHECK(status IN ('candidate', 'investigating', 'confirmed', 'rejected', 'needs_more_evidence')),
+    conclusion_summary TEXT,
+    evidence TEXT,
+    audit_finding_id TEXT REFERENCES audit_findings(id) ON DELETE SET NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    concluded_by TEXT,
+    concluded_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_candidates_project
+    ON audit_candidates(project_id, snapshot_id, status, severity);
+CREATE INDEX IF NOT EXISTS idx_audit_candidates_location
+    ON audit_candidates(project_id, snapshot_id, file_path, line_start);
+
+CREATE TABLE IF NOT EXISTS report_enrichment_tasks (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    finding_id TEXT NOT NULL REFERENCES audit_findings(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+    created_by TEXT NOT NULL,
+    worker TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    last_heartbeat_at TEXT,
+    completed_at TEXT,
+    error_message TEXT,
+    packet_templates_json TEXT NOT NULL DEFAULT '[]',
+    reproduction_poc_json TEXT NOT NULL DEFAULT '{}',
+    evidence_chain_json TEXT NOT NULL DEFAULT '[]',
+    report_sections_json TEXT NOT NULL DEFAULT '{}',
+    delivery_notes_json TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE INDEX IF NOT EXISTS idx_report_enrichment_project
+    ON report_enrichment_tasks(project_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_report_enrichment_finding
+    ON report_enrichment_tasks(project_id, finding_id, status, created_at);
 """
 
 VULNERABILITY_COLUMNS: dict[str, str] = {
@@ -220,7 +402,48 @@ VULNERABILITY_COLUMNS: dict[str, str] = {
     "source_fact_ids_json": "TEXT NOT NULL DEFAULT '[]'",
     "evidence_json": "TEXT NOT NULL DEFAULT '[]'",
     "process_json": "TEXT NOT NULL DEFAULT '[]'",
+    "proof_packets_json": "TEXT NOT NULL DEFAULT '[]'",
+    "reproduction_poc_json": "TEXT NOT NULL DEFAULT '{}'",
     "status": "TEXT NOT NULL DEFAULT 'confirmed'",
+}
+
+
+AUDIT_FINDING_COLUMNS: dict[str, str] = {
+    "symbol": "TEXT",
+    "entry_point": "TEXT",
+    "business_node_id": "TEXT REFERENCES business_nodes(id) ON DELETE SET NULL",
+    "proof_packets_json": "TEXT NOT NULL DEFAULT '[]'",
+    "reproduction_poc_json": "TEXT NOT NULL DEFAULT '{}'",
+}
+
+BUSINESS_NODE_COLUMNS: dict[str, str] = {
+    "risk_level": (
+        "TEXT NOT NULL DEFAULT 'unknown' "
+        "CHECK(risk_level IN ('critical', 'high', 'medium', 'low', 'unknown'))"
+    ),
+    "review_status": (
+        "TEXT NOT NULL DEFAULT 'unreviewed' "
+        "CHECK(review_status IN ('unreviewed', 'investigating', 'covered', 'blocked'))"
+    ),
+    "coverage_note": "TEXT",
+    "last_intent_id": "TEXT",
+}
+
+WORKER_TASK_HISTORY_COLUMNS: dict[str, str] = {
+    "error_type": "TEXT",
+    "error_detail": "TEXT",
+    "rate_limited": "INTEGER NOT NULL DEFAULT 0",
+    "used_fallback": "INTEGER NOT NULL DEFAULT 0",
+    "stdout_preview": "TEXT",
+    "stderr_preview": "TEXT",
+}
+
+REPORT_ENRICHMENT_COLUMNS: dict[str, str] = {
+    "packet_templates_json": "TEXT NOT NULL DEFAULT '[]'",
+    "reproduction_poc_json": "TEXT NOT NULL DEFAULT '{}'",
+    "evidence_chain_json": "TEXT NOT NULL DEFAULT '[]'",
+    "report_sections_json": "TEXT NOT NULL DEFAULT '{}'",
+    "delivery_notes_json": "TEXT NOT NULL DEFAULT '[]'",
 }
 
 
@@ -232,6 +455,16 @@ def _ensure_vulnerability_columns(conn) -> None:
     for name, ddl in VULNERABILITY_COLUMNS.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE vulnerabilities ADD COLUMN {name} {ddl}")
+
+
+def _ensure_columns(conn, table: str, columns: dict[str, str]) -> None:
+    existing = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    for name, ddl in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
 def configure_product_db() -> None:
@@ -247,3 +480,7 @@ def configure_product_db() -> None:
     with db.get_conn() as conn:
         conn.executescript(PRODUCT_SCHEMA)
         _ensure_vulnerability_columns(conn)
+        _ensure_columns(conn, "audit_findings", AUDIT_FINDING_COLUMNS)
+        _ensure_columns(conn, "business_nodes", BUSINESS_NODE_COLUMNS)
+        _ensure_columns(conn, "worker_task_history", WORKER_TASK_HISTORY_COLUMNS)
+        _ensure_columns(conn, "report_enrichment_tasks", REPORT_ENRICHMENT_COLUMNS)

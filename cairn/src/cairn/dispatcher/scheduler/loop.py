@@ -6,13 +6,14 @@ import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import requests
 
 from cairn.dispatcher.config import DispatchConfig, WorkerConfig
-from cairn.dispatcher.models import ReasonCheckpoint, RunningTask
+from cairn.dispatcher.models import ReasonCheckpoint, RunningTask, TaskOutcome
 from cairn.dispatcher.protocol.client import CairnClient
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
 from cairn.dispatcher.runtime.containers import ContainerManager
@@ -21,11 +22,13 @@ from cairn.dispatcher.scheduler.worker_select import choose_worker
 from cairn.dispatcher.tasks.bootstrap import run_bootstrap_task
 from cairn.dispatcher.tasks.explore import run_explore_task
 from cairn.dispatcher.tasks.reason import run_reason_task
+from cairn.dispatcher.tasks.report_enrichment import run_report_enrichment_task
 from cairn.server.models import Intent, ProjectDetail, ProjectSummary
 
 LOG = logging.getLogger(__name__)
 UNHEALTHY_RETRY_AFTER_SECONDS = 5
 REJECTED_RETRY_AFTER_SECONDS = 5
+SOURCE_PREFLIGHT_RETRY_AFTER_SECONDS = 60
 BOOTSTRAP_INTENT_DESCRIPTION = "bootstrap"
 BOOTSTRAP_INTENT_CREATOR = "dispatcher.bootstrap"
 
@@ -48,12 +51,13 @@ class DispatcherLoop:
         self.container_manager = ContainerManager(self.config.container)
         self.executor = ThreadPoolExecutor(max_workers=self.config.runtime.max_workers)
         self.cleanup_executor = ThreadPoolExecutor(max_workers=max(1, min(8, self.config.runtime.max_workers)))
-        self.futures: dict[Future[str], RunningTask] = {}
+        self.futures: dict[Future[str | TaskOutcome], RunningTask] = {}
         self.cleanup_futures: dict[Future[bool], tuple[str, str | None, str | None]] = {}
         self.reason_checkpoints: dict[str, ReasonCheckpoint] = {}
         self.runtime_project_ids: set[str] = set()
         self.worker_unhealthy_until: dict[str, float] = {}
         self.worker_rejected_until: dict[tuple[str, str, str], float] = {}
+        self.source_preflight_blocked_until: dict[tuple[str, str], float] = {}
         self._log_state: dict[str, tuple[int, str, tuple[object, ...]]] = {}
         self._cleanup_pending: set[str] = set()
         self._inactive_cleanup_done: dict[str, str] = {}
@@ -99,7 +103,7 @@ class DispatcherLoop:
         if self.task_history is None or self.task_history.maxlen != history_size:
             self.task_history = deque(self.task_history or (), maxlen=history_size)
 
-    def _record_task_history(self, task: RunningTask, outcome: str) -> None:
+    def _record_task_history(self, task: RunningTask, outcome: TaskOutcome) -> None:
         """Append a completed-task record to the optional history buffer.
 
         No-op unless ``enable_internal_state_tracking`` has been called. Wrapped
@@ -112,20 +116,75 @@ class DispatcherLoop:
             now = time.time()
             started_at = getattr(task, "started_at", None)
             duration = round(max(0.0, now - started_at), 3) if isinstance(started_at, (int, float)) else None
-            history.append(
-                {
-                    "project_id": task.project_id,
-                    "task_type": task.task_type,
-                    "worker_name": task.worker_name,
-                    "intent_id": task.intent_id,
-                    "outcome": outcome,
-                    "started_at": started_at,
-                    "completed_at": now,
-                    "duration_seconds": duration,
-                }
-            )
+            history.append(self._task_history_payload(task, outcome, completed_at=now, duration_seconds=duration, epoch_times=True))
         except Exception:  # pragma: no cover - defensive only
             LOG.debug("failed to record task history", exc_info=True)
+
+    def _persist_task_history(self, task: RunningTask, outcome: TaskOutcome) -> None:
+        try:
+            completed_at = time.time()
+            duration = round(max(0.0, completed_at - task.started_at), 3)
+            payload = self._task_history_payload(task, outcome, completed_at=completed_at, duration_seconds=duration)
+            response = self.client.record_worker_task_history(payload)
+            if not response.ok:
+                LOG.warning(
+                    "worker task history write failed project=%s task=%s worker=%s status=%s body=%s",
+                    task.project_id,
+                    task.task_type,
+                    task.worker_name,
+                    response.status_code,
+                    response.text,
+                )
+        except Exception:
+            LOG.warning(
+                "worker task history write crashed project=%s task=%s worker=%s",
+                task.project_id,
+                task.task_type,
+                task.worker_name,
+                exc_info=True,
+            )
+
+    def _task_history_payload(
+        self,
+        task: RunningTask,
+        outcome: TaskOutcome,
+        *,
+        completed_at: float,
+        duration_seconds: float | None,
+        epoch_times: bool = False,
+    ) -> dict[str, Any]:
+        if epoch_times:
+            started_at: str | float = task.started_at
+            completed_value: str | float = completed_at
+        else:
+            started_at = self._format_epoch(task.started_at)
+            completed_value = self._format_epoch(completed_at)
+        return {
+            "project_id": task.project_id,
+            "task_type": task.task_type,
+            "worker_name": task.worker_name,
+            "intent_id": task.intent_id,
+            "outcome": outcome.storage_status,
+            "started_at": started_at,
+            "completed_at": completed_value,
+            "duration_seconds": duration_seconds,
+            "error_type": outcome.error_type,
+            "error_detail": outcome.error_detail,
+            "rate_limited": outcome.rate_limited,
+            "used_fallback": outcome.used_fallback,
+            "stdout_preview": outcome.stdout_preview,
+            "stderr_preview": outcome.stderr_preview,
+        }
+
+    @staticmethod
+    def _format_epoch(value: float) -> str:
+        return datetime.fromtimestamp(value, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @staticmethod
+    def _coerce_task_outcome(value: str | TaskOutcome) -> TaskOutcome:
+        if isinstance(value, TaskOutcome):
+            return value
+        return TaskOutcome(status=value)
 
     def close(self) -> None:
         if self.futures:
@@ -147,6 +206,7 @@ class DispatcherLoop:
                 try:
                     if not self._settings_checked:
                         self._validate_server_settings()
+                        self._validate_artifact_runtime()
                         self._settings_checked = True
                     self._reap_futures()
                     self._reap_cleanup_futures()
@@ -325,6 +385,14 @@ class DispatcherLoop:
             newest = max(unclaimed_intents, key=lambda i: i.created_at)
             export_yaml = self.client.export_project(summary.id)
             return self._dispatch_explore(project, export_yaml, newest)
+        running_report_tasks = self._project_running_report_enrichment_tasks(summary.id)
+        pending_report_tasks = [
+            task
+            for task in self.client.list_pending_report_enrichments(summary.id, limit=10)
+            if isinstance(task, dict) and task.get("id") not in running_report_tasks
+        ]
+        if pending_report_tasks:
+            return self._dispatch_report_enrichment(project, pending_report_tasks[0])
         if project.project.reason is not None:
             self._log_changed(
                 f"{skip_scope}:reason_claimed",
@@ -441,6 +509,8 @@ class DispatcherLoop:
         return True
 
     def _dispatch_bootstrap(self, project: ProjectDetail, intent: Intent) -> bool:
+        if self._source_preflight_blocked(project.project.id, "bootstrap"):
+            return False
         selection = self._select_worker(project.project.id, "bootstrap")
         worker = selection.worker
         if worker is None:
@@ -499,6 +569,8 @@ class DispatcherLoop:
         return True
 
     def _dispatch_explore(self, project: ProjectDetail, export_yaml: str, intent: Intent) -> bool:
+        if self._source_preflight_blocked(project.project.id, "explore"):
+            return False
         selection = self._select_worker(project.project.id, "explore")
         worker = selection.worker
         if worker is None:
@@ -555,6 +627,68 @@ class DispatcherLoop:
         self.runtime_project_ids.add(project.project.id)
         self._clear_project_log_state(project.project.id)
         LOG.info("dispatched explore project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
+        return True
+
+    def _dispatch_report_enrichment(self, project: ProjectDetail, task: dict) -> bool:
+        task_id = str(task.get("id") or "")
+        finding_id = str(task.get("finding_id") or "")
+        if not task_id or not finding_id:
+            return False
+        selection = self._select_worker(project.project.id, "report_enrichment")
+        worker = selection.worker
+        if worker is None:
+            self._log_changed(
+                f"project:{project.project.id}:worker:report_enrichment",
+                logging.INFO,
+                "no worker available for report enrichment project=%s task=%s blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s",
+                project.project.id,
+                task_id,
+                selection.blocked_busy,
+                selection.blocked_unhealthy,
+                selection.blocked_rejected,
+            )
+            return False
+        self._clear_log_state(f"project:{project.project.id}:worker:report_enrichment")
+        claim = self.client.claim_report_enrichment(task_id, worker.name)
+        if claim.status_code in (403, 409):
+            level = logging.INFO if claim.status_code == 403 else logging.WARNING
+            LOG.log(
+                level,
+                "report enrichment claim failed project=%s task=%s worker=%s status=%s",
+                project.project.id,
+                task_id,
+                worker.name,
+                claim.status_code,
+            )
+            return False
+        if not claim.ok:
+            LOG.warning(
+                "report enrichment claim failed project=%s task=%s worker=%s status=%s",
+                project.project.id,
+                task_id,
+                worker.name,
+                claim.status_code,
+            )
+            return False
+        try:
+            future = self.executor.submit(
+                run_report_enrichment_task,
+                self.config,
+                self.client,
+                self.container_manager,
+                project,
+                task,
+                worker,
+                cancellation := TaskCancellation(),
+            )
+        except Exception:
+            LOG.exception("failed to submit report enrichment task project=%s task=%s worker=%s", project.project.id, task_id, worker.name)
+            self.client.release_report_enrichment(task_id, worker.name)
+            return False
+        self.futures[future] = RunningTask(project.project.id, "report_enrichment", worker.name, cancellation, intent_id=task_id)
+        self.runtime_project_ids.add(project.project.id)
+        self._clear_project_log_state(project.project.id)
+        LOG.info("dispatched report enrichment project=%s task=%s finding=%s worker=%s", project.project.id, task_id, finding_id, worker.name)
         return True
 
     def _select_worker(self, project_id: str, task_type: str) -> WorkerSelection:
@@ -660,6 +794,13 @@ class DispatcherLoop:
             if task.project_id == project_id and task.task_type == "explore" and task.intent_id is not None
         }
 
+    def _project_running_report_enrichment_tasks(self, project_id: str) -> set[str]:
+        return {
+            task.intent_id
+            for task in self.futures.values()
+            if task.project_id == project_id and task.task_type == "report_enrichment" and task.intent_id is not None
+        }
+
     def _running_project_count(self, summaries: list[ProjectSummary]) -> int:
         active_ids = {summary.id for summary in summaries if summary.status == "active"}
         return len(self.runtime_project_ids & active_ids)
@@ -738,25 +879,30 @@ class DispatcherLoop:
         for future in done:
             task = self.futures.pop(future)
             try:
-                outcome = future.result()
+                outcome = self._coerce_task_outcome(future.result())
                 self._record_task_history(task, outcome)
-                if outcome == "cancelled":
+                self._persist_task_history(task, outcome)
+                status = outcome.status
+                if status == "cancelled":
                     LOG.info(
                         "task cancelled project=%s task=%s worker=%s",
                         task.project_id,
                         task.task_type,
                         task.worker_name,
                     )
-                elif outcome != "success":
+                elif status != "success":
                     LOG.warning(
-                        "task finished project=%s task=%s worker=%s outcome=%s",
+                        "task finished project=%s task=%s worker=%s outcome=%s error_type=%s rate_limited=%s used_fallback=%s",
                         task.project_id,
                         task.task_type,
                         task.worker_name,
-                        outcome,
+                        status,
+                        outcome.error_type,
+                        outcome.rate_limited,
+                        outcome.used_fallback,
                     )
                 self._clear_project_log_state(task.project_id)
-                if outcome == "unhealthy":
+                if status == "unhealthy":
                     retry_after_seconds = UNHEALTHY_RETRY_AFTER_SECONDS
                     self.worker_unhealthy_until[task.worker_name] = time.time() + retry_after_seconds
                     LOG.info(
@@ -767,7 +913,17 @@ class DispatcherLoop:
                 else:
                     self.worker_unhealthy_until.pop(task.worker_name, None)
                 rejection_key = (task.project_id, task.task_type, task.worker_name)
-                if outcome == "rejected":
+                if outcome.error_type == "source_preflight_failed":
+                    retry_until = time.time() + SOURCE_PREFLIGHT_RETRY_AFTER_SECONDS
+                    self.source_preflight_blocked_until[(task.project_id, task.task_type)] = retry_until
+                    LOG.warning(
+                        "source preflight failed; blocking redispatch project=%s task=%s retry_after=%.0fs detail=%s",
+                        task.project_id,
+                        task.task_type,
+                        SOURCE_PREFLIGHT_RETRY_AFTER_SECONDS,
+                        outcome.error_detail,
+                    )
+                if status == "rejected":
                     retry_after_seconds = REJECTED_RETRY_AFTER_SECONDS
                     self.worker_rejected_until[rejection_key] = time.time() + retry_after_seconds
                     LOG.info(
@@ -779,7 +935,7 @@ class DispatcherLoop:
                     )
                 else:
                     self.worker_rejected_until.pop(rejection_key, None)
-                if outcome == "success" and task.task_type == "reason":
+                if status == "success" and task.task_type == "reason":
                     assert task.fact_count is not None
                     assert task.hint_count is not None
                     assert task.open_intent_count is not None
@@ -797,6 +953,7 @@ class DispatcherLoop:
                     )
             except Exception:
                 LOG.exception("task crashed project=%s task=%s worker=%s", task.project_id, task.task_type, task.worker_name)
+                self._persist_task_history(task, TaskOutcome(status="failed", error_type="task_crashed"))
 
     def _cleanup_completed_containers(self, summaries: list[ProjectSummary]) -> None:
         for summary in summaries:
@@ -911,6 +1068,23 @@ class DispatcherLoop:
         self._log_state[scope] = state
         LOG.log(level, message, *args)
 
+    def _source_preflight_blocked(self, project_id: str, task_type: str) -> bool:
+        key = (project_id, task_type)
+        retry_until = self.source_preflight_blocked_until.get(key, 0)
+        now = time.time()
+        if retry_until <= now:
+            self.source_preflight_blocked_until.pop(key, None)
+            return False
+        self._log_changed(
+            f"project:{project_id}:skip:{task_type}:source_preflight_backoff",
+            logging.WARNING,
+            "skip %s project=%s because source preflight recently failed retry_after=%.0fs",
+            task_type,
+            project_id,
+            retry_until - now,
+        )
+        return True
+
     def _clear_log_state(self, scope: str) -> None:
         self._log_state.pop(scope, None)
 
@@ -945,8 +1119,58 @@ class DispatcherLoop:
                 interval,
             )
 
+    def _validate_artifact_runtime(self) -> None:
+        runtime = self.client.get_runtime_info()
+        expected_container_root = PurePosixPath(self.config.container.artifact_mount_path) / "artifacts"
+        server_container_root = PurePosixPath(runtime.source_container_root)
+        if server_container_root != expected_container_root:
+            raise RuntimeError(
+                "server source container root does not match dispatcher mount: "
+                f"server={server_container_root} expected={expected_container_root}; "
+                "check source_service.snapshot_container_path and dispatch.yaml container.artifact_mount_path"
+            )
+
+        if self.config.container.artifact_host_path:
+            expected_artifact_root = (
+                Path(self.config.container.artifact_host_path).expanduser().resolve() / "artifacts"
+            )
+            server_artifact_root = Path(runtime.artifact_root).expanduser().resolve()
+            if server_artifact_root != expected_artifact_root:
+                raise RuntimeError(
+                    "server artifact_root does not match dispatcher artifact_host_path: "
+                    f"server writes {server_artifact_root}, dispatcher mounts "
+                    f"{Path(self.config.container.artifact_host_path).expanduser().resolve()} "
+                    f"so workers expect {expected_artifact_root}; "
+                    "start the server with CAIRN_ARTIFACT_ROOT set to the dispatcher artifacts directory "
+                    "or update dispatch.yaml"
+                )
+            LOG.info(
+                "artifact root validated server=%s dispatcher_host=%s container_root=%s",
+                server_artifact_root,
+                Path(self.config.container.artifact_host_path).expanduser().resolve(),
+                server_container_root,
+            )
+            return
+
+        if self.config.container.artifact_volume:
+            LOG.info(
+                "artifact root validation uses docker volume volume=%s container_root=%s server_artifact_root=%s",
+                self.config.container.artifact_volume,
+                server_container_root,
+                runtime.artifact_root,
+            )
+            return
+
+        raise RuntimeError(
+            "dispatcher container artifact mount is not configured; set container.artifact_host_path "
+            "or container.artifact_volume so workers can read imported source snapshots"
+        )
+
     def _run_startup_healthchecks(self, *, show_commands: bool) -> None:
         results = run_startup_healthchecks(self.config, self.container_manager, show_commands=show_commands)
+        if not results:
+            LOG.warning("startup healthcheck skipped because no workers are enabled")
+            return
         if any(result.ok for result in results):
             return
         raise RuntimeError(format_failure_summary(results))

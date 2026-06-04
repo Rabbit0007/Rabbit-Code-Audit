@@ -15,9 +15,17 @@ from urllib.parse import urlparse
 import uuid
 import zipfile
 
+from cairn.server.code_index import extract_code_index
 from cairn.server import db
 from cairn.server.services import get_project_or_404, utcnow
-from cairn.server.source_models import CodeFile, SourceSnapshot
+from cairn.server.source_models import (
+    CodeEntrypoint,
+    CodeFile,
+    CodeSymbol,
+    DependencyManifest,
+    SourceIndexSummary,
+    SourceSnapshot,
+)
 
 
 MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
@@ -45,6 +53,24 @@ LANGUAGE_BY_SUFFIX: dict[str, str] = {
     ".tsx": "TypeScript",
     ".vue": "Vue",
 }
+WEB_SCRIPT_SUFFIXES = {".php", ".jsp", ".jspx", ".asp", ".aspx", ".ashx"}
+WEB_SCRIPT_EXCLUDED_PARTS = {
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "spec",
+    "target",
+    "test",
+    "tests",
+    "vendor",
+    "venv",
+}
+MAX_SOURCE_INDEX_CANDIDATES = 2000
 
 
 def artifact_root() -> Path:
@@ -166,6 +192,91 @@ def list_code_files(project_id: str, snapshot_id: str, limit: int = 5000) -> lis
             sha256=row["sha256"],
             language=row["language"],
             is_binary=bool(row["is_binary"]),
+        )
+        for row in rows
+    ]
+
+
+def get_source_index_summary(project_id: str, snapshot_id: str) -> SourceIndexSummary:
+    snapshot = get_snapshot(project_id, snapshot_id)
+    _ensure_code_index(snapshot)
+    with db.get_conn() as conn:
+        symbols = conn.execute(
+            "SELECT COUNT(*) AS count FROM code_symbols WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()["count"]
+        entrypoints = conn.execute(
+            "SELECT COUNT(*) AS count FROM code_entrypoints WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()["count"]
+        manifests = conn.execute(
+            "SELECT COUNT(*) AS count FROM dependency_manifests WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()["count"]
+    return SourceIndexSummary(
+        symbol_count=symbols,
+        entrypoint_count=entrypoints,
+        manifest_count=manifests,
+    )
+
+
+def list_code_symbols(project_id: str, snapshot_id: str, limit: int = 1000) -> list[CodeSymbol]:
+    snapshot = get_snapshot(project_id, snapshot_id)
+    _ensure_code_index(snapshot)
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM code_symbols
+            WHERE snapshot_id = ?
+            ORDER BY path, COALESCE(line_start, 0), kind, name
+            LIMIT ?
+            """,
+            (snapshot_id, limit),
+        ).fetchall()
+    return [CodeSymbol(**dict(row)) for row in rows]
+
+
+def list_code_entrypoints(project_id: str, snapshot_id: str, limit: int = 1000) -> list[CodeEntrypoint]:
+    snapshot = get_snapshot(project_id, snapshot_id)
+    _ensure_code_index(snapshot)
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM code_entrypoints
+            WHERE snapshot_id = ?
+            ORDER BY path, COALESCE(line_start, 0), route, COALESCE(method, '')
+            LIMIT ?
+            """,
+            (snapshot_id, limit),
+        ).fetchall()
+    return [CodeEntrypoint(**dict(row)) for row in rows]
+
+
+def list_dependency_manifests(project_id: str, snapshot_id: str, limit: int = 1000) -> list[DependencyManifest]:
+    snapshot = get_snapshot(project_id, snapshot_id)
+    _ensure_code_index(snapshot)
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM dependency_manifests
+            WHERE snapshot_id = ?
+            ORDER BY path
+            LIMIT ?
+            """,
+            (snapshot_id, limit),
+        ).fetchall()
+    return [
+        DependencyManifest(
+            id=row["id"],
+            snapshot_id=row["snapshot_id"],
+            path=row["path"],
+            manifest_type=row["manifest_type"],
+            package_name=row["package_name"],
+            dependencies=_decode_json_list(row["dependencies_json"]),
+            dev_dependencies=_decode_json_list(row["dev_dependencies_json"]),
         )
         for row in rows
     ]
@@ -301,7 +412,7 @@ def _finalize_snapshot(
     resolved_commit: str | None = None,
     archive_sha256: str | None = None,
 ) -> SourceSnapshot:
-    files, snapshot_sha256, languages, total_bytes = _index_snapshot(snapshot_id)
+    files, snapshot_sha256, languages, total_bytes, code_index = _index_snapshot(snapshot_id)
     with db.get_conn() as conn:
         conn.executemany(
             """
@@ -320,6 +431,8 @@ def _finalize_snapshot(
                 for item in files
             ],
         )
+        _insert_code_index(conn, code_index)
+        _insert_audit_candidates_from_index(conn, snapshot_id, files, code_index)
         conn.execute(
             """
             UPDATE source_snapshots
@@ -348,7 +461,283 @@ def _finalize_snapshot(
     return _snapshot_from_row(row)
 
 
-def _index_snapshot(snapshot_id: str) -> tuple[list[CodeFile], str, dict[str, int], int]:
+def _insert_code_index(conn, code_index) -> None:
+    conn.executemany(
+        """
+        INSERT INTO code_symbols (
+            id, snapshot_id, path, language, kind, name, container,
+            signature, line_start, line_end
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                item.id,
+                item.snapshot_id,
+                item.path,
+                item.language,
+                item.kind,
+                item.name,
+                item.container,
+                item.signature,
+                item.line_start,
+                item.line_end,
+            )
+            for item in code_index.symbols
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO code_entrypoints (
+            id, snapshot_id, path, language, kind, framework, method,
+            route, handler, line_start, evidence
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                item.id,
+                item.snapshot_id,
+                item.path,
+                item.language,
+                item.kind,
+                item.framework,
+                item.method,
+                item.route,
+                item.handler,
+                item.line_start,
+                item.evidence,
+            )
+            for item in code_index.entrypoints
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO dependency_manifests (
+            id, snapshot_id, path, manifest_type, package_name,
+            dependencies_json, dev_dependencies_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                item.id,
+                item.snapshot_id,
+                item.path,
+                item.manifest_type,
+                item.package_name,
+                json.dumps(item.dependencies, ensure_ascii=False),
+                json.dumps(item.dev_dependencies, ensure_ascii=False),
+            )
+            for item in code_index.manifests
+        ],
+    )
+
+
+def _insert_audit_candidates_from_index(conn, snapshot_id: str, files: list[CodeFile], code_index) -> None:
+    row = conn.execute(
+        "SELECT project_id FROM source_snapshots WHERE id = ?",
+        (snapshot_id,),
+    ).fetchone()
+    if row is None:
+        return
+    project_id = row["project_id"]
+    created_at = utcnow()
+    candidates: list[tuple[object, ...]] = []
+    seen: set[tuple[str, str | None, int | None, str | None]] = set()
+
+    def add_candidate(
+        *,
+        source: str,
+        candidate_type: str,
+        title: str,
+        description: str,
+        file_path: str | None,
+        line_start: int | None,
+        line_end: int | None = None,
+        entry_point: str | None = None,
+        symbol: str | None = None,
+    ) -> None:
+        if len(candidates) >= MAX_SOURCE_INDEX_CANDIDATES:
+            return
+        key = (candidate_type, file_path, line_start, entry_point)
+        if key in seen:
+            return
+        seen.add(key)
+        candidate_id = _stable_candidate_id(snapshot_id, source, candidate_type, file_path, line_start, entry_point, title)
+        candidates.append(
+            (
+                candidate_id,
+                project_id,
+                snapshot_id,
+                source,
+                candidate_type,
+                "unknown",
+                title,
+                description,
+                file_path,
+                line_start,
+                line_end,
+                entry_point,
+                symbol,
+                "candidate",
+                "source_index",
+                created_at,
+                created_at,
+            )
+        )
+
+    indexed_entrypoint_paths: set[str] = set()
+    for entrypoint in code_index.entrypoints:
+        if not _is_candidate_source_path(entrypoint.path):
+            continue
+        indexed_entrypoint_paths.add(entrypoint.path)
+        label = _entrypoint_label(entrypoint.method, entrypoint.route)
+        add_candidate(
+            source="index",
+            candidate_type="entrypoint",
+            title=f"审计入口: {label}",
+            description=(
+                f"代码索引识别到入口 {label}，位于 {entrypoint.path}。"
+                "需要按真实数据流和访问控制进行安全审计。"
+            ),
+            file_path=entrypoint.path,
+            line_start=entrypoint.line_start,
+            entry_point=label,
+            symbol=entrypoint.handler,
+        )
+
+    for file in files:
+        if file.is_binary or file.path in indexed_entrypoint_paths:
+            continue
+        if not _is_web_script_candidate_path(file.path):
+            continue
+        route = f"/{file.path}"
+        add_candidate(
+            source="index",
+            candidate_type="web_entrypoint",
+            title=f"审计 Web 脚本: {file.path}",
+            description=(
+                f"{file.path} 是可能被 Web 服务器直接暴露的脚本文件。"
+                "需要确认入口参数、权限控制、敏感操作和外部数据流是否安全。"
+            ),
+            file_path=file.path,
+            line_start=1,
+            entry_point=route,
+        )
+
+    if not candidates:
+        return
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO audit_candidates (
+            id, project_id, snapshot_id, source, candidate_type, severity,
+            title, description, file_path, line_start, line_end, entry_point,
+            symbol, status, created_by, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        candidates,
+    )
+
+
+def _stable_candidate_id(*parts: object) -> str:
+    digest = hashlib.sha1("\0".join("" if part is None else str(part) for part in parts).encode("utf-8")).hexdigest()
+    return f"cand_{digest[:16]}"
+
+
+def _entrypoint_label(method: str | None, route: str) -> str:
+    route_text = route.strip() or "/"
+    return f"{method} {route_text}" if method else route_text
+
+
+def _is_candidate_source_path(path: str) -> bool:
+    parts = PurePosixPath(path).parts
+    return not any(part in WEB_SCRIPT_EXCLUDED_PARTS for part in parts)
+
+
+def _is_web_script_candidate_path(path: str) -> bool:
+    if PurePosixPath(path).suffix.lower() not in WEB_SCRIPT_SUFFIXES:
+        return False
+    return _is_candidate_source_path(path)
+
+
+def _ensure_code_index(snapshot: SourceSnapshot) -> None:
+    if snapshot.status != "ready":
+        return
+    root = snapshot_path(snapshot.id)
+    if not root.exists():
+        return
+    with db.get_conn() as conn:
+        existing = conn.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM code_symbols WHERE snapshot_id = ?) +
+                (SELECT COUNT(*) FROM code_entrypoints WHERE snapshot_id = ?) +
+                (SELECT COUNT(*) FROM dependency_manifests WHERE snapshot_id = ?) AS count
+            """,
+            (snapshot.id, snapshot.id, snapshot.id),
+        ).fetchone()["count"]
+        if existing:
+            _ensure_snapshot_audit_candidates(conn, snapshot, root)
+            return
+        rows = conn.execute(
+            """
+            SELECT snapshot_id, path, size_bytes, sha256, language, is_binary
+            FROM code_files
+            WHERE snapshot_id = ?
+            ORDER BY path
+            """,
+            (snapshot.id,),
+        ).fetchall()
+        files = [
+            CodeFile(
+                snapshot_id=row["snapshot_id"],
+                path=row["path"],
+                size_bytes=row["size_bytes"],
+                sha256=row["sha256"],
+                language=row["language"],
+                is_binary=bool(row["is_binary"]),
+            )
+            for row in rows
+        ]
+        code_index = extract_code_index(snapshot.id, root, files)
+        _insert_code_index(conn, code_index)
+        _insert_audit_candidates_from_index(conn, snapshot.id, files, code_index)
+
+
+def _ensure_snapshot_audit_candidates(conn, snapshot: SourceSnapshot, root: Path) -> None:
+    existing = conn.execute(
+        "SELECT COUNT(*) AS count FROM audit_candidates WHERE snapshot_id = ?",
+        (snapshot.id,),
+    ).fetchone()["count"]
+    if existing:
+        return
+    rows = conn.execute(
+        """
+        SELECT snapshot_id, path, size_bytes, sha256, language, is_binary
+        FROM code_files
+        WHERE snapshot_id = ?
+        ORDER BY path
+        """,
+        (snapshot.id,),
+    ).fetchall()
+    files = [
+        CodeFile(
+            snapshot_id=row["snapshot_id"],
+            path=row["path"],
+            size_bytes=row["size_bytes"],
+            sha256=row["sha256"],
+            language=row["language"],
+            is_binary=bool(row["is_binary"]),
+        )
+        for row in rows
+    ]
+    code_index = extract_code_index(snapshot.id, root, files)
+    _insert_audit_candidates_from_index(conn, snapshot.id, files, code_index)
+
+
+def _index_snapshot(snapshot_id: str):
     root = snapshot_path(snapshot_id)
     files: list[CodeFile] = []
     languages: dict[str, int] = {}
@@ -384,7 +773,20 @@ def _index_snapshot(snapshot_id: str) -> tuple[list[CodeFile], str, dict[str, in
                 is_binary=is_binary,
             )
         )
-    return files, manifest_digest.hexdigest(), languages, total_bytes
+    code_index = extract_code_index(snapshot_id, root, files)
+    return files, manifest_digest.hexdigest(), languages, total_bytes, code_index
+
+
+def _decode_json_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item).strip()]
 
 
 def _hash_file(path: Path) -> tuple[str, bool]:

@@ -37,6 +37,7 @@ from cairn.server.services import (
     utcnow,
     validate_facts_exist,
     validate_goal_not_in_sources,
+    validate_project_ready_to_complete,
 )
 from cairn.server.source_service import list_snapshots
 
@@ -104,8 +105,8 @@ def create_project(body: CreateProjectRequest):
                 )
                 hints.append(Hint(id=hid, content=h.content, creator=h.creator, created_at=now))
 
-        record_audit("project.create", f"创建项目 {body.title}", target_type="project", target_id=pid)
-        record_notification(f"新建项目：{body.title}", level="info", link="#/projects")
+        record_audit("project.create", f"创建项目 {body.title}", target_type="project", target_id=pid, conn=conn)
+        record_notification(f"新建项目：{body.title}", level="info", link="#/projects", conn=conn)
         return ProjectDetail(
             project=ProjectMeta(id=pid, title=body.title, status="active", created_at=now, reason=None),
             facts=[
@@ -267,6 +268,7 @@ def complete_project(project_id: str, body: CompleteRequest):
         expire_reason_leases(conn, project_id)
         validate_facts_exist(conn, project_id, body.from_)
         validate_goal_not_in_sources(body.from_)
+        validate_project_ready_to_complete(conn, project_id)
 
         now = utcnow()
         iid = next_intent_id(conn, project_id)

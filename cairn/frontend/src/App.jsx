@@ -14,6 +14,7 @@ import {
   ChevronRight,
   Circle,
   Clock,
+  Copy,
   Download,
   Eye,
   EyeOff,
@@ -30,6 +31,7 @@ import {
   Moon,
   Network,
   Pause,
+  Pencil,
   Play,
   Plus,
   RefreshCw,
@@ -79,6 +81,97 @@ function formatFindingStatus(status) {
     rejected: "已拒绝",
     needs_more_evidence: "需更多证据",
   }[status] || status;
+}
+
+const BUSINESS_NODE_META = {
+  feature: { label: "功能", tone: "success" },
+  role: { label: "角色", tone: "info" },
+  endpoint: { label: "接口", tone: "high" },
+  data_object: { label: "数据", tone: "medium" },
+  state: { label: "状态", tone: "muted" },
+  control: { label: "控制点", tone: "critical" },
+  asset: { label: "资产", tone: "info" },
+  risk: { label: "风险", tone: "danger" },
+  external_system: { label: "外部系统", tone: "muted" },
+};
+
+const BUSINESS_EDGE_META = {
+  contains: "包含",
+  exposes: "暴露",
+  calls: "调用",
+  uses: "使用",
+  owns: "归属",
+  guards: "保护",
+  transitions_to: "流转",
+  depends_on: "依赖",
+  risk_of: "风险关联",
+  relates_to: "相关",
+};
+
+const BUSINESS_RISK_META = {
+  critical: { label: "严重风险", tone: "critical" },
+  high: { label: "高风险", tone: "high" },
+  medium: { label: "中风险", tone: "medium" },
+  low: { label: "低风险", tone: "low" },
+  unknown: { label: "未知风险", tone: "warning" },
+};
+
+const BUSINESS_REVIEW_STATUS_META = {
+  unreviewed: { label: "未覆盖", tone: "warning" },
+  investigating: { label: "调查中", tone: "info" },
+  covered: { label: "已覆盖", tone: "success" },
+  blocked: { label: "已阻塞", tone: "muted" },
+};
+
+const BUSINESS_CONCLUSION_META = {
+  confirmed_finding: { label: "确认漏洞", tone: "danger" },
+  rejected: { label: "未发现漏洞", tone: "success" },
+  needs_more_evidence: { label: "证据不足", tone: "warning" },
+};
+
+function splitLines(value) {
+  return String(value || "")
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+async function copyText(value, setToast, successMessage = "已复制") {
+  const text = String(value || "").trim();
+  if (!text) {
+    setToast?.({ type: "warning", message: "没有可复制的内容" });
+    return false;
+  }
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.left = "-9999px";
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand("copy");
+      textarea.remove();
+    }
+    setToast?.({ type: "success", message: successMessage });
+    return true;
+  } catch {
+    setToast?.({ type: "danger", message: "复制失败，请手动选择文本复制" });
+    return false;
+  }
+}
+
+function pocText(poc, key) {
+  const value = poc?.[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function pocList(poc, key) {
+  const value = poc?.[key];
+  return Array.isArray(value) ? value.map((item) => String(item || "").trim()).filter(Boolean) : [];
 }
 
 function useRoute() {
@@ -250,7 +343,6 @@ function TopNav({ route, user, theme, onToggleTheme, onLogout, onPassword, onSet
     ["projects", "项目", Folder],
     ["vulnerabilities", "审计报告", AlertTriangle],
     ["workers", "工作节点", Monitor],
-    ["templates", "模板", FileText],
   ];
   const activeNav = mainNav.find(([key]) => route.page === key || (key === "projects" && route.page === "project"));
   const sectionLabel =
@@ -802,43 +894,243 @@ function AuditPage({ setToast }) {
   );
 }
 
+const AUTH_FIELD_ORDER = ["username", "password", "confirm_password", "captcha_answer"];
+const AUTH_FIELD_LABELS = {
+  username: "用户名",
+  password: "密码",
+  confirm_password: "确认密码",
+  captcha_answer: "验证码",
+};
+
+function authValidationMessage(field, rawMessage) {
+  const message = String(rawMessage || "").replace(/^Value error,\s*/i, "").trim();
+  if (field === "username" && /must not be empty|field required/i.test(message)) return "请输入用户名";
+  if (field === "password" && /must not be empty|field required/i.test(message)) return "请输入密码";
+  if (/username must be between/i.test(message)) return "用户名需为 3-32 位";
+  if (/username may only contain/i.test(message)) return "用户名只能包含字母、数字、下划线或短横线";
+  if (/password must be between/i.test(message)) return "密码需为 8-72 位";
+  if (/must not be empty|field required/i.test(message)) return `请填写${AUTH_FIELD_LABELS[field] || "该项"}`;
+  return message || `${AUTH_FIELD_LABELS[field] || "该项"}填写不正确`;
+}
+
+function authFieldFromLoc(loc) {
+  const field = Array.isArray(loc) ? loc[loc.length - 1] : "";
+  if (field === "captcha_id") return "captcha_answer";
+  return AUTH_FIELD_LABELS[field] ? field : "";
+}
+
+function authErrorFeedback(error, mode) {
+  const detail = error?.payload?.detail;
+  if (Array.isArray(detail)) {
+    const fieldErrors = {};
+    detail.forEach((item) => {
+      const field = authFieldFromLoc(item?.loc);
+      if (field && !fieldErrors[field]) {
+        fieldErrors[field] = authValidationMessage(field, item?.msg);
+      }
+    });
+    return {
+      message: Object.keys(fieldErrors).length ? "请先处理表单中标出的项目。" : "请检查表单填写是否完整。",
+      fieldErrors,
+      tone: "warning",
+    };
+  }
+
+  const rawMessage = String(detail || error?.message || "");
+  const lowerMessage = rawMessage.toLowerCase();
+  if (!error?.status && /failed to fetch|load failed|network/i.test(lowerMessage)) {
+    return {
+      message: "无法连接服务，请确认 8765 端口服务正在运行后重试。",
+      fieldErrors: {},
+      tone: "danger",
+    };
+  }
+  if (error?.status === 409 || lowerMessage.includes("username already taken")) {
+    return {
+      message: "用户名已存在，请换一个用户名或直接登录。",
+      fieldErrors: { username: "这个用户名已被注册" },
+      tone: "warning",
+    };
+  }
+  if (rawMessage.includes("验证码")) {
+    return {
+      message: rawMessage,
+      fieldErrors: { captcha_answer: rawMessage },
+      captchaRelated: true,
+      tone: "warning",
+    };
+  }
+  if (error?.status === 429 || lowerMessage.includes("too many attempts")) {
+    return {
+      message: "登录失败次数过多，请等待 15 分钟后再试。",
+      fieldErrors: { password: "短时间内失败次数过多" },
+      tone: "warning",
+    };
+  }
+  if (error?.status === 401 || lowerMessage.includes("invalid credentials")) {
+    return {
+      message: mode === "login" ? "用户名或密码错误，请检查后重试。" : "认证失败，请检查用户名和密码。",
+      fieldErrors: mode === "login" ? { password: "用户名或密码不正确" } : {},
+      tone: "danger",
+    };
+  }
+  return {
+    message: rawMessage || (mode === "login" ? "登录失败，请稍后重试。" : "注册失败，请稍后重试。"),
+    fieldErrors: {},
+    tone: "danger",
+  };
+}
+
+function validateAuthForm(form, mode, captcha) {
+  const errors = {};
+  const username = String(form.username || "").trim();
+  const password = String(form.password || "");
+  const confirmPassword = String(form.confirm_password || "");
+  const captchaAnswer = String(form.captcha_answer || "").trim();
+
+  if (!username) {
+    errors.username = "请输入用户名";
+  } else if (mode === "register" && (username.length < 3 || username.length > 32)) {
+    errors.username = "用户名需为 3-32 位";
+  } else if (mode === "register" && !/^[a-zA-Z0-9_-]+$/.test(username)) {
+    errors.username = "用户名只能包含字母、数字、下划线或短横线";
+  }
+
+  if (!password) {
+    errors.password = mode === "register" ? "请设置密码" : "请输入密码";
+  } else if (mode === "register" && (password.length < 8 || password.length > 72)) {
+    errors.password = "密码需为 8-72 位";
+  }
+
+  if (mode === "register") {
+    if (!confirmPassword) {
+      errors.confirm_password = "请再次输入密码";
+    } else if (password !== confirmPassword) {
+      errors.confirm_password = "两次输入的密码不一致";
+    }
+  }
+
+  if (!captcha?.captcha_id) {
+    errors.captcha_answer = "验证码未加载，请先刷新验证码";
+  } else if (!captchaAnswer) {
+    errors.captcha_answer = "请输入验证码计算结果";
+  }
+
+  return errors;
+}
+
+function focusFirstAuthError(inputRefs, fieldErrors) {
+  const field = AUTH_FIELD_ORDER.find((item) => fieldErrors[item]);
+  const node = field ? inputRefs.current?.[field] : null;
+  if (node) {
+    window.requestAnimationFrame(() => node.focus());
+  }
+}
+
 function AuthPage({ onAuthed, setToast }) {
   const [mode, setMode] = useState("login");
   const [form, setForm] = useState({ username: "", password: "", confirm_password: "", captcha_answer: "" });
   const [captcha, setCaptcha] = useState(null);
+  const [captchaLoading, setCaptchaLoading] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [formError, setFormError] = useState("");
+  const [fieldErrors, setFieldErrors] = useState({});
+  const inputRefs = useRef({});
 
-  const loadCaptcha = useCallback(async () => {
-    const data = await apiRequest("/api/auth/captcha");
-    setCaptcha(data);
-    setForm((prev) => ({ ...prev, captcha_answer: "" }));
-  }, []);
+  const loadCaptcha = useCallback(
+    async ({ preserveCaptchaError = false, notify = true } = {}) => {
+      setCaptchaLoading(true);
+      try {
+        const data = await apiRequest("/api/auth/captcha");
+        setCaptcha(data);
+        setForm((prev) => ({ ...prev, captcha_answer: "" }));
+        setFieldErrors((prev) => {
+          if (preserveCaptchaError || !prev.captcha_answer) return prev;
+          const next = { ...prev };
+          delete next.captcha_answer;
+          return next;
+        });
+        return data;
+      } catch {
+        const message = "验证码加载失败，请刷新页面或稍后重试。";
+        setFormError(message);
+        if (notify) setToast({ type: "danger", message });
+        throw new Error(message);
+      } finally {
+        setCaptchaLoading(false);
+      }
+    },
+    [setToast]
+  );
 
   useEffect(() => {
-    loadCaptcha().catch((error) => setToast({ type: "danger", message: error.message }));
-  }, [loadCaptcha, setToast]);
+    loadCaptcha().catch(() => {});
+  }, [loadCaptcha]);
+
+  const setFieldValue = (field, value) => {
+    setForm((prev) => ({ ...prev, [field]: value }));
+    setFieldErrors((prev) => {
+      if (!prev[field] && !(field === "password" && prev.confirm_password)) return prev;
+      const next = { ...prev };
+      delete next[field];
+      if (field === "password") delete next.confirm_password;
+      return next;
+    });
+    if (formError) setFormError("");
+  };
+
+  const switchMode = (nextMode) => {
+    if (nextMode === mode) return;
+    setMode(nextMode);
+    setForm((prev) => ({ username: prev.username, password: "", confirm_password: "", captcha_answer: "" }));
+    setFormError("");
+    setFieldErrors({});
+    loadCaptcha({ notify: false }).catch(() => {});
+  };
+
+  const showPhoneLoginNotice = () => {
+    const message = "手机号验证码登录暂未接入，请先使用账号登录。";
+    setFormError(message);
+    setToast({ type: "info", message });
+  };
 
   const submit = async (event) => {
     event.preventDefault();
-    if (mode === "register" && form.password !== form.confirm_password) {
-      setToast({ type: "warning", message: "两次输入的密码不一致" });
+    if (loading) return;
+    const preparedForm = {
+      ...form,
+      username: String(form.username || "").trim(),
+      captcha_answer: String(form.captcha_answer || "").trim(),
+    };
+    const localErrors = validateAuthForm(preparedForm, mode, captcha);
+    if (Object.keys(localErrors).length) {
+      setForm((prev) => ({ ...prev, username: preparedForm.username, captcha_answer: preparedForm.captcha_answer }));
+      setFieldErrors(localErrors);
+      setFormError("请先处理表单中标出的项目。");
+      focusFirstAuthError(inputRefs, localErrors);
       return;
     }
+    setFormError("");
+    setFieldErrors({});
     setLoading(true);
     try {
       await apiRequest(`/api/auth/${mode === "login" ? "login" : "register"}`, {
         method: "POST",
         body: {
-          username: form.username,
-          password: form.password,
+          username: preparedForm.username,
+          password: preparedForm.password,
           captcha_id: captcha?.captcha_id,
-          captcha_answer: form.captcha_answer,
+          captcha_answer: preparedForm.captcha_answer,
         },
       });
       await onAuthed();
     } catch (error) {
-      setToast({ type: "danger", message: error.message || "认证失败" });
-      await loadCaptcha().catch(() => {});
+      const feedback = authErrorFeedback(error, mode);
+      setFormError(feedback.message);
+      setFieldErrors(feedback.fieldErrors);
+      setToast({ type: feedback.tone || "danger", message: feedback.message });
+      await loadCaptcha({ preserveCaptchaError: feedback.captchaRelated, notify: false }).catch(() => {});
+      focusFirstAuthError(inputRefs, feedback.fieldErrors);
     } finally {
       setLoading(false);
     }
@@ -891,7 +1183,7 @@ function AuthPage({ onAuthed, setToast }) {
 
         <main className="auth-form-panel">
           {mode === "register" && (
-            <button className="auth-back" type="button" onClick={() => setMode("login")}>
+            <button className="auth-back" type="button" onClick={() => switchMode("login")}>
               <ArrowLeft size={16} />
               返回登录
             </button>
@@ -905,68 +1197,122 @@ function AuthPage({ onAuthed, setToast }) {
               <button className="active" type="button">
                 账号登录
               </button>
-              <button
-                type="button"
-                onClick={() => setToast({ type: "info", message: "手机号验证码登录暂未接入，先使用账号登录。" })}
-              >
+              <button type="button" onClick={showPhoneLoginNotice}>
                 手机号登录
               </button>
             </div>
           )}
+          {formError && (
+            <div className="auth-form-alert" role="alert">
+              <AlertCircle size={17} />
+              <span>{formError}</span>
+            </div>
+          )}
           <form className="stack-form auth-stack-form" onSubmit={submit}>
-            <label>
+            <label className={cn(fieldErrors.username && "has-error")}>
               <span>用户名</span>
               <input
+                ref={(node) => {
+                  inputRefs.current.username = node;
+                }}
+                name="username"
                 autoComplete="username"
                 value={form.username}
-                onChange={(event) => setForm({ ...form, username: event.target.value })}
+                onChange={(event) => setFieldValue("username", event.target.value)}
                 placeholder="请输入用户名"
+                aria-invalid={Boolean(fieldErrors.username)}
+                aria-describedby={fieldErrors.username ? "auth-username-error" : undefined}
               />
+              {fieldErrors.username && (
+                <small className="field-error" id="auth-username-error">
+                  {fieldErrors.username}
+                </small>
+              )}
             </label>
-            <label>
+            <label className={cn(fieldErrors.password && "has-error")}>
               <span>密码</span>
               <input
+                ref={(node) => {
+                  inputRefs.current.password = node;
+                }}
+                name="password"
                 autoComplete={mode === "login" ? "current-password" : "new-password"}
                 type="password"
                 value={form.password}
-                onChange={(event) => setForm({ ...form, password: event.target.value })}
+                onChange={(event) => setFieldValue("password", event.target.value)}
                 placeholder={mode === "login" ? "请输入密码" : "请设置密码"}
+                aria-invalid={Boolean(fieldErrors.password)}
+                aria-describedby={fieldErrors.password ? "auth-password-error" : undefined}
               />
+              {fieldErrors.password && (
+                <small className="field-error" id="auth-password-error">
+                  {fieldErrors.password}
+                </small>
+              )}
             </label>
             {mode === "register" && (
-              <label>
+              <label className={cn(fieldErrors.confirm_password && "has-error")}>
                 <span>确认密码</span>
                 <input
+                  ref={(node) => {
+                    inputRefs.current.confirm_password = node;
+                  }}
+                  name="confirm_password"
                   autoComplete="new-password"
                   type="password"
                   value={form.confirm_password}
-                  onChange={(event) => setForm({ ...form, confirm_password: event.target.value })}
+                  onChange={(event) => setFieldValue("confirm_password", event.target.value)}
                   placeholder="请再次输入密码"
+                  aria-invalid={Boolean(fieldErrors.confirm_password)}
+                  aria-describedby={fieldErrors.confirm_password ? "auth-confirm-password-error" : undefined}
                 />
+                {fieldErrors.confirm_password && (
+                  <small className="field-error" id="auth-confirm-password-error">
+                    {fieldErrors.confirm_password}
+                  </small>
+                )}
               </label>
             )}
-            <label>
+            <label className={cn(fieldErrors.captcha_answer && "has-error")}>
               <span>验证码</span>
               <div className="captcha-row">
                 <input
+                  ref={(node) => {
+                    inputRefs.current.captcha_answer = node;
+                  }}
+                  name="captcha_answer"
                   value={form.captcha_answer}
-                  onChange={(event) => setForm({ ...form, captcha_answer: event.target.value })}
+                  onChange={(event) => setFieldValue("captcha_answer", event.target.value)}
                   placeholder="请输入计算结果"
+                  inputMode="numeric"
+                  aria-invalid={Boolean(fieldErrors.captcha_answer)}
+                  aria-describedby={fieldErrors.captcha_answer ? "auth-captcha-error" : undefined}
                 />
-                <button className="captcha-chip" type="button" onClick={loadCaptcha}>
-                  {captcha?.question || "刷新"}
-                  <RefreshCw size={15} />
+                <button
+                  className="captcha-chip"
+                  type="button"
+                  onClick={() => loadCaptcha().catch(() => {})}
+                  disabled={captchaLoading}
+                  title="刷新验证码"
+                >
+                  {captchaLoading ? "加载中" : captcha?.question || "刷新验证码"}
+                  <RefreshCw className={cn(captchaLoading && "spin")} size={15} />
                 </button>
               </div>
+              {fieldErrors.captcha_answer && (
+                <small className="field-error" id="auth-captcha-error">
+                  {fieldErrors.captcha_answer}
+                </small>
+              )}
             </label>
             <button className="primary-button auth-submit" type="submit" disabled={loading}>
               {loading ? <Loader2 className="spin" size={18} /> : <Lock size={18} />}
-              {mode === "login" ? "登录" : "注册账号"}
+              {loading ? (mode === "login" ? "正在登录..." : "正在注册...") : mode === "login" ? "登录" : "注册账号"}
             </button>
           </form>
           <p className="auth-switch">
             {mode === "login" ? "还没有账号？" : "已有账号？"}
-            <button type="button" onClick={() => setMode(mode === "login" ? "register" : "login")}>
+            <button type="button" onClick={() => switchMode(mode === "login" ? "register" : "login")}>
               {mode === "login" ? "立即注册" : "返回登录"}
             </button>
           </p>
@@ -1104,7 +1450,7 @@ function DashboardPage({ runAction, setToast }) {
     { key: "new", label: "新建项目", desc: "导入源码并定义审计目标", icon: Plus, onClick: () => setNewOpen(true) },
     { key: "vulns", label: "审计报告", desc: "查看已复核的安全发现", icon: AlertTriangle, onClick: () => go("#/vulnerabilities") },
     { key: "workers", label: "工作节点", desc: "状态与模型配置", icon: Monitor, onClick: () => go("#/workers") },
-    { key: "templates", label: "模板", desc: "复用项目模板", icon: FileText, onClick: () => go("#/templates") },
+    { key: "audit", label: "审计日志", desc: "查看系统审计操作", icon: History, onClick: () => go("#/audit") },
   ];
 
   return (
@@ -1605,29 +1951,44 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
   const [toolPlan, setToolPlan] = useState([]);
   const [toolFindings, setToolFindings] = useState([]);
   const [auditFindings, setAuditFindings] = useState([]);
+  const [businessGraph, setBusinessGraph] = useState({ nodes: [], edges: [], conclusions: [] });
+  const [sourceIndexSummary, setSourceIndexSummary] = useState(null);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState(null);
   const [tab, setTab] = useState("details");
   const [modal, setModal] = useState(null);
+  const [editingBusinessNode, setEditingBusinessNode] = useState(null);
+  const [concludingBusinessNode, setConcludingBusinessNode] = useState(null);
   const [layout, setLayout] = useState("dagre");
 
   const load = useCallback(async () => {
     try {
-      const [project, events, projectToolFindings, projectAuditFindings] = await Promise.all([
+      const [project, events, projectToolFindings, projectAuditFindings, graph, conclusions] = await Promise.all([
         apiRequest(`/projects/${projectId}`),
         apiRequest(`/api/projects/${projectId}/timeline`).catch(() => []),
         apiRequest(`/api/projects/${projectId}/tool-findings`).catch(() => []),
         apiRequest(`/api/projects/${projectId}/audit-findings`).catch(() => []),
+        apiRequest(`/api/projects/${projectId}/business-graph`).catch(() => ({ nodes: [], edges: [] })),
+        apiRequest(`/api/projects/${projectId}/business-graph/conclusions`).catch(() => []),
       ]);
       const readySource = (project.sources || []).find((source) => source.status === "ready");
       const plan = readySource
         ? await apiRequest(`/api/projects/${projectId}/sources/${readySource.id}/tool-plan`).catch(() => [])
         : [];
+      const indexSummary = readySource
+        ? await apiRequest(`/api/projects/${projectId}/sources/${readySource.id}/index-summary`).catch(() => null)
+        : null;
       setDetail(project);
       setTimeline(events);
       setToolPlan(plan);
       setToolFindings(projectToolFindings);
       setAuditFindings(projectAuditFindings);
+      setSourceIndexSummary(indexSummary);
+      setBusinessGraph({
+        nodes: Array.isArray(graph?.nodes) ? graph.nodes : [],
+        edges: Array.isArray(graph?.edges) ? graph.edges : [],
+        conclusions: Array.isArray(conclusions) ? conclusions : [],
+      });
     } catch (error) {
       setToast({ type: "danger", message: error.message || "项目加载失败" });
     } finally {
@@ -1674,6 +2035,59 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
   const updateStatus = async (status) => {
     await runAction("项目状态已更新", () =>
       apiRequest(`/projects/${project.id}/status`, { method: "PUT", body: { status } }),
+    );
+    await load();
+  };
+
+  const submitBusinessNode = async (payload) => {
+    await runAction("业务节点已保存", () =>
+      apiRequest(`/api/projects/${project.id}/business-graph/nodes`, { method: "POST", body: payload }),
+    );
+    setModal(null);
+    await load();
+  };
+
+  const updateBusinessNode = async (node, payload) => {
+    await runAction("业务节点已更新", () =>
+      apiRequest(`/api/projects/${project.id}/business-graph/nodes/${node.id}`, { method: "PUT", body: payload }),
+    );
+    setEditingBusinessNode(null);
+    await load();
+  };
+
+  const submitBusinessEdge = async (payload) => {
+    await runAction("业务关系已保存", () =>
+      apiRequest(`/api/projects/${project.id}/business-graph/edges`, { method: "POST", body: payload }),
+    );
+    setModal(null);
+    await load();
+  };
+
+  const submitBusinessConclusion = async (payload) => {
+    await runAction("业务结论已保存", () =>
+      apiRequest(`/api/projects/${project.id}/business-graph/conclusions`, { method: "POST", body: payload }),
+    );
+    setConcludingBusinessNode(null);
+    await load();
+  };
+
+  const deleteBusinessNode = async (node) => {
+    const ok = await confirmAction({
+      title: "删除业务节点",
+      message: `确认删除业务节点「${node.title}」？关联关系也会被删除。`,
+      tone: "danger",
+      confirmLabel: "删除",
+    });
+    if (!ok) return;
+    await runAction("业务节点已删除", () =>
+      apiRequest(`/api/projects/${project.id}/business-graph/nodes/${node.id}`, { method: "DELETE" }),
+    );
+    await load();
+  };
+
+  const deleteBusinessEdge = async (edge) => {
+    await runAction("业务关系已删除", () =>
+      apiRequest(`/api/projects/${project.id}/business-graph/edges/${edge.id}`, { method: "DELETE" }),
     );
     await load();
   };
@@ -1731,6 +2145,7 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
           <div className="status-pill">
             <span>{facts.length} 个事实</span>
             <span>{intents.length} 个意图</span>
+            <span>{businessGraph.nodes.length} 个业务节点</span>
           </div>
           <button className="ghost-button compact" type="button" onClick={() => exportProject("yaml")}>
             <Download size={16} />
@@ -1786,6 +2201,14 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
                 <span>大小</span>
                 <strong>{formatBytes(currentSource.total_bytes)}</strong>
               </div>
+              <div>
+                <span>结构索引</span>
+                <strong>
+                  {sourceIndexSummary
+                    ? `${sourceIndexSummary.symbol_count} 符号 / ${sourceIndexSummary.entrypoint_count} 入口 / ${sourceIndexSummary.manifest_count} 依赖`
+                    : "未生成"}
+                </strong>
+              </div>
             </div>
           )}
           <div className="graph-toolbar floating">
@@ -1831,8 +2254,15 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
           toolPlan={toolPlan}
           toolFindings={toolFindings}
           auditFindings={auditFindings}
+          businessGraph={businessGraph}
           onRefresh={load}
           runAction={runAction}
+          onAddBusinessNode={() => setModal("business-node")}
+          onAddBusinessEdge={() => setModal("business-edge")}
+          onEditBusinessNode={setEditingBusinessNode}
+          onAddBusinessConclusion={setConcludingBusinessNode}
+          onDeleteBusinessNode={deleteBusinessNode}
+          onDeleteBusinessEdge={deleteBusinessEdge}
         />
       </section>
       {modal === "intent" && (
@@ -1924,6 +2354,33 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
           submitLabel="保存名称"
           onClose={() => setModal(null)}
           onSubmit={submitTitle}
+        />
+      )}
+      {modal === "business-node" && (
+        <BusinessNodeModal onClose={() => setModal(null)} onSubmit={submitBusinessNode} />
+      )}
+      {editingBusinessNode && (
+        <BusinessNodeModal
+          initial={editingBusinessNode}
+          title="编辑业务节点"
+          submitLabel="保存节点"
+          onClose={() => setEditingBusinessNode(null)}
+          onSubmit={(payload) => updateBusinessNode(editingBusinessNode, payload)}
+        />
+      )}
+      {modal === "business-edge" && (
+        <BusinessEdgeModal
+          nodes={businessGraph.nodes}
+          onClose={() => setModal(null)}
+          onSubmit={submitBusinessEdge}
+        />
+      )}
+      {concludingBusinessNode && (
+        <BusinessConclusionModal
+          node={concludingBusinessNode}
+          findings={auditFindings}
+          onClose={() => setConcludingBusinessNode(null)}
+          onSubmit={submitBusinessConclusion}
         />
       )}
     </>
@@ -2126,8 +2583,15 @@ function Inspector({
   toolPlan,
   toolFindings,
   auditFindings,
+  businessGraph,
   onRefresh,
   runAction,
+  onAddBusinessNode,
+  onAddBusinessEdge,
+  onEditBusinessNode,
+  onAddBusinessConclusion,
+  onDeleteBusinessNode,
+  onDeleteBusinessEdge,
 }) {
   const facts = detail.facts;
   const intents = detail.intents;
@@ -2135,6 +2599,7 @@ function Inspector({
   const intent = selected?.type === "intent" ? intents.find((item) => item.id === selected.id) : null;
   const tabs = [
     ["details", "详情", null],
+    ["business", "业务", businessGraph.nodes.length],
     ["hints", "提示", detail.hints.length],
     ["tools", "工具", toolPlan.length],
     ["findings", "发现", auditFindings.length],
@@ -2242,6 +2707,18 @@ function Inspector({
             )}
           </div>
         )}
+        {tab === "business" && (
+          <BusinessGraphPanel
+            graph={businessGraph}
+            auditFindings={auditFindings}
+            onAddNode={onAddBusinessNode}
+            onAddEdge={onAddBusinessEdge}
+            onEditNode={onEditBusinessNode}
+            onAddConclusion={onAddBusinessConclusion}
+            onDeleteNode={onDeleteBusinessNode}
+            onDeleteEdge={onDeleteBusinessEdge}
+          />
+        )}
         {tab === "tools" && (
           <div className="timeline-list">
             {toolPlan.length === 0 ? (
@@ -2334,6 +2811,195 @@ function Inspector({
         )}
       </div>
     </aside>
+  );
+}
+
+function isHighRiskBusinessNode(node) {
+  return ["critical", "high", "unknown"].includes(node.risk_level || "unknown");
+}
+
+function hasBusinessCoverage(node) {
+  if (node.review_status === "covered") return true;
+  return node.review_status === "blocked" && String(node.coverage_note || "").trim();
+}
+
+function getBusinessConclusionIssue(node, conclusion, auditFindingById) {
+  if (!isHighRiskBusinessNode(node)) return null;
+  if (!hasBusinessCoverage(node)) return "缺少覆盖";
+  if (!conclusion) return "缺少结论";
+  if (conclusion.conclusion === "confirmed_finding") {
+    const finding = auditFindingById.get(conclusion.audit_finding_id);
+    if (!finding) return "漏洞记录缺失";
+    if (finding.status !== "confirmed") return "漏洞待复核";
+  }
+  return null;
+}
+
+function BusinessGraphPanel({
+  graph,
+  auditFindings,
+  onAddNode,
+  onAddEdge,
+  onEditNode,
+  onAddConclusion,
+  onDeleteNode,
+  onDeleteEdge,
+}) {
+  const nodes = graph.nodes || [];
+  const edges = graph.edges || [];
+  const conclusions = graph.conclusions || [];
+  const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
+  const auditFindingById = useMemo(
+    () => new Map((auditFindings || []).map((finding) => [finding.id, finding])),
+    [auditFindings],
+  );
+  const latestConclusionByNode = useMemo(() => {
+    const map = new Map();
+    for (const conclusion of conclusions) {
+      if (!map.has(conclusion.business_node_id)) map.set(conclusion.business_node_id, conclusion);
+    }
+    return map;
+  }, [conclusions]);
+  const highRiskNodes = useMemo(() => nodes.filter(isHighRiskBusinessNode), [nodes]);
+  const unresolvedNodes = useMemo(
+    () =>
+      highRiskNodes.filter((node) =>
+        Boolean(getBusinessConclusionIssue(node, latestConclusionByNode.get(node.id), auditFindingById)),
+      ),
+    [auditFindingById, highRiskNodes, latestConclusionByNode],
+  );
+
+  return (
+    <div className="business-graph-panel">
+      <div className="business-toolbar">
+        <button className="primary-outline compact" type="button" onClick={onAddNode}>
+          <Plus size={16} />
+          节点
+        </button>
+        <button className="ghost-button compact" type="button" onClick={onAddEdge} disabled={nodes.length < 2}>
+          <Network size={16} />
+          关系
+        </button>
+      </div>
+      {highRiskNodes.length > 0 && (
+        <div className={cn("business-closure-strip", unresolvedNodes.length ? "warning" : "success")}>
+          <div>
+            <span>高风险闭环</span>
+            <strong>
+              {highRiskNodes.length - unresolvedNodes.length}/{highRiskNodes.length}
+            </strong>
+          </div>
+          <p>
+            {unresolvedNodes.length
+              ? `${unresolvedNodes.length} 个严重/高/未知风险节点还缺覆盖或结构化结论`
+              : "所有严重/高/未知风险节点已有覆盖和结构化结论"}
+          </p>
+        </div>
+      )}
+      {nodes.length === 0 ? (
+        <EmptyState
+          icon={Network}
+          title="暂无业务图"
+          subtitle="先记录业务功能、角色、接口、数据对象和状态流转，Worker 后续会把它作为审计上下文。"
+        />
+      ) : (
+        <>
+          <div className="business-section">
+            <span>业务节点</span>
+            <div className="business-node-list">
+              {nodes.map((node) => {
+                const meta = BUSINESS_NODE_META[node.node_type] || { label: node.node_type, tone: "muted" };
+                const risk = BUSINESS_RISK_META[node.risk_level || "unknown"] || BUSINESS_RISK_META.unknown;
+                const review =
+                  BUSINESS_REVIEW_STATUS_META[node.review_status || "unreviewed"] ||
+                  BUSINESS_REVIEW_STATUS_META.unreviewed;
+                const conclusion = latestConclusionByNode.get(node.id);
+                const conclusionMeta = conclusion
+                  ? BUSINESS_CONCLUSION_META[conclusion.conclusion] || { label: conclusion.conclusion, tone: "muted" }
+                  : null;
+                const issue = getBusinessConclusionIssue(node, conclusion, auditFindingById);
+                return (
+                  <article className={cn("business-node-card", issue && "needs-closure")} key={node.id}>
+                    <div className="business-node-head">
+                      <div className="business-badge-row">
+                        <Badge tone={meta.tone}>{meta.label}</Badge>
+                        <Badge tone={risk.tone}>{risk.label}</Badge>
+                        <Badge tone={review.tone}>{review.label}</Badge>
+                        {conclusionMeta && <Badge tone={conclusionMeta.tone}>{conclusionMeta.label}</Badge>}
+                        {issue && <Badge tone="warning">{issue}</Badge>}
+                      </div>
+                      <div className="button-row">
+                        <button className="icon-button tiny" type="button" title="记录结论" onClick={() => onAddConclusion(node)}>
+                          <CheckCheck size={14} />
+                        </button>
+                        <button className="icon-button tiny" type="button" title="编辑节点" onClick={() => onEditNode(node)}>
+                          <Pencil size={14} />
+                        </button>
+                        <button className="icon-button tiny danger" type="button" title="删除节点" onClick={() => onDeleteNode(node)}>
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </div>
+                    <h3>{node.title}</h3>
+                    {node.description && <p>{node.description}</p>}
+                    {node.coverage_note && <p className="business-coverage-note">{node.coverage_note}</p>}
+                    {conclusion && (
+                      <div className="business-conclusion-box">
+                        <strong>{conclusion.summary}</strong>
+                        {conclusion.evidence && <p>{conclusion.evidence}</p>}
+                        <small>
+                          {conclusion.audit_finding_id || "无关联漏洞"} · {conclusion.created_by}
+                        </small>
+                      </div>
+                    )}
+                    {node.risk_tags?.length > 0 && (
+                      <div className="business-chip-row">
+                        {node.risk_tags.map((tag) => (
+                          <span key={tag}>{tag}</span>
+                        ))}
+                      </div>
+                    )}
+                    {node.evidence?.length > 0 && (
+                      <div className="business-evidence">
+                        {node.evidence.map((item) => (
+                          <code key={item}>{item}</code>
+                        ))}
+                      </div>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
+          </div>
+          <div className="business-section">
+            <span>业务关系</span>
+            {edges.length === 0 ? (
+              <div className="soft-box compact">暂无关系</div>
+            ) : (
+              <div className="business-edge-list">
+                {edges.map((edge) => {
+                  const from = nodeById.get(edge.from_node_id);
+                  const to = nodeById.get(edge.to_node_id);
+                  return (
+                    <article className="business-edge-card" key={edge.id}>
+                      <div>
+                        <strong>{from?.title || edge.from_node_id}</strong>
+                        <span>{BUSINESS_EDGE_META[edge.relation] || edge.relation}</span>
+                        <strong>{to?.title || edge.to_node_id}</strong>
+                      </div>
+                      {edge.description && <p>{edge.description}</p>}
+                      <button className="icon-button tiny danger" type="button" title="删除关系" onClick={() => onDeleteEdge(edge)}>
+                        <Trash2 size={14} />
+                      </button>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -2458,6 +3124,318 @@ function TextActionModal({
           <button className="primary-button compact" type="submit" disabled={saving}>
             {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
             {submitLabel}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function BusinessNodeModal({ onClose, onSubmit, initial = null, title = "新增业务节点", submitLabel = "保存节点" }) {
+  const [form, setForm] = useState({
+    node_type: initial?.node_type || "feature",
+    title: initial?.title || "",
+    description: initial?.description || "",
+    risk_level: initial?.risk_level || "unknown",
+    review_status: initial?.review_status || "unreviewed",
+    coverage_note: initial?.coverage_note || "",
+    risk_tags: (initial?.risk_tags || []).join("\n"),
+    evidence: (initial?.evidence || []).join("\n"),
+  });
+  const [saving, setSaving] = useState(false);
+  const isEditing = Boolean(initial);
+
+  const submit = async (event) => {
+    event.preventDefault();
+    setSaving(true);
+    try {
+      const payload = {
+        node_type: form.node_type,
+        title: form.title,
+        description: form.description || null,
+        risk_level: form.risk_level,
+        review_status: form.review_status,
+        coverage_note: form.coverage_note || null,
+        last_intent_id: initial?.last_intent_id || null,
+        risk_tags: splitLines(form.risk_tags),
+        evidence: splitLines(form.evidence),
+      };
+      if (!isEditing) payload.created_by = HUMAN_WORKER;
+      await onSubmit(payload);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal title={title} subtitle="记录功能、角色、接口、数据对象、状态或风险点。" onClose={onClose} wide>
+      <form className="stack-form modal-body" onSubmit={submit}>
+        <div className="two-col">
+          <label>
+            <span>类型</span>
+            <select value={form.node_type} onChange={(event) => setForm({ ...form, node_type: event.target.value })}>
+              {Object.entries(BUSINESS_NODE_META).map(([key, meta]) => (
+                <option key={key} value={key}>
+                  {meta.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>标题</span>
+            <input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} required />
+          </label>
+        </div>
+        <div className="two-col">
+          <label>
+            <span>风险等级</span>
+            <select value={form.risk_level} onChange={(event) => setForm({ ...form, risk_level: event.target.value })}>
+              {Object.entries(BUSINESS_RISK_META).map(([key, meta]) => (
+                <option key={key} value={key}>
+                  {meta.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>覆盖状态</span>
+            <select value={form.review_status} onChange={(event) => setForm({ ...form, review_status: event.target.value })}>
+              {Object.entries(BUSINESS_REVIEW_STATUS_META).map(([key, meta]) => (
+                <option key={key} value={key}>
+                  {meta.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <label>
+          <span>说明</span>
+          <textarea
+            rows={4}
+            value={form.description}
+            onChange={(event) => setForm({ ...form, description: event.target.value })}
+          />
+        </label>
+        <label>
+          <span>覆盖说明</span>
+          <textarea
+            rows={3}
+            value={form.coverage_note}
+            placeholder="已覆盖/阻塞时写明依据或剩余不确定性"
+            onChange={(event) => setForm({ ...form, coverage_note: event.target.value })}
+          />
+        </label>
+        <div className="two-col">
+          <label>
+            <span>风险标签</span>
+            <textarea
+              rows={4}
+              value={form.risk_tags}
+              placeholder="每行一个，例如：越权"
+              onChange={(event) => setForm({ ...form, risk_tags: event.target.value })}
+            />
+          </label>
+          <label>
+            <span>代码证据</span>
+            <textarea
+              rows={4}
+              value={form.evidence}
+              placeholder="每行一个路径或符号"
+              onChange={(event) => setForm({ ...form, evidence: event.target.value })}
+            />
+          </label>
+        </div>
+        <div className="modal-footer">
+          <button className="ghost-button" type="button" onClick={onClose}>
+            取消
+          </button>
+          <button className="primary-button compact" type="submit" disabled={saving}>
+            {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
+            {submitLabel}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function BusinessEdgeModal({ nodes, onClose, onSubmit }) {
+  const [form, setForm] = useState({
+    from_node_id: nodes[0]?.id || "",
+    to_node_id: nodes[1]?.id || nodes[0]?.id || "",
+    relation: "relates_to",
+    description: "",
+  });
+  const [saving, setSaving] = useState(false);
+
+  const submit = async (event) => {
+    event.preventDefault();
+    setSaving(true);
+    try {
+      await onSubmit({
+        from_node_id: form.from_node_id,
+        to_node_id: form.to_node_id,
+        relation: form.relation,
+        description: form.description || null,
+        created_by: HUMAN_WORKER,
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal title="新增业务关系" subtitle="把业务功能、接口、角色、数据对象和状态流转连接起来。" onClose={onClose} wide>
+      <form className="stack-form modal-body" onSubmit={submit}>
+        <div className="two-col">
+          <label>
+            <span>起点</span>
+            <select value={form.from_node_id} onChange={(event) => setForm({ ...form, from_node_id: event.target.value })}>
+              {nodes.map((node) => (
+                <option key={node.id} value={node.id}>
+                  {node.title}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>终点</span>
+            <select value={form.to_node_id} onChange={(event) => setForm({ ...form, to_node_id: event.target.value })}>
+              {nodes.map((node) => (
+                <option key={node.id} value={node.id}>
+                  {node.title}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <label>
+          <span>关系</span>
+          <select value={form.relation} onChange={(event) => setForm({ ...form, relation: event.target.value })}>
+            {Object.entries(BUSINESS_EDGE_META).map(([key, label]) => (
+              <option key={key} value={key}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>说明</span>
+          <textarea
+            rows={4}
+            value={form.description}
+            onChange={(event) => setForm({ ...form, description: event.target.value })}
+          />
+        </label>
+        <div className="modal-footer">
+          <button className="ghost-button" type="button" onClick={onClose}>
+            取消
+          </button>
+          <button className="primary-button compact" type="submit" disabled={saving || !form.from_node_id || !form.to_node_id}>
+            {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
+            保存关系
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function BusinessConclusionModal({ node, findings, onClose, onSubmit }) {
+  const confirmedFindings = useMemo(
+    () => (findings || []).filter((finding) => finding.business_node_id === node.id && finding.status === "confirmed"),
+    [findings, node.id],
+  );
+  const [form, setForm] = useState({
+    conclusion: "rejected",
+    summary: "",
+    evidence: "",
+    audit_finding_id: "",
+  });
+  const [saving, setSaving] = useState(false);
+  const requiresFinding = form.conclusion === "confirmed_finding";
+
+  const submit = async (event) => {
+    event.preventDefault();
+    setSaving(true);
+    try {
+      await onSubmit({
+        business_node_id: node.id,
+        conclusion: form.conclusion,
+        summary: form.summary,
+        evidence: requiresFinding ? form.evidence || null : form.evidence,
+        audit_finding_id: requiresFinding ? form.audit_finding_id : null,
+        created_by: HUMAN_WORKER,
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal title="记录业务结论" subtitle={node.title} onClose={onClose} wide>
+      <form className="stack-form modal-body" onSubmit={submit}>
+        <div className="two-col">
+          <label>
+            <span>结论类型</span>
+            <select
+              value={form.conclusion}
+              onChange={(event) => setForm({ ...form, conclusion: event.target.value, audit_finding_id: "" })}
+            >
+              {Object.entries(BUSINESS_CONCLUSION_META).map(([key, meta]) => (
+                <option key={key} value={key}>
+                  {meta.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>关联漏洞</span>
+            <select
+              value={form.audit_finding_id}
+              onChange={(event) => setForm({ ...form, audit_finding_id: event.target.value })}
+              disabled={!requiresFinding}
+              required={requiresFinding}
+            >
+              <option value="">{requiresFinding ? "选择已确认漏洞" : "无需关联"}</option>
+              {confirmedFindings.map((finding) => (
+                <option key={finding.id} value={finding.id}>
+                  {finding.id} · {finding.title}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        {requiresFinding && confirmedFindings.length === 0 && (
+          <div className="soft-box compact">当前业务节点没有已确认漏洞；先完成 finding 的独立复核，再记录确认漏洞结论。</div>
+        )}
+        <label>
+          <span>结论摘要</span>
+          <textarea
+            rows={4}
+            value={form.summary}
+            placeholder="写清这条业务路径最终判断是什么"
+            onChange={(event) => setForm({ ...form, summary: event.target.value })}
+            required
+          />
+        </label>
+        <label>
+          <span>证据</span>
+          <textarea
+            rows={4}
+            value={form.evidence}
+            placeholder="未发现漏洞或证据不足时必须写代码证据、阻塞原因或缺失证据"
+            onChange={(event) => setForm({ ...form, evidence: event.target.value })}
+            required={!requiresFinding}
+          />
+        </label>
+        <div className="modal-footer">
+          <button className="ghost-button" type="button" onClick={onClose}>
+            取消
+          </button>
+          <button className="primary-button compact" type="submit" disabled={saving || (requiresFinding && !form.audit_finding_id)}>
+            {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
+            保存结论
           </button>
         </div>
       </form>
@@ -2755,6 +3733,7 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
                     key={vuln.id}
                     vuln={vuln}
                     selected={selectedIds.includes(vuln.id)}
+                    setToast={setToast}
                     onSelect={() => toggleSelected(vuln.id)}
                     expanded={!!expandedVulns[vuln.id]}
                     onToggle={() => setExpandedVulns({ ...expandedVulns, [vuln.id]: !expandedVulns[vuln.id] })}
@@ -3227,9 +4206,67 @@ function VulnerabilityStatusDistribution({ data }) {
   );
 }
 
-function VulnerabilityItem({ vuln, selected, onSelect, expanded, onToggle, onExport, onStatusChange }) {
+function formatVulnerabilityCopyText(vuln) {
+  const meta = SEVERITY_META[vuln.severity] || SEVERITY_META.low;
+  const evidence = (vuln.evidence || []).filter(Boolean);
+  const poc = vuln.reproduction_poc || {};
+  const pocRequest =
+    pocText(poc, "request_template") ||
+    pocText(poc, "curl") ||
+    pocText(poc, "command");
+  return [
+    `漏洞名称：${vuln.title || "未记录"}`,
+    `严重程度：${meta.label || vuln.severity || "未记录"}`,
+    `状态：${vuln.status === "ignored" ? "已忽略" : "已确认"}`,
+    `项目：${vuln.project_name || "未记录"} (${vuln.project_id || "未记录"})`,
+    `确认事实：${vuln.fact_id || "未记录"}`,
+    `发现时间：${formatTime(vuln.discovered_at)}`,
+    "",
+    "漏洞描述：",
+    vuln.description || "未记录",
+    "",
+    "关键证据：",
+    ...(evidence.length ? evidence.map((item) => `- ${item}`) : ["- 未记录"]),
+    "",
+    `证明数据包：${(vuln.proof_packets || []).length ? `${vuln.proof_packets.length} 个` : "未记录"}`,
+    `静态 PoC：${pocRequest ? pocRequest : "未记录"}`,
+  ].join("\n");
+}
+
+function CopyButton({ value, setToast, message = "已复制", className, children, title = "复制" }) {
+  return (
+    <button
+      className={cn("copy-button", className)}
+      type="button"
+      title={title}
+      aria-label={title}
+      onClick={() => copyText(value, setToast, message)}
+    >
+      <Copy size={14} />
+      {children}
+    </button>
+  );
+}
+
+function CopyableBlock({ label, value, setToast, codeClassName }) {
+  const text = String(value || "未记录");
+  return (
+    <div className="copyable-block">
+      <div className="copyable-head">
+        <span>{label}</span>
+        <CopyButton value={text} setToast={setToast} message={`${label}已复制`} />
+      </div>
+      <pre className={codeClassName}>{text}</pre>
+    </div>
+  );
+}
+
+function VulnerabilityItem({ vuln, selected, setToast, onSelect, expanded, onToggle, onExport, onStatusChange }) {
   const meta = SEVERITY_META[vuln.severity] || SEVERITY_META.low;
   const ignored = vuln.status === "ignored";
+  const hasProofPackets = (vuln.proof_packets || []).length > 0;
+  const hasStaticPoc = !!(vuln.reproduction_poc && Object.keys(vuln.reproduction_poc).length);
+  const summaryText = formatVulnerabilityCopyText(vuln);
   return (
     <article className={cn("vuln-table-item", ignored && "ignored")}>
       <div className="vuln-table-row">
@@ -3239,6 +4276,13 @@ function VulnerabilityItem({ vuln, selected, onSelect, expanded, onToggle, onExp
         <div className="vuln-name-cell">
           <div className="vuln-meta">
             <span>{vuln.fact_id}</span>
+            <CopyButton
+              className="inline-copy"
+              value={vuln.fact_id}
+              setToast={setToast}
+              message="确认事实 ID 已复制"
+              title="复制确认事实 ID"
+            />
           </div>
           <h3>{vuln.title}</h3>
         </div>
@@ -3254,6 +4298,15 @@ function VulnerabilityItem({ vuln, selected, onSelect, expanded, onToggle, onExp
         </div>
         <time>{formatTime(vuln.discovered_at)}</time>
         <div className="button-row">
+          <button
+            className="table-action"
+            type="button"
+            title="复制漏洞摘要"
+            aria-label="复制漏洞摘要"
+            onClick={() => copyText(summaryText, setToast, "漏洞摘要已复制")}
+          >
+            <Copy size={16} />
+          </button>
           <button
             className={cn("table-action", ignored ? "success" : "warning")}
             type="button"
@@ -3273,6 +4326,20 @@ function VulnerabilityItem({ vuln, selected, onSelect, expanded, onToggle, onExp
       </div>
       {expanded && (
         <div className="vuln-detail">
+          <div className="detail-toolbar">
+            <div className="evidence-state">
+              <Badge tone={hasProofPackets ? "success" : "warning"}>
+                {hasProofPackets ? "已有证明数据包" : "缺少证明数据包"}
+              </Badge>
+              <Badge tone={hasStaticPoc ? "info" : "muted"}>
+                {hasStaticPoc ? "已有静态 PoC" : "未记录静态 PoC"}
+              </Badge>
+            </div>
+            <button className="ghost-button compact" type="button" onClick={() => copyText(summaryText, setToast, "漏洞摘要已复制")}>
+              <Copy size={15} />
+              复制摘要
+            </button>
+          </div>
           <div className="detail-grid cards">
             <InfoBox label="项目来源" value={`${vuln.project_name} (${vuln.project_id})`} />
             <InfoBox label="确认事实" value={vuln.fact_id} />
@@ -3287,7 +4354,16 @@ function VulnerabilityItem({ vuln, selected, onSelect, expanded, onToggle, onExp
             <h4>关键证据</h4>
             <div className="evidence-list">
               {(vuln.evidence?.length ? vuln.evidence : ["未记录"]).map((item, index) => (
-                <p key={`${item}-${index}`}>{item}</p>
+                <div className="evidence-row" key={`${item}-${index}`}>
+                  <p>{item}</p>
+                  <CopyButton
+                    className="inline-copy evidence-copy"
+                    value={item}
+                    setToast={setToast}
+                    message="证据已复制"
+                    title="复制证据"
+                  />
+                </div>
               ))}
             </div>
           </section>
@@ -3300,16 +4376,16 @@ function VulnerabilityItem({ vuln, selected, onSelect, expanded, onToggle, onExp
                 vuln.proof_packets.map((packet, index) => (
                   <article className="packet-card" key={`${packet.title}-${index}`}>
                     <strong>{packet.title || `证明 ${index + 1}`}</strong>
-                    <span>请求数据包</span>
-                    <pre>{packet.request || "未记录"}</pre>
-                    <span>响应/回显</span>
-                    <pre>{packet.response || "未记录"}</pre>
+                    {packet.payload && <CopyableBlock label="Payload" value={packet.payload} setToast={setToast} />}
+                    <CopyableBlock label="请求数据包" value={packet.request || "未记录"} setToast={setToast} />
+                    <CopyableBlock label="响应/回显" value={packet.response || "未记录"} setToast={setToast} />
                     {packet.note && <p>{packet.note}</p>}
                   </article>
                 ))
               )}
             </div>
           </section>
+          <StaticPocSection poc={vuln.reproduction_poc} setToast={setToast} />
           <section>
             <h4>漏洞浮现过程</h4>
             <div className="process-list">
@@ -3334,6 +4410,98 @@ function VulnerabilityItem({ vuln, selected, onSelect, expanded, onToggle, onExp
         </div>
       )}
     </article>
+  );
+}
+
+function StaticPocSection({ poc, setToast }) {
+  if (!poc || typeof poc !== "object" || Object.keys(poc).length === 0) {
+    return (
+      <section>
+        <h4>静态复现 PoC</h4>
+        <p className="soft-box">未记录静态复现 PoC。导出的 Markdown 会保留当前证明材料状态。</p>
+      </section>
+    );
+  }
+  const payload = pocText(poc, "payload");
+  const requestTemplate = pocText(poc, "request_template") || pocText(poc, "curl") || pocText(poc, "command");
+  const expectedResult = pocText(poc, "expected_result") || pocText(poc, "expected_response");
+  const verification = pocText(poc, "verification");
+  const steps = pocList(poc, "steps");
+  const prerequisites = pocList(poc, "prerequisites");
+  const limitations = pocList(poc, "limitations");
+  const fullText = [
+    payload ? `Payload:\n${payload}` : "",
+    steps.length ? `复现步骤:\n${steps.map((step, index) => `${index + 1}. ${step}`).join("\n")}` : "",
+    requestTemplate ? `请求/命令模板:\n${requestTemplate}` : "",
+    expectedResult ? `预期结果:\n${expectedResult}` : "",
+    verification ? `判断标准:\n${verification}` : "",
+    prerequisites.length ? `利用前提:\n${prerequisites.map((item) => `- ${item}`).join("\n")}` : "",
+    limitations.length ? `限制与说明:\n${limitations.map((item) => `- ${item}`).join("\n")}` : "",
+  ].filter(Boolean).join("\n\n");
+
+  return (
+    <section>
+      <div className="section-heading-row">
+        <h4>静态复现 PoC</h4>
+        <button className="ghost-button compact" type="button" onClick={() => copyText(fullText, setToast, "静态 PoC 已复制")}>
+          <Copy size={15} />
+          复制 PoC
+        </button>
+      </div>
+      <div className="static-poc-panel">
+        {payload && <CopyableBlock label="Payload" value={payload} setToast={setToast} />}
+        {steps.length > 0 && (
+          <div className="poc-steps">
+            <div className="copyable-head">
+              <span>复现步骤</span>
+              <CopyButton value={steps.map((step, index) => `${index + 1}. ${step}`).join("\n")} setToast={setToast} message="复现步骤已复制" />
+            </div>
+            <ol>
+              {steps.map((step, index) => (
+                <li key={`${step}-${index}`}>{step}</li>
+              ))}
+            </ol>
+          </div>
+        )}
+        {requestTemplate && <CopyableBlock label="请求/命令模板" value={requestTemplate} setToast={setToast} codeClassName="bash-block" />}
+        {expectedResult && (
+          <div className="poc-note-block">
+            <strong>预期结果</strong>
+            <p>{expectedResult}</p>
+          </div>
+        )}
+        {verification && (
+          <div className="poc-note-block">
+            <strong>判断标准</strong>
+            <p>{verification}</p>
+          </div>
+        )}
+        {(prerequisites.length > 0 || limitations.length > 0) && (
+          <div className="poc-note-grid">
+            {prerequisites.length > 0 && (
+              <div className="poc-note-block">
+                <strong>利用前提</strong>
+                <ul>
+                  {prerequisites.map((item, index) => (
+                    <li key={`${item}-${index}`}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {limitations.length > 0 && (
+              <div className="poc-note-block">
+                <strong>限制与说明</strong>
+                <ul>
+                  {limitations.map((item, index) => (
+                    <li key={`${item}-${index}`}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -3632,12 +4800,23 @@ function normalizeWorkerForSave(worker) {
 
 const WORKER_PRESETS = [
   {
-    id: "pi-openai-chat",
-    label: "Pi · OpenAI Chat",
+    id: "pi-deepseek-pro",
+    label: "Pi · DeepSeek V4 Pro",
     type: "pi",
     env: {
-      PI_MODEL: "deepseekv4",
-      PI_BASE_URL: "http://127.0.0.1:3000/v1",
+      PI_MODEL: "deepseek-v4-pro",
+      PI_BASE_URL: "https://api.deepseek.com",
+      PI_API_KEY: "",
+      PI_PROVIDER_API: "openai-completions",
+    },
+  },
+  {
+    id: "pi-glm-5",
+    label: "Pi · GLM-5",
+    type: "pi",
+    env: {
+      PI_MODEL: "glm-5",
+      PI_BASE_URL: "http://10.2.8.77:3000/v1",
       PI_API_KEY: "",
       PI_PROVIDER_API: "openai-completions",
     },

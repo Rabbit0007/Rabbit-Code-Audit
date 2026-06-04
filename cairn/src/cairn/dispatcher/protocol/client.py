@@ -9,7 +9,7 @@ from pydantic import TypeAdapter
 import requests
 from requests.adapters import HTTPAdapter
 
-from cairn.server.models import Intent, ProjectDetail, ProjectSummary, Settings
+from cairn.server.models import Intent, ProjectDetail, ProjectSummary, RuntimeInfo, Settings
 
 LOG = logging.getLogger(__name__)
 
@@ -62,6 +62,11 @@ class CairnClient:
         response = self._session().get(self._url("/settings"), timeout=self._timeout)
         response.raise_for_status()
         return Settings.model_validate(response.json())
+
+    def get_runtime_info(self) -> RuntimeInfo:
+        response = self._session().get(self._url("/api/runtime"), timeout=self._timeout)
+        response.raise_for_status()
+        return RuntimeInfo.model_validate(response.json())
 
     def export_project(self, project_id: str) -> str:
         response = self._session().get(
@@ -142,6 +147,56 @@ class CairnClient:
             json=payload,
         )
 
+    def create_audit_candidate(self, project_id: str, payload: dict[str, Any]) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/projects/{project_id}/audit-candidates",
+            json=payload,
+        )
+
+    def conclude_audit_candidate(
+        self,
+        project_id: str,
+        candidate_id: str,
+        reviewer: str,
+        decision: str,
+        summary: str,
+        evidence: str | None = None,
+        audit_finding_id: str | None = None,
+    ) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/projects/{project_id}/audit-candidates/{candidate_id}/conclude",
+            json={
+                "reviewer": reviewer,
+                "decision": decision,
+                "summary": summary,
+                "evidence": evidence,
+                "audit_finding_id": audit_finding_id,
+            },
+        )
+
+    def create_business_node(self, project_id: str, payload: dict[str, Any]) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/projects/{project_id}/business-graph/nodes",
+            json=payload,
+        )
+
+    def create_business_edge(self, project_id: str, payload: dict[str, Any]) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/projects/{project_id}/business-graph/edges",
+            json=payload,
+        )
+
+    def create_business_node_conclusion(self, project_id: str, payload: dict[str, Any]) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/projects/{project_id}/business-graph/conclusions",
+            json=payload,
+        )
+
     def review_audit_finding(
         self,
         project_id: str,
@@ -154,6 +209,65 @@ class CairnClient:
             f"/api/projects/{project_id}/audit-findings/{finding_id}/review",
             json={"reviewer": reviewer, "decision": decision},
         )
+
+    def record_worker_task_history(self, payload: dict[str, Any]) -> ApiResult:
+        return self._request_json("POST", "/api/workers/history", json=payload)
+
+    def list_pending_report_enrichments(self, project_id: str, limit: int = 10) -> list[dict[str, Any]]:
+        response = self._session().get(
+            self._url("/api/report-enrichments/pending"),
+            params={"project_id": project_id, "limit": limit},
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
+
+    def claim_report_enrichment(self, task_id: str, worker: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/report-enrichments/{task_id}/claim",
+            json={"worker": worker},
+        )
+
+    def report_enrichment_heartbeat(self, task_id: str, worker: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/report-enrichments/{task_id}/heartbeat",
+            json={"worker": worker},
+        )
+
+    def release_report_enrichment(self, task_id: str, worker: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/report-enrichments/{task_id}/release",
+            json={"worker": worker},
+        )
+
+    def complete_report_enrichment(self, task_id: str, payload: dict[str, Any]) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/report-enrichments/{task_id}/complete",
+            json=payload,
+        )
+
+    def fail_report_enrichment(self, task_id: str, worker: str, error_message: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/report-enrichments/{task_id}/fail",
+            json={"worker": worker, "error_message": error_message},
+        )
+
+    def get_report_enrichment_packet(self, task_id: str) -> dict[str, Any]:
+        response = self._session().get(
+            self._url(f"/api/report-enrichments/{task_id}/packet"),
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ProtocolError("report enrichment packet must be an object", response.status_code, response.text)
+        return payload
 
     def _request_json(self, method: str, path: str, json: dict[str, Any]) -> ApiResult:
         try:

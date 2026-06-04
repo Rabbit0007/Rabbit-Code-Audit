@@ -2,12 +2,24 @@ from __future__ import annotations
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
-from cairn.server.source_models import CodeFile, GitSourceImportRequest, SourceSnapshot
+from cairn.server.source_models import (
+    CodeEntrypoint,
+    CodeFile,
+    CodeSymbol,
+    DependencyManifest,
+    GitSourceImportRequest,
+    SourceIndexSummary,
+    SourceSnapshot,
+)
 from cairn.server.source_service import (
     get_snapshot,
+    get_source_index_summary,
     import_git_source,
     import_zip_source,
+    list_code_entrypoints,
     list_code_files,
+    list_code_symbols,
+    list_dependency_manifests,
     list_snapshots,
     snapshot_container_path,
 )
@@ -53,6 +65,44 @@ def get_source_files(project_id: str, snapshot_id: str, limit: int = 5000):
         raise HTTPException(400, "limit must be between 1 and 20000")
     try:
         return list_code_files(project_id, snapshot_id, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.get("/{snapshot_id}/index-summary", response_model=SourceIndexSummary)
+def get_source_index(project_id: str, snapshot_id: str):
+    try:
+        return get_source_index_summary(project_id, snapshot_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.get("/{snapshot_id}/symbols", response_model=list[CodeSymbol])
+def get_source_symbols(project_id: str, snapshot_id: str, limit: int = 1000):
+    if limit < 1 or limit > 20_000:
+        raise HTTPException(400, "limit must be between 1 and 20000")
+    try:
+        return list_code_symbols(project_id, snapshot_id, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.get("/{snapshot_id}/entrypoints", response_model=list[CodeEntrypoint])
+def get_source_entrypoints(project_id: str, snapshot_id: str, limit: int = 1000):
+    if limit < 1 or limit > 20_000:
+        raise HTTPException(400, "limit must be between 1 and 20000")
+    try:
+        return list_code_entrypoints(project_id, snapshot_id, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.get("/{snapshot_id}/manifests", response_model=list[DependencyManifest])
+def get_source_manifests(project_id: str, snapshot_id: str, limit: int = 1000):
+    if limit < 1 or limit > 20_000:
+        raise HTTPException(400, "limit must be between 1 and 20000")
+    try:
+        return list_dependency_manifests(project_id, snapshot_id, limit=limit)
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
 

@@ -14,14 +14,19 @@ from cairn.dispatcher.protocol.client import CairnClient
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
 from cairn.dispatcher.runtime.containers import ContainerManager
 from cairn.dispatcher.runtime.heartbeat import HeartbeatLease
+from cairn.dispatcher.models import TaskOutcome
 from cairn.dispatcher.tasks.common import (
     best_effort_release,
     cancel_reason,
     did_timeout,
+    latest_ready_source_path,
     project_allows_conclude_fallback,
     preview,
     run_healthcheck,
     run_worker_process,
+    task_outcome,
+    verify_latest_source_available,
+    write_business_graph,
     write_conclude_result,
     write_conclude_result_with_fact_id,
 )
@@ -39,7 +44,7 @@ def run_bootstrap_task(
     intent: Intent,
     worker: WorkerConfig,
     cancellation: TaskCancellation,
-) -> str:
+) -> TaskOutcome:
     driver = get_driver(worker.type)
     task_started = time.perf_counter()
     healthcheck_timeout = config.runtime.healthcheck_timeout
@@ -47,6 +52,16 @@ def run_bootstrap_task(
     lease.start()
     try:
         container_name = container_manager.ensure_running(project.project.id)
+        source_check = verify_latest_source_available(
+            container_manager,
+            container_name,
+            project,
+            phase="bootstrap_preflight",
+            worker_name=worker.name,
+        )
+        if not source_check.ok:
+            best_effort_release(client, project.project.id, intent.id, worker.name)
+            return task_outcome("failed", error_type="source_preflight_failed", error_detail=source_check.reason)
 
         LOG.info(
             "starting container exec project=%s intent=%s worker=%s phase=bootstrap_healthcheck timeout=%ss",
@@ -74,7 +89,7 @@ def run_bootstrap_task(
                 cancelled,
             )
             best_effort_release(client, project.project.id, intent.id, worker.name)
-            return "cancelled"
+            return task_outcome("cancelled", error_type="cancelled", error_detail=cancelled, result=healthcheck.result)
         if lease.failure is not None:
             LOG.warning(
                 "heartbeat lost during bootstrap healthcheck project=%s intent=%s worker=%s status=%s",
@@ -84,7 +99,7 @@ def run_bootstrap_task(
                 lease.failure.status_code,
             )
             best_effort_release(client, project.project.id, intent.id, worker.name)
-            return "failed"
+            return task_outcome("failed", error_type="heartbeat_lost", error_detail=f"status={lease.failure.status_code}", result=healthcheck.result)
         healthcheck_error = driver.healthcheck_error(
             healthcheck.result.returncode,
             healthcheck.result.stdout,
@@ -100,7 +115,7 @@ def run_bootstrap_task(
                 preview(healthcheck_error),
             )
             best_effort_release(client, project.project.id, intent.id, worker.name)
-            return "unhealthy"
+            return task_outcome("unhealthy", error_type="healthcheck_failed", error_detail=healthcheck_error, result=healthcheck.result)
 
         prompt = render_prompt(
             load_prompt(config.runtime.prompt_group, "bootstrap.md"),
@@ -134,7 +149,7 @@ def run_bootstrap_task(
                 execute_ms,
             )
             best_effort_release(client, project.project.id, intent.id, worker.name)
-            return "cancelled"
+            return task_outcome("cancelled", error_type="cancelled", error_detail=cancelled, result=first)
         if lease.failure is not None:
             LOG.warning(
                 "heartbeat lost during bootstrap project=%s intent=%s worker=%s status=%s execute_ms=%s",
@@ -145,7 +160,7 @@ def run_bootstrap_task(
                 execute_ms,
             )
             best_effort_release(client, project.project.id, intent.id, worker.name)
-            return "failed"
+            return task_outcome("failed", error_type="heartbeat_lost", error_detail=f"status={lease.failure.status_code}", result=first)
         if not did_timeout(first) and first.returncode == 0:
             try:
                 model_output = driver.extract_response_text(first.stdout, first.stderr)
@@ -175,6 +190,9 @@ def run_bootstrap_task(
                     session,
                     lease,
                     cancellation,
+                    cause_result=first,
+                    cause_error_type="parse_failed",
+                    cause_error_detail=str(exc),
                 )
             if kind == "rejected":
                 LOG.warning(
@@ -187,9 +205,9 @@ def run_bootstrap_task(
                     preview(first.stdout),
                 )
                 best_effort_release(client, project.project.id, intent.id, worker.name)
-                return "rejected"
+                return task_outcome("rejected", error_type="model_rejected", result=first)
             if kind == "fact":
-                return write_conclude_result(
+                status = write_conclude_result(
                     client,
                     project.project.id,
                     intent.id,
@@ -199,7 +217,17 @@ def run_bootstrap_task(
                     phase_ms=execute_ms,
                     total_ms=int((time.perf_counter() - task_started) * 1000),
                 )
-            return _write_bootstrap_complete_result(
+                if status == "success":
+                    write_business_graph(
+                        client,
+                        project.project.id,
+                        worker.name,
+                        data,
+                        source="bootstrap",
+                        last_intent_id=intent.id,
+                    )
+                return task_outcome(status, error_type=None if status == "success" else "conclude_write_failed")
+            status = _write_bootstrap_complete_result(
                 client,
                 project.project.id,
                 intent.id,
@@ -210,6 +238,16 @@ def run_bootstrap_task(
                 phase_ms=execute_ms,
                 total_ms=int((time.perf_counter() - task_started) * 1000),
             )
+            if status == "success":
+                write_business_graph(
+                    client,
+                    project.project.id,
+                    worker.name,
+                    data,
+                    source="bootstrap",
+                    last_intent_id=intent.id,
+                )
+            return task_outcome(status, error_type=None if status == "success" else "complete_write_failed")
         if did_timeout(first):
             LOG.warning(
                 "bootstrap timed out project=%s intent=%s worker=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -233,6 +271,8 @@ def run_bootstrap_task(
                 session,
                 lease,
                 cancellation,
+                cause_result=first,
+                cause_error_type="timeout",
             )
         LOG.warning(
             "bootstrap command failed project=%s intent=%s worker=%s code=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -246,11 +286,11 @@ def run_bootstrap_task(
             preview(first.stderr),
         )
         best_effort_release(client, project.project.id, intent.id, worker.name)
-        return "failed"
+        return task_outcome("failed", error_type="command_failed", error_detail=f"returncode={first.returncode}", result=first)
     except Exception:
         LOG.exception("bootstrap task crashed project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
         best_effort_release(client, project.project.id, intent.id, worker.name)
-        return "failed"
+        return task_outcome("failed", error_type="task_crashed")
     finally:
         lease.stop()
 
@@ -267,7 +307,10 @@ def _try_conclude_fallback(
     session: str | None,
     lease: HeartbeatLease,
     cancellation: TaskCancellation,
-) -> str:
+    cause_result=None,
+    cause_error_type: str | None = None,
+    cause_error_detail: str | None = None,
+) -> TaskOutcome:
     if not driver.supports_conclude() or not session:
         LOG.info(
             "bootstrap conclude fallback unavailable project=%s intent=%s worker=%s supports_conclude=%s has_session=%s",
@@ -278,7 +321,12 @@ def _try_conclude_fallback(
             bool(session),
         )
         best_effort_release(client, project.project.id, intent.id, worker.name)
-        return "failed"
+        return task_outcome(
+            "failed",
+            error_type=cause_error_type or "fallback_unavailable",
+            error_detail=cause_error_detail,
+            result=cause_result,
+        )
     if lease.failure is not None:
         LOG.warning(
             "bootstrap conclude fallback skipped because heartbeat already lost project=%s intent=%s worker=%s",
@@ -287,7 +335,7 @@ def _try_conclude_fallback(
             worker.name,
         )
         best_effort_release(client, project.project.id, intent.id, worker.name)
-        return "failed"
+        return task_outcome("failed", error_type="heartbeat_lost", result=cause_result)
     if cancellation.is_cancelled:
         LOG.info(
             "bootstrap conclude fallback skipped because task was cancelled project=%s intent=%s worker=%s reason=%s",
@@ -297,7 +345,7 @@ def _try_conclude_fallback(
             cancellation.reason,
         )
         best_effort_release(client, project.project.id, intent.id, worker.name)
-        return "cancelled"
+        return task_outcome("cancelled", error_type="cancelled", error_detail=cancellation.reason, result=cause_result)
 
     if not project_allows_conclude_fallback(
         client,
@@ -306,7 +354,7 @@ def _try_conclude_fallback(
         intent_id=intent.id,
     ):
         best_effort_release(client, project.project.id, intent.id, worker.name)
-        return "failed"
+        return task_outcome("failed", error_type="fallback_project_inactive", result=cause_result)
 
     container_name = container_manager.ensure_running(project.project.id)
 
@@ -339,10 +387,10 @@ def _try_conclude_fallback(
             conclude_ms,
         )
         best_effort_release(client, project.project.id, intent.id, worker.name)
-        return "cancelled"
+        return task_outcome("cancelled", error_type="cancelled", error_detail=cancelled, result=result, used_fallback=True)
     if lease.failure is not None:
         best_effort_release(client, project.project.id, intent.id, worker.name)
-        return "failed"
+        return task_outcome("failed", error_type="heartbeat_lost", result=result, used_fallback=True)
     if result.timed_out or result.returncode != 0:
         LOG.warning(
             "bootstrap conclude failed project=%s intent=%s worker=%s code=%s timed_out=%s conclude_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -356,7 +404,13 @@ def _try_conclude_fallback(
             preview(result.stderr),
         )
         best_effort_release(client, project.project.id, intent.id, worker.name)
-        return "failed"
+        return task_outcome(
+            "failed",
+            error_type="fallback_command_failed",
+            error_detail=f"returncode={result.returncode} timed_out={result.timed_out}",
+            result=result,
+            used_fallback=True,
+        )
     try:
         model_output = driver.extract_response_text(result.stdout, result.stderr)
         payload = parse_json_output(model_output)
@@ -382,7 +436,7 @@ def _try_conclude_fallback(
             preview(result.stderr),
         )
         best_effort_release(client, project.project.id, intent.id, worker.name)
-        return "failed"
+        return task_outcome("failed", error_type="fallback_parse_failed", error_detail=str(exc), result=result, used_fallback=True)
     if kind == "rejected":
         LOG.warning(
             "bootstrap conclude rejected project=%s intent=%s worker=%s conclude_ms=%s stdout_preview=%s",
@@ -393,8 +447,8 @@ def _try_conclude_fallback(
             preview(result.stdout),
         )
         best_effort_release(client, project.project.id, intent.id, worker.name)
-        return "rejected"
-    return write_conclude_result(
+        return task_outcome("rejected", error_type="fallback_rejected", result=result, used_fallback=True)
+    status = write_conclude_result(
         client,
         project.project.id,
         intent.id,
@@ -403,6 +457,7 @@ def _try_conclude_fallback(
         source="bootstrap_conclude",
         phase_ms=conclude_ms,
     )
+    return task_outcome(status, error_type=None if status == "success" else "conclude_write_failed", used_fallback=True)
 
 
 def _bootstrap_prompt_replacements(project: ProjectDetail) -> dict[str, str]:
@@ -420,16 +475,8 @@ def _bootstrap_prompt_replacements(project: ProjectDetail) -> dict[str, str]:
         "origin": facts.get("origin", ""),
         "goal": facts.get("goal", ""),
         "hints": format_hints(hints),
-        "source_path": _latest_source_path(project),
+        "source_path": latest_ready_source_path(project) or "",
     }
-
-
-def _latest_source_path(project: ProjectDetail) -> str:
-    ready = [source for source in project.sources if source.status == "ready"]
-    if not ready:
-        return ""
-    latest = ready[0]
-    return f"/audit-data/artifacts/snapshots/{latest.id}/source"
 
 
 def _write_bootstrap_complete_result(
@@ -467,7 +514,7 @@ def _write_bootstrap_complete_result(
         return "success"
 
     response = client.complete(project_id, [conclude.fact_id], complete_description, worker_name)
-    if response.status_code in (403, 409):
+    if response.status_code == 403:
         LOG.info(
             "bootstrap complete deferred project=%s intent=%s worker=%s source=%s status=%s fact_id=%s",
             project_id,
@@ -489,7 +536,7 @@ def _write_bootstrap_complete_result(
             response.status_code,
             response.text,
         )
-        return "success"
+        return "failed"
     if total_ms is None:
         LOG.info(
             "bootstrap completed project=%s intent=%s worker=%s source=%s from=%s phase_ms=%s",

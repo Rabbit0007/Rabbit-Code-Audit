@@ -82,6 +82,53 @@ def _insert_fact(fact_id: str, project_id: str, description: str) -> None:
         )
 
 
+def _proof_packets_json() -> str:
+    return json.dumps(
+        [
+            {
+                "title": "SQL injection proof",
+                "payload": "1' OR '1'='1",
+                "request": (
+                    "GET /app/item?id=1%27%20OR%20%271%27%3D%271 HTTP/1.1\n"
+                    "Host: audit.local\n"
+                    "Accept: */*\n"
+                    "Connection: close"
+                ),
+                "response": (
+                    "HTTP/1.1 200 OK\n"
+                    "Content-Type: text/html\n\n"
+                    "database rows returned for injected predicate"
+                ),
+                "note": "captured verification packet",
+            }
+        ],
+        ensure_ascii=False,
+    )
+
+
+def _reproduction_poc_json() -> str:
+    return json.dumps(
+        {
+            "payload": "shell.php. .",
+            "request_template": (
+                "curl -X POST -F 'submit=上传' "
+                "-F 'upload_file=@webshell.txt;filename=shell.php. .' "
+                "http://target/Pass-09/index.php"
+            ),
+            "steps": [
+                "创建 webshell.txt 文件",
+                "替换 target 为测试环境地址并上传 shell.php. .",
+                "在 Windows 环境下访问 /upload/shell.php",
+            ],
+            "expected_result": "上传成功后 Windows 将文件名规整为 shell.php，可访问执行",
+            "verification": "Pass-09/index.php 使用处理后的文件名调用 move_uploaded_file",
+            "prerequisites": ["Windows 文件系统会去除文件名末尾点和空格"],
+            "limitations": ["该 PoC 为源码静态推导，未包含真实抓包响应"],
+        },
+        ensure_ascii=False,
+    )
+
+
 # Representative fact descriptions for each severity level. The strings are
 # chosen to match exactly one severity category in the extraction patterns.
 CRITICAL_DESC = "SQL injection found in the login form allowing data dump"
@@ -471,15 +518,11 @@ def test_list_merges_same_cve_and_keeps_final_confirmation(client, temp_db):
     assert body[0]["fact_id"] == "f014"
     assert body[0]["related_fact_ids"] == ["f014"]
     assert "最终确认事实为 f014" not in body[0]["description"]
-    packet = body[0]["proof_packets"][0]
-    assert "/invoker/readonly" in packet["request"]
-    assert "Host: 127.0.0.1:60001" in packet["request"]
-    assert "uid=0" not in packet["request"]
-    assert "依据当前项目 p1" in packet["note"]
+    assert body[0]["proof_packets"] == []
 
 
-def test_proof_packet_reconstructs_sql_request_from_same_project_fact(client, temp_db):
-    """SQL proof uses the recorded endpoint instead of a fixed lab template."""
+def test_fact_derived_vulnerability_does_not_reconstruct_fake_proof_packet(client, temp_db):
+    """Facts without captured traffic do not produce placeholder proof packets."""
     _insert_project("p1", "SQL Test")
     _insert_fact(
         "origin",
@@ -497,40 +540,181 @@ def test_proof_packet_reconstructs_sql_request_from_same_project_fact(client, te
     resp = client.get("/api/vulnerabilities", params={"project_id": "p1"})
 
     assert resp.status_code == 200
-    packet = resp.json()[0]["proof_packets"][0]
-    assert "GET /app/item?id=1" in packet["request"]
-    assert "Host: 10.20.30.40" in packet["request"]
-    assert "/sqli-labs/" not in packet["request"]
-    assert "p1" in packet["note"]
+    assert resp.json()[0]["proof_packets"] == []
 
 
-def test_proof_packets_keep_parameters_scoped_to_each_endpoint(client, temp_db):
-    """One fact's parameters are not copied onto a different endpoint."""
-    _insert_project("p1", "API Test")
-    _insert_fact("origin", "p1", "http://10.20.30.40/")
-    _insert_fact(
-        "f001",
-        "p1",
-        "发现两个未授权 JSON API：\n"
-        "- /config/realtime_getStatusJson.action 接受 POST 请求，"
-        "statusName=systemDiskStatus 无需认证直接返回 JSON 系统状态数据。\n"
-        "- /config/realtime_loginKeeper.action 使用 GET/POST 均返回 true，无需认证。",
-    )
-    scan_project_facts("p1")
+def test_stored_proof_packets_are_returned_and_exported_to_markdown(client, temp_db):
+    """Only complete stored proof packets are used as deliverable proof."""
+    _insert_project("p1", "SQL Test")
+    with db.get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO vulnerabilities (
+                id, project_id, fact_id, title, description, severity,
+                discovered_at, proof_packets_json
+            )
+            VALUES (
+                'vuln_p1_f001', 'p1', 'f001', 'SQL injection',
+                'Confirmed SQL injection in item endpoint', 'critical',
+                '2026-01-01T00:00:00Z', ?
+            )
+            """,
+            (_proof_packets_json(),),
+        )
 
     resp = client.get("/api/vulnerabilities", params={"project_id": "p1"})
-
     assert resp.status_code == 200
-    packets = resp.json()[0]["proof_packets"]
-    requests = {packet["title"]: packet["request"] for packet in packets}
-    status_request = next(
-        request for title, request in requests.items() if "getStatusJson" in title
+    packet = resp.json()[0]["proof_packets"][0]
+    assert packet["payload"] == "1' OR '1'='1"
+    assert "GET /app/item?id=1%27%20OR%20%271%27%3D%271 HTTP/1.1" in packet["request"]
+    assert "HTTP/1.1 200 OK" in packet["response"]
+
+    markdown = client.get(
+        "/api/vulnerabilities/export",
+        params={"format": "md", "project_id": "p1"},
     )
-    keeper_request = next(
-        request for title, request in requests.items() if "loginKeeper" in title
+    assert markdown.status_code == 200
+    assert "Payload：" in markdown.text
+    assert "1' OR '1'='1" in markdown.text
+    assert "GET /app/item?id=1%27%20OR%20%271%27%3D%271 HTTP/1.1" in markdown.text
+    assert "缺少原始证明数据包" not in markdown.text
+
+
+def test_static_reproduction_poc_is_exported_to_markdown_without_fake_packet(client, temp_db):
+    """Markdown separates static PoC from dynamic proof packets."""
+    _insert_project("p1", "Upload Test")
+    with db.get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO vulnerabilities (
+                id, project_id, fact_id, title, description, severity,
+                discovered_at, reproduction_poc_json
+            )
+            VALUES (
+                'vuln_p1_f002', 'p1', 'f002', 'Pass-09 upload bypass',
+                'Filename normalization allows uploading a PHP file', 'critical',
+                '2026-01-01T00:00:00Z', ?
+            )
+            """,
+            (_reproduction_poc_json(),),
+        )
+
+    markdown = client.get(
+        "/api/vulnerabilities/export",
+        params={"format": "md", "project_id": "p1"},
     )
-    assert "statusName=systemDiskStatus" in status_request
-    assert "statusName=systemDiskStatus" not in keeper_request
+
+    assert markdown.status_code == 200
+    assert "缺少原始证明数据包，不能作为交付证明" in markdown.text
+    assert "#### 静态复现 PoC" in markdown.text
+    assert "shell.php. ." in markdown.text
+    assert "curl -X POST" in markdown.text
+    assert "以下 PoC 基于源码静态推导" in markdown.text
+
+
+def test_report_enrichment_is_exported_as_static_request_not_proof_packet(client, temp_db):
+    """Report worker material is rendered separately from real proof packets."""
+    _insert_project("p1", "SQL Test")
+    with db.get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO source_snapshots (
+                id, project_id, source_type, status, file_count, total_bytes,
+                detected_languages_json, created_at
+            )
+            VALUES ('snap_1', 'p1', 'zip', 'ready', 1, 10, '{}', '2026-01-01T00:00:00Z')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_findings (
+                id, project_id, snapshot_id, title, category, severity, status,
+                file_path, line_start, entry_point, description, impact,
+                evidence, discovered_by, reviewed_by, created_at, reviewed_at
+            )
+            VALUES (
+                'finding_1', 'p1', 'snap_1', 'SQL injection', 'injection',
+                'high', 'confirmed', 'index.php', 12, 'GET /index.php?id=',
+                'id parameter reaches SQL concatenation', 'data disclosure',
+                '$_GET id is concatenated into SELECT', 'worker-a', 'reviewer-b',
+                '2026-01-01T00:00:01Z', '2026-01-01T00:00:02Z'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO vulnerabilities (
+                id, project_id, fact_id, title, description, severity,
+                discovered_at, proof_packets_json, reproduction_poc_json
+            )
+            VALUES (
+                'finding_1', 'p1', 'finding_1', 'SQL injection',
+                'id parameter reaches SQL concatenation', 'high',
+                '2026-01-01T00:00:01Z', '[]', '{}'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO report_enrichment_tasks (
+                id, project_id, finding_id, status, created_by, worker,
+                created_at, completed_at, packet_templates_json,
+                reproduction_poc_json, evidence_chain_json, report_sections_json,
+                delivery_notes_json
+            )
+            VALUES (
+                'rpt_1', 'p1', 'finding_1', 'completed', 'tester', 'reporter-1',
+                '2026-01-01T00:00:03Z', '2026-01-01T00:00:04Z',
+                ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                json.dumps(
+                    [
+                        {
+                            "title": "SQL 注入静态推测请求",
+                            "payload": "id=1' OR '1'='1",
+                            "request": "GET /index.php?id=1%27%20OR%20%271%27%3D%271 HTTP/1.1\nHost: target\nConnection: close",
+                            "expected_result": "响应内容或错误差异体现 SQL 条件被拼接执行",
+                            "verification": "index.php 中 id 参数进入 SQL 拼接",
+                            "note": "静态推测验证请求，不是实测抓包",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "payload": "id=1' OR '1'='1",
+                        "request_template": "curl -i 'http://target/index.php?id=1%27%20OR%20%271%27%3D%271'",
+                        "steps": ["替换 target", "发送请求", "观察响应差异"],
+                        "expected_result": "返回内容与正常请求不同",
+                        "verification": "源码证据显示参数未绑定",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(["finding_1 已确认", "审计日志和源码证据支持该请求模板"], ensure_ascii=False),
+                json.dumps({"影响说明": "攻击者可改变 SQL 查询条件。"}, ensure_ascii=False),
+                json.dumps(["需在测试环境补充真实响应包。"], ensure_ascii=False),
+            ),
+        )
+
+    listed = client.get("/api/vulnerabilities", params={"project_id": "p1"})
+    assert listed.status_code == 200
+    assert listed.json()[0]["proof_packets"] == []
+
+    markdown = client.get(
+        "/api/vulnerabilities/export",
+        params={"format": "md", "project_id": "p1"},
+    )
+
+    assert markdown.status_code == 200
+    assert "#### 静态推测验证请求" in markdown.text
+    assert "不是实测抓包；不能替代真实 proof_packets" in markdown.text
+    assert "GET /index.php?id=1%27%20OR%20%271%27%3D%271 HTTP/1.1" in markdown.text
+    assert "#### 报告补充静态 PoC" in markdown.text
+    assert "#### 报告补充说明" in markdown.text
+    assert "攻击者可改变 SQL 查询条件" in markdown.text
+    assert "HTTP/1.1 200 OK" not in markdown.text
 
 
 # ---------------------------------------------------------------------------
@@ -688,7 +872,7 @@ def test_export_markdown_content_and_scope(client, populated):
     assert "## 报告概览" in text
     assert "## 漏洞清单" in text
     assert "## 项目：Alpha（`p1`）" in text
-    assert "未记录真实请求/响应数据包。" in text
+    assert "缺少原始证明数据包，不能作为交付证明" in text
     assert "Beta" not in text
 
 

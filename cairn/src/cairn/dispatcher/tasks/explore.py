@@ -10,6 +10,7 @@ from cairn.dispatcher.protocol.client import CairnClient
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
 from cairn.dispatcher.runtime.containers import ContainerManager
 from cairn.dispatcher.runtime.heartbeat import HeartbeatLease
+from cairn.dispatcher.models import TaskOutcome
 from cairn.dispatcher.tasks.common import (
     best_effort_release,
     cancel_reason,
@@ -18,6 +19,10 @@ from cairn.dispatcher.tasks.common import (
     preview,
     run_healthcheck,
     run_worker_process,
+    task_outcome,
+    verify_latest_source_available,
+    write_business_graph,
+    write_business_node_conclusions,
     write_conclude_result,
     write_graph_snapshot_reference,
 )
@@ -36,7 +41,7 @@ def run_explore_task(
     intent: Intent,
     worker: WorkerConfig,
     cancellation: TaskCancellation,
-) -> str:
+) -> TaskOutcome:
     driver = get_driver(worker.type)
     task_started = time.perf_counter()
     healthcheck_timeout = config.runtime.healthcheck_timeout
@@ -44,6 +49,16 @@ def run_explore_task(
     lease.start()
     try:
         container_name = container_manager.ensure_running(project.project.id)
+        source_check = verify_latest_source_available(
+            container_manager,
+            container_name,
+            project,
+            phase="explore_preflight",
+            worker_name=worker.name,
+        )
+        if not source_check.ok:
+            best_effort_release(client, project.project.id, intent.id, worker.name)
+            return task_outcome("failed", error_type="source_preflight_failed", error_detail=source_check.reason)
 
         LOG.info(
             "starting container exec project=%s intent=%s worker=%s phase=explore_healthcheck timeout=%ss",
@@ -71,7 +86,7 @@ def run_explore_task(
                 cancelled,
             )
             best_effort_release(client, project.project.id, intent.id, worker.name)
-            return "cancelled"
+            return task_outcome("cancelled", error_type="cancelled", error_detail=cancelled, result=healthcheck.result)
         if lease.failure is not None:
             LOG.warning(
                 "heartbeat lost during explore healthcheck project=%s intent=%s worker=%s status=%s",
@@ -81,7 +96,7 @@ def run_explore_task(
                 lease.failure.status_code,
             )
             best_effort_release(client, project.project.id, intent.id, worker.name)
-            return "failed"
+            return task_outcome("failed", error_type="heartbeat_lost", error_detail=f"status={lease.failure.status_code}", result=healthcheck.result)
         healthcheck_error = driver.healthcheck_error(
             healthcheck.result.returncode,
             healthcheck.result.stdout,
@@ -97,7 +112,7 @@ def run_explore_task(
                 preview(healthcheck_error),
             )
             best_effort_release(client, project.project.id, intent.id, worker.name)
-            return "unhealthy"
+            return task_outcome("unhealthy", error_type="healthcheck_failed", error_detail=healthcheck_error, result=healthcheck.result)
 
         prompt = render_prompt(
             load_prompt(config.runtime.prompt_group, "explore.md"),
@@ -140,7 +155,7 @@ def run_explore_task(
                 execute_ms,
             )
             best_effort_release(client, project.project.id, intent.id, worker.name)
-            return "cancelled"
+            return task_outcome("cancelled", error_type="cancelled", error_detail=cancelled, result=first)
         if lease.failure is not None:
             LOG.warning(
                 "heartbeat lost during explore project=%s intent=%s worker=%s status=%s execute_ms=%s",
@@ -151,7 +166,7 @@ def run_explore_task(
                 execute_ms,
             )
             best_effort_release(client, project.project.id, intent.id, worker.name)
-            return "failed"
+            return task_outcome("failed", error_type="heartbeat_lost", error_detail=f"status={lease.failure.status_code}", result=first)
         if not did_timeout(first) and first.returncode == 0:
             try:
                 model_output = driver.extract_response_text(first.stdout, first.stderr)
@@ -182,6 +197,9 @@ def run_explore_task(
                     session,
                     lease,
                     cancellation,
+                    cause_result=first,
+                    cause_error_type="parse_failed",
+                    cause_error_detail=str(exc),
                 )
             if kind == "rejected":
                 LOG.warning(
@@ -194,7 +212,7 @@ def run_explore_task(
                     preview(first.stdout),
                 )
                 best_effort_release(client, project.project.id, intent.id, worker.name)
-                return "rejected"
+                return task_outcome("rejected", error_type="model_rejected", result=first)
             return _write_explore_result(
                 client,
                 project.project.id,
@@ -229,6 +247,8 @@ def run_explore_task(
                 session,
                 lease,
                 cancellation,
+                cause_result=first,
+                cause_error_type="timeout",
             )
         LOG.warning(
             "explore command failed project=%s intent=%s worker=%s code=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -242,11 +262,11 @@ def run_explore_task(
             preview(first.stderr),
         )
         best_effort_release(client, project.project.id, intent.id, worker.name)
-        return "failed"
+        return task_outcome("failed", error_type="command_failed", error_detail=f"returncode={first.returncode}", result=first)
     except Exception:
         LOG.exception("explore task crashed project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
         best_effort_release(client, project.project.id, intent.id, worker.name)
-        return "failed"
+        return task_outcome("failed", error_type="task_crashed")
     finally:
         lease.stop()
 
@@ -264,7 +284,10 @@ def _try_conclude_fallback(
     session: str | None,
     lease: HeartbeatLease,
     cancellation: TaskCancellation,
-) -> str:
+    cause_result=None,
+    cause_error_type: str | None = None,
+    cause_error_detail: str | None = None,
+) -> TaskOutcome:
     if not driver.supports_conclude() or not session:
         LOG.info(
             "conclude fallback unavailable project=%s intent=%s worker=%s supports_conclude=%s has_session=%s",
@@ -275,11 +298,16 @@ def _try_conclude_fallback(
             bool(session),
         )
         best_effort_release(client, project_id, intent.id, worker.name)
-        return "failed"
+        return task_outcome(
+            "failed",
+            error_type=cause_error_type or "fallback_unavailable",
+            error_detail=cause_error_detail,
+            result=cause_result,
+        )
     if lease.failure is not None:
         LOG.warning("conclude fallback skipped because heartbeat already lost project=%s intent=%s worker=%s", project_id, intent.id, worker.name)
         best_effort_release(client, project_id, intent.id, worker.name)
-        return "failed"
+        return task_outcome("failed", error_type="heartbeat_lost", result=cause_result)
     if cancellation.is_cancelled:
         LOG.info(
             "conclude fallback skipped because task was cancelled project=%s intent=%s worker=%s reason=%s",
@@ -289,7 +317,7 @@ def _try_conclude_fallback(
             cancellation.reason,
         )
         best_effort_release(client, project_id, intent.id, worker.name)
-        return "cancelled"
+        return task_outcome("cancelled", error_type="cancelled", error_detail=cancellation.reason, result=cause_result)
 
     if not project_allows_conclude_fallback(
         client,
@@ -298,7 +326,7 @@ def _try_conclude_fallback(
         intent_id=intent.id,
     ):
         best_effort_release(client, project_id, intent.id, worker.name)
-        return "failed"
+        return task_outcome("failed", error_type="fallback_project_inactive", result=cause_result)
 
     container_name = container_manager.ensure_running(project_id)
 
@@ -340,10 +368,10 @@ def _try_conclude_fallback(
             conclude_ms,
         )
         best_effort_release(client, project_id, intent.id, worker.name)
-        return "cancelled"
+        return task_outcome("cancelled", error_type="cancelled", error_detail=cancelled, result=result, used_fallback=True)
     if lease.failure is not None:
         best_effort_release(client, project_id, intent.id, worker.name)
-        return "failed"
+        return task_outcome("failed", error_type="heartbeat_lost", result=result, used_fallback=True)
     if result.timed_out or result.returncode != 0:
         LOG.warning(
             "conclude failed project=%s intent=%s worker=%s code=%s timed_out=%s conclude_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -357,7 +385,13 @@ def _try_conclude_fallback(
             preview(result.stderr),
         )
         best_effort_release(client, project_id, intent.id, worker.name)
-        return "failed"
+        return task_outcome(
+            "failed",
+            error_type="fallback_command_failed",
+            error_detail=f"returncode={result.returncode} timed_out={result.timed_out}",
+            result=result,
+            used_fallback=True,
+        )
     try:
         model_output = driver.extract_response_text(result.stdout, result.stderr)
         payload = parse_json_output(model_output)
@@ -374,7 +408,7 @@ def _try_conclude_fallback(
             preview(result.stderr),
         )
         best_effort_release(client, project_id, intent.id, worker.name)
-        return "failed"
+        return task_outcome("failed", error_type="fallback_parse_failed", error_detail=str(exc), result=result, used_fallback=True)
     if kind == "rejected":
         LOG.warning(
             "conclude rejected project=%s intent=%s worker=%s conclude_ms=%s stdout_preview=%s",
@@ -385,7 +419,7 @@ def _try_conclude_fallback(
             preview(result.stdout),
         )
         best_effort_release(client, project_id, intent.id, worker.name)
-        return "rejected"
+        return task_outcome("rejected", error_type="fallback_rejected", result=result, used_fallback=True)
     return _write_explore_result(
         client,
         project_id,
@@ -394,6 +428,7 @@ def _try_conclude_fallback(
         result_data,
         source="explore_conclude",
         phase_ms=conclude_ms,
+        used_fallback=True,
     )
 
 
@@ -407,9 +442,10 @@ def _write_explore_result(
     source: str,
     phase_ms: int,
     total_ms: int | None = None,
-) -> str:
+    used_fallback: bool = False,
+) -> TaskOutcome:
     if not result_data:
-        return "failed"
+        return task_outcome("failed", error_type="empty_result", used_fallback=used_fallback)
     status = write_conclude_result(
         client,
         project_id,
@@ -421,18 +457,55 @@ def _write_explore_result(
         total_ms=total_ms,
     )
     if status != "success":
-        return status
+        return task_outcome(status, error_type="conclude_write_failed", used_fallback=used_fallback)
+    ref_to_id = write_business_graph(
+        client,
+        project_id,
+        worker_name,
+        result_data,
+        source=source,
+        last_intent_id=intent_id,
+    )
 
     finding = result_data.get("finding")
+    findings = result_data.get("findings") or ([finding] if finding else [])
     review = result_data.get("review")
+    reviews = result_data.get("reviews") or ([review] if review else [])
     tool_findings = result_data.get("tool_findings") or []
+    audit_candidates = result_data.get("audit_candidates") or []
+    candidate_conclusions = result_data.get("candidate_conclusions") or []
     snapshot = None
-    if finding or tool_findings:
+    if findings or tool_findings or audit_candidates:
         project = client.get_project(project_id)
         snapshot = next((item for item in project.sources if item.status == "ready"), None)
         if snapshot is None:
             LOG.warning("skip findings without ready snapshot project=%s worker=%s", project_id, worker_name)
-            return status
+            return task_outcome(status, used_fallback=used_fallback)
+
+    candidate_ref_to_id: dict[str, str] = {}
+    for candidate in audit_candidates:
+        ref = candidate.get("ref")
+        payload = _strip_internal_refs(_resolve_business_node_ref(candidate, ref_to_id))
+        response = client.create_audit_candidate(
+            project_id,
+            {
+                **payload,
+                "snapshot_id": snapshot.id,
+                "created_by": worker_name,
+            },
+        )
+        if response.ok:
+            candidate_id = _response_id(response.data)
+            if isinstance(ref, str) and candidate_id:
+                candidate_ref_to_id[ref] = candidate_id
+        else:
+            LOG.warning(
+                "audit candidate write failed project=%s worker=%s status=%s body=%s",
+                project_id,
+                worker_name,
+                response.status_code,
+                response.text,
+            )
 
     for tool_finding in tool_findings:
         response = client.create_tool_finding(
@@ -450,8 +523,28 @@ def _write_explore_result(
                 response.status_code,
                 response.text,
             )
+            continue
+        tool_finding_id = _response_id(response.data)
+        client.create_audit_candidate(
+            project_id,
+            {
+                "snapshot_id": snapshot.id,
+                "source": "tool",
+                "candidate_type": "tool_finding",
+                "severity": tool_finding.get("severity", "info"),
+                "title": tool_finding["title"],
+                "description": tool_finding["description"],
+                "file_path": tool_finding.get("file_path"),
+                "line_start": tool_finding.get("line_start"),
+                "line_end": tool_finding.get("line_end"),
+                "tool_finding_id": tool_finding_id,
+                "created_by": worker_name,
+            },
+        )
 
-    if finding:
+    for finding in findings:
+        candidate_id = _resolve_candidate_ref(finding, candidate_ref_to_id)
+        finding = _strip_internal_refs(_resolve_business_node_ref(finding, ref_to_id))
         response = client.create_audit_finding(
             project_id,
             {
@@ -468,7 +561,20 @@ def _write_explore_result(
                 response.status_code,
                 response.text,
             )
-    elif review:
+            continue
+        finding_id = _response_id(response.data)
+        if candidate_id and finding_id:
+            client.conclude_audit_candidate(
+                project_id,
+                candidate_id,
+                worker_name,
+                "confirmed",
+                finding.get("title") or "候选项已确认并生成审计 finding",
+                evidence=finding.get("evidence"),
+                audit_finding_id=finding_id,
+            )
+
+    for review in reviews:
         response = client.review_audit_finding(
             project_id,
             review["finding_id"],
@@ -484,7 +590,79 @@ def _write_explore_result(
                 response.status_code,
                 response.text,
             )
-    return status
+    for conclusion in candidate_conclusions:
+        candidate_id = _resolve_candidate_ref(conclusion, candidate_ref_to_id)
+        if not candidate_id:
+            LOG.warning(
+                "audit candidate conclusion skipped without resolvable candidate project=%s worker=%s",
+                project_id,
+                worker_name,
+            )
+            continue
+        response = client.conclude_audit_candidate(
+            project_id,
+            candidate_id,
+            worker_name,
+            conclusion["decision"],
+            conclusion["summary"],
+            evidence=conclusion.get("evidence"),
+            audit_finding_id=conclusion.get("audit_finding_id"),
+        )
+        if not response.ok:
+            LOG.warning(
+                "audit candidate conclusion failed project=%s candidate=%s worker=%s status=%s body=%s",
+                project_id,
+                candidate_id,
+                worker_name,
+                response.status_code,
+                response.text,
+            )
+    write_business_node_conclusions(
+        client,
+        project_id,
+        worker_name,
+        result_data,
+        ref_to_id,
+        source=source,
+    )
+    return task_outcome(status, used_fallback=used_fallback)
+
+
+def _response_id(data) -> str | None:
+    if isinstance(data, dict):
+        candidate = data.get("id")
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
+def _strip_internal_refs(payload: dict) -> dict:
+    result = dict(payload)
+    result.pop("ref", None)
+    result.pop("candidate_id", None)
+    result.pop("candidate_ref", None)
+    return result
+
+
+def _resolve_candidate_ref(payload: dict, ref_to_id: dict[str, str]) -> str | None:
+    candidate_id = payload.get("candidate_id")
+    if isinstance(candidate_id, str) and candidate_id.strip():
+        text = candidate_id.strip()
+        return ref_to_id.get(text, text)
+    candidate_ref = payload.get("candidate_ref")
+    if isinstance(candidate_ref, str) and candidate_ref.strip():
+        return ref_to_id.get(candidate_ref.strip())
+    return None
+
+
+def _resolve_business_node_ref(finding: dict, ref_to_id: dict[str, str]) -> dict:
+    business_node_id = finding.get("business_node_id")
+    if not isinstance(business_node_id, str):
+        return finding
+    resolved = ref_to_id.get(business_node_id)
+    if resolved is None:
+        return finding
+    return {**finding, "business_node_id": resolved}
 
 
 def _run_process(

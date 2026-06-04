@@ -10,7 +10,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-TaskType = Literal["reason", "explore", "bootstrap"]
+TaskType = Literal["reason", "explore", "bootstrap", "report_enrichment"]
 WorkerType = Literal["claudecode", "codex", "pi", "mock"]
 CompletedAction = Literal["remove", "stop"]
 
@@ -43,6 +43,7 @@ DEFAULT_PROMPT_REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
     "reason.md": ("{graph_yaml}", "{fact_ids}", "{open_intents}", "{max_intents}"),
     "explore.md": ("{graph_yaml}", "{intent_id}", "{intent_description}"),
     "explore_conclude.md": ("{graph_yaml}", "{intent_id}", "{intent_description}"),
+    "report_enrichment.md": ("{finding_id}", "{evidence_packet_json}"),
     "bootstrap.md": ("{origin}", "{goal}", "{hints}", "{source_path}"),
     "bootstrap_conclude.md": ("{origin}", "{goal}", "{hints}", "{source_path}"),
 }
@@ -52,6 +53,7 @@ PROMPT_REQUIRED_TOKENS_BY_GROUP: dict[str, dict[str, tuple[str, ...]]] = {
         "reason.md": ("{fact_ids}", "{open_intents}", "{max_intents}"),
         "explore.md": ("{intent_id}",),
         "explore_conclude.md": ("{intent_id}",),
+        "report_enrichment.md": ("{finding_id}", "{evidence_packet_json}"),
         "bootstrap.md": ("{origin}", "{goal}", "{hints}"),
         "bootstrap_conclude.md": ("{origin}", "{goal}", "{hints}"),
     }
@@ -62,6 +64,7 @@ MOCK_ALLOWED_OUTCOMES: dict[str, frozenset[str]] = {
     "reason": frozenset({"complete", "intent", "noop", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
     "explore_execute": frozenset({"fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
     "explore_conclude": frozenset({"fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
+    "report_enrichment": frozenset({"complete", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
     "bootstrap": frozenset({"complete", "fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
     "bootstrap_conclude": frozenset({"fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
 }
@@ -97,6 +100,16 @@ MOCK_DEFAULT_BEHAVIOR: dict[str, dict[str, Any]] = {
         "delay": [0.05, 0.3],
         "outcomes": {
             "fact": "1.0",
+            "rejected": "0.0",
+            "invalid_json": "0.0",
+            "invalid_payload": "0.0",
+            "command_fail": "0.0",
+        },
+    },
+    "report_enrichment": {
+        "delay": [0.05, 0.3],
+        "outcomes": {
+            "complete": "1.0",
             "rejected": "0.0",
             "invalid_json": "0.0",
             "invalid_payload": "0.0",
@@ -141,6 +154,10 @@ class ExploreTaskConfig(BaseModel):
     conclude_timeout: int = Field(gt=0)
 
 
+class ReportEnrichmentTaskConfig(BaseModel):
+    timeout: int = Field(gt=0, default=120)
+
+
 class BootstrapTaskConfig(BaseModel):
     timeout: int = Field(gt=0)
     conclude_timeout: int = Field(gt=0)
@@ -150,6 +167,7 @@ class TasksConfig(BaseModel):
     bootstrap: BootstrapTaskConfig
     reason: ReasonTaskConfig
     explore: ExploreTaskConfig
+    report_enrichment: ReportEnrichmentTaskConfig = Field(default_factory=ReportEnrichmentTaskConfig)
 
 
 class ContainerConfig(BaseModel):
@@ -158,7 +176,20 @@ class ContainerConfig(BaseModel):
     completed_action: CompletedAction
     cap_add: list[str] = Field(default_factory=list)
     artifact_volume: str | None = None
+    artifact_host_path: str | None = None
     artifact_mount_path: str = "/audit-data"
+
+    @model_validator(mode="after")
+    def validate_artifact_mount(self) -> "ContainerConfig":
+        if self.artifact_volume and self.artifact_host_path:
+            raise ValueError("artifact_volume and artifact_host_path cannot both be set")
+        if self.artifact_volume is not None and not self.artifact_volume.strip():
+            raise ValueError("artifact_volume must not be empty")
+        if self.artifact_host_path is not None and not self.artifact_host_path.strip():
+            raise ValueError("artifact_host_path must not be empty")
+        if not self.artifact_mount_path.startswith("/"):
+            raise ValueError("artifact_mount_path must be an absolute container path")
+        return self
 
 
 class RuntimeConfig(BaseModel):
@@ -253,8 +284,6 @@ class DispatchConfig(BaseModel):
             raise ValueError("worker names must be unique")
         if not self.workers:
             raise ValueError("workers must not be empty")
-        if not any(worker.enabled for worker in self.workers):
-            raise ValueError("at least one worker must be enabled")
         if self.runtime.max_project_workers > self.runtime.max_workers:
             raise ValueError("max_project_workers cannot exceed max_workers")
         return self

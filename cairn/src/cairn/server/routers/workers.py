@@ -38,6 +38,7 @@ from fastapi import APIRouter, HTTPException, Path
 
 from cairn.server.db import get_conn
 from cairn.server.workers_models import (
+    CreateWorkerTaskHistoryRequest,
     WorkerConfigResponse,
     WorkerConfigUpdate,
     WorkerConnectionTestRequest,
@@ -412,6 +413,48 @@ def test_worker_config(request: WorkerConnectionTestRequest) -> WorkerConnection
     return WorkerConnectionTestResult.model_validate(payload)
 
 
+@router.post("/history", status_code=201)
+def create_worker_history_entry(body: CreateWorkerTaskHistoryRequest) -> dict[str, int]:
+    """Append a completed worker task record.
+
+    This endpoint is used by the dispatcher after reaping a task future. It is
+    deliberately append-only and best-effort from the dispatcher's perspective:
+    the dashboard and audit triage need post-run evidence of failures, retries,
+    rate limits, and fallback usage, but writing this telemetry must never
+    block scheduling.
+    """
+    with get_conn() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO worker_task_history (
+                worker_name, project_id, task_type, intent_id, started_at,
+                completed_at, duration_seconds, outcome, error_type,
+                error_detail, rate_limited, used_fallback, stdout_preview,
+                stderr_preview
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                body.worker_name,
+                body.project_id,
+                body.task_type,
+                body.intent_id,
+                body.started_at,
+                body.completed_at,
+                body.duration_seconds,
+                body.outcome,
+                body.error_type,
+                body.error_detail,
+                1 if body.rate_limited else 0,
+                1 if body.used_fallback else 0,
+                body.stdout_preview,
+                body.stderr_preview,
+            ),
+        )
+        row_id = int(cursor.lastrowid)
+    return {"id": row_id}
+
+
 def _build_history_description(
     task_type: str, project_name: str, intent_id: str | None
 ) -> str:
@@ -452,6 +495,12 @@ def worker_history(
                 h.started_at,
                 h.duration_seconds,
                 h.outcome,
+                h.error_type,
+                h.error_detail,
+                h.rate_limited,
+                h.used_fallback,
+                h.stdout_preview,
+                h.stderr_preview,
                 h.project_id,
                 COALESCE(p.title, h.project_id) AS project_name
             FROM worker_task_history h
@@ -476,6 +525,12 @@ def worker_history(
                 started_at=row["started_at"],
                 duration_seconds=row["duration_seconds"],
                 outcome=row["outcome"],
+                error_type=row["error_type"],
+                error_detail=row["error_detail"],
+                rate_limited=bool(row["rate_limited"]),
+                used_fallback=bool(row["used_fallback"]),
+                stdout_preview=row["stdout_preview"],
+                stderr_preview=row["stderr_preview"],
             )
         )
     return entries

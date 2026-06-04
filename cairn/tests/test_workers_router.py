@@ -382,6 +382,37 @@ def test_worker_config_test_proxy_returns_result(client, monkeypatch):
     assert resp.json()["ok"] is True
 
 
+def test_create_worker_history_entry_persists_trace_fields(client, temp_db):
+    payload = {
+        "worker_name": "alpha",
+        "project_id": "proj-1",
+        "task_type": "explore",
+        "intent_id": "i001",
+        "started_at": "2024-01-01T00:00:00Z",
+        "completed_at": "2024-01-01T00:01:00Z",
+        "duration_seconds": 60.0,
+        "outcome": "failed",
+        "error_type": "timeout",
+        "error_detail": "model call exceeded timeout",
+        "rate_limited": True,
+        "used_fallback": True,
+        "stdout_preview": "429 too many requests",
+        "stderr_preview": "rate limit",
+    }
+
+    resp = client.post("/api/workers/history", json=payload)
+
+    assert resp.status_code == 201
+    body = client.get("/api/workers/alpha/history").json()
+    assert body[0]["outcome"] == "failed"
+    assert body[0]["error_type"] == "timeout"
+    assert body[0]["error_detail"] == "model call exceeded timeout"
+    assert body[0]["rate_limited"] is True
+    assert body[0]["used_fallback"] is True
+    assert body[0]["stdout_preview"] == "429 too many requests"
+    assert body[0]["stderr_preview"] == "rate limit"
+
+
 # ---------------------------------------------------------------------------
 # GET /api/workers/{name}/history (reqs 11.1, 11.2, 11.3)
 # ---------------------------------------------------------------------------

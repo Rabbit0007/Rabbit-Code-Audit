@@ -110,6 +110,37 @@ if phase=="bootstrap_conclude":
         print(json.dumps({"accepted":True,"data":{"complete":{"description":"mock invalid payload"}}}, ensure_ascii=False))
     raise SystemExit(0)
 
+if phase=="report_enrichment":
+    if outcome=="complete":
+        finding_id = prompt.get("finding_id") or "finding_mock"
+        print(json.dumps({"accepted":True,"data":{
+            "finding_id": finding_id,
+            "packet_templates": [{
+                "title": "mock source-inferred request template",
+                "payload": "id=1",
+                "request": "GET /mock.php?id=1 HTTP/1.1\\nHost: target\\nAccept: */*\\nConnection: close",
+                "expected_result": "response shows the source-backed vulnerable behavior",
+                "verification": "mock report enrichment verification",
+                "note": "static source-inferred template, not observed traffic"
+            }],
+            "reproduction_poc": {
+                "payload": "id=1",
+                "request_template": "curl -i 'http://target/mock.php?id=1'",
+                "steps": ["replace target", "send request", "check response"],
+                "expected_result": "source-backed vulnerable behavior appears",
+                "verification": "mock source evidence",
+                "limitations": ["static PoC, not a captured packet"]
+            },
+            "evidence_chain": ["mock evidence"],
+            "report_sections": {"proof_material_note": "mock report material"},
+            "delivery_notes": ["mock delivery note"]
+        }}}, ensure_ascii=False))
+    elif outcome=="rejected":
+        print(json.dumps({"accepted":False,"reason":"mock_rejected"}, ensure_ascii=False))
+    else:
+        print(json.dumps({"accepted":True,"data":{}}, ensure_ascii=False))
+    raise SystemExit(0)
+
 if outcome=="fact":
     label = prompt.get("intent_id") or phase
     print(json.dumps({"accepted":True,"data":{"description":f"mock fact for {label}"}} , ensure_ascii=False))
