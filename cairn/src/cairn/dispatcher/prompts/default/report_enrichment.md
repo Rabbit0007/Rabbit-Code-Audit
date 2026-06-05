@@ -4,11 +4,9 @@ Task: enrich an already confirmed code-audit finding for Markdown delivery. Use 
 
 Finding id: {finding_id}
 
-Evidence packet JSON:
+Evidence packet:
 
-```json
-{evidence_packet_json}
-```
+{evidence_packet_reference}
 
 Produce exactly one JSON object. Use this shape:
 

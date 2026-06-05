@@ -112,6 +112,21 @@ def write_graph_snapshot_reference(
     )
 
 
+def write_report_evidence_packet_reference(
+    container_manager: ContainerManager,
+    container_name: str,
+    evidence_packet_json: str,
+) -> str:
+    path = f"{GRAPH_SNAPSHOT_ROOT}/report-enrichment-{uuid.uuid4().hex[:12]}/evidence_packet.json"
+    container_manager.write_text_file(container_name, path, evidence_packet_json)
+    return (
+        "The evidence packet JSON is stored in this file inside the current container:\n\n"
+        f"{path}\n\n"
+        "Before producing the report enrichment output, read the entire file and treat its contents "
+        "as the supplied Evidence packet JSON."
+    )
+
+
 def latest_ready_source_path(project: ProjectDetail) -> str | None:
     ready = [source for source in project.sources if source.status == "ready"]
     if not ready:

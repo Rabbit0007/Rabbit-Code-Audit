@@ -19,6 +19,7 @@ from cairn.dispatcher.tasks.common import (
     run_healthcheck,
     run_worker_process,
     task_outcome,
+    write_report_evidence_packet_reference,
 )
 from cairn.dispatcher.workers.registry import get_driver
 from cairn.server.models import ProjectDetail
@@ -75,12 +76,21 @@ def run_report_enrichment_task(
             return task_outcome("unhealthy", error_type="healthcheck_failed", error_detail=healthcheck_error, result=healthcheck.result)
 
         evidence_packet = client.get_report_enrichment_packet(task_id)
+        prompt_template = load_prompt(config.runtime.prompt_group, "report_enrichment.md")
+        evidence_packet_json = format_json_block(evidence_packet)
+        replacements = {
+            "finding_id": finding_id,
+            "evidence_packet_json": evidence_packet_json,
+        }
+        if "{evidence_packet_reference}" in prompt_template:
+            replacements["evidence_packet_reference"] = write_report_evidence_packet_reference(
+                container_manager,
+                container_name,
+                evidence_packet_json,
+            )
         prompt = render_prompt(
-            load_prompt(config.runtime.prompt_group, "report_enrichment.md"),
-            {
-                "finding_id": finding_id,
-                "evidence_packet_json": format_json_block(evidence_packet),
-            },
+            prompt_template,
+            replacements,
         )
         execute = driver.build_execute(worker, prompt, driver.prepare_session())
         started = time.perf_counter()
