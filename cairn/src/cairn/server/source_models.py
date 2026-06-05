@@ -62,6 +62,8 @@ class CodeSymbol(BaseModel):
     signature: str | None = None
     line_start: int | None = None
     line_end: int | None = None
+    confidence: float = 0.8
+    source: str = "heuristic"
 
 
 class CodeEntrypoint(BaseModel):
@@ -76,6 +78,22 @@ class CodeEntrypoint(BaseModel):
     handler: str | None = None
     line_start: int | None = None
     evidence: str | None = None
+    confidence: float = 0.8
+    source: str = "heuristic"
+
+
+class CodeRelationship(BaseModel):
+    id: str
+    snapshot_id: str
+    from_path: str
+    from_symbol: str | None = None
+    to_path: str
+    to_symbol: str | None = None
+    relation: str
+    evidence: str | None = None
+    confidence: float = 0.55
+    source: str = "heuristic"
+    line_start: int | None = None
 
 
 class DependencyManifest(BaseModel):
@@ -91,7 +109,36 @@ class DependencyManifest(BaseModel):
 class SourceIndexSummary(BaseModel):
     symbol_count: int = 0
     entrypoint_count: int = 0
+    relationship_count: int = 0
     manifest_count: int = 0
+
+
+class SourceIndexQualityIssue(BaseModel):
+    severity: Literal["info", "warning", "critical"] = "info"
+    code: str
+    title: str
+    description: str
+    count: int = 0
+
+
+class SourceIndexQuality(BaseModel):
+    snapshot_id: str
+    score: int = Field(ge=0, le=100)
+    grade: Literal["strong", "usable", "weak", "poor"]
+    summary: SourceIndexSummary
+    file_count: int = 0
+    code_file_count: int = 0
+    detected_languages: dict[str, int] = Field(default_factory=dict)
+    framework_counts: dict[str, int] = Field(default_factory=dict)
+    relationship_counts: dict[str, int] = Field(default_factory=dict)
+    symbol_kind_counts: dict[str, int] = Field(default_factory=dict)
+    confidence: dict[str, float] = Field(default_factory=dict)
+    low_confidence: dict[str, int] = Field(default_factory=dict)
+    orphan_entrypoints: list[CodeEntrypoint] = Field(default_factory=list)
+    data_object_count: int = 0
+    entrypoints_with_data_paths: int = 0
+    issues: list[SourceIndexQualityIssue] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
 
 
 FindingStatus = Literal[

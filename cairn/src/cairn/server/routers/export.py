@@ -17,6 +17,7 @@ from cairn.server.source_service import (
     get_source_index_summary,
     list_code_entrypoints,
     list_code_files,
+    list_code_relationships,
     list_code_symbols,
     list_dependency_manifests,
 )
@@ -104,7 +105,7 @@ def _load_business_graph(
         """
         SELECT id, node_type, title, description, risk_level, review_status,
                coverage_note, last_intent_id, risk_tags_json, evidence_json,
-               created_by, created_at, updated_at
+               source_snapshot_id, confidence, created_by, created_at, updated_at
         FROM business_nodes
         WHERE project_id = ?
         ORDER BY created_at, id
@@ -113,7 +114,7 @@ def _load_business_graph(
     ).fetchall()
     edges = conn.execute(
         """
-        SELECT id, from_node_id, to_node_id, relation, description, created_by, created_at
+        SELECT id, from_node_id, to_node_id, relation, description, confidence, created_by, created_at
         FROM business_edges
         WHERE project_id = ?
         ORDER BY created_at, id
@@ -229,6 +230,8 @@ def _load_business_graph(
                 "last_intent_id": row["last_intent_id"],
                 "risk_tags": _decode_json_list(row["risk_tags_json"]),
                 "evidence": _decode_json_list(row["evidence_json"]),
+                "source_snapshot_id": row["source_snapshot_id"],
+                "confidence": row["confidence"],
                 "created_by": row["created_by"],
                 "created_at": format_export_timestamp(row["created_at"]),
                 "updated_at": format_export_timestamp(row["updated_at"]),
@@ -242,6 +245,7 @@ def _load_business_graph(
                 "to": row["to_node_id"],
                 "relation": row["relation"],
                 "description": row["description"],
+                "confidence": row["confidence"],
                 "created_by": row["created_by"],
                 "created_at": format_export_timestamp(row["created_at"]),
             }
@@ -584,6 +588,7 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
             ]
             index_limit = _code_index_limit(profile)
             entrypoints = list_code_entrypoints(project_id, ready_source.id, limit=index_limit)
+            relationships = list_code_relationships(project_id, ready_source.id, limit=index_limit)
             manifests = list_dependency_manifests(project_id, ready_source.id, limit=index_limit)
             symbols = list_code_symbols(project_id, ready_source.id, limit=index_limit)
             data["code_index"] = {
@@ -592,10 +597,12 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
                     "profile": profile,
                     "limit": index_limit,
                     "entrypoints_included": len(entrypoints),
+                    "relationships_included": len(relationships),
                     "symbols_included": len(symbols),
                     "manifests_included": len(manifests),
                 },
                 "entrypoints": [item.model_dump() for item in entrypoints],
+                "relationships": [item.model_dump() for item in relationships],
                 "dependency_manifests": [item.model_dump() for item in manifests],
                 "symbols_sample": [item.model_dump() for item in symbols],
             }

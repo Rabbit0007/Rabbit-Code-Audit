@@ -23,8 +23,11 @@ from cairn.server.services import get_project_or_404, utcnow
 from cairn.server.source_models import (
     CodeEntrypoint,
     CodeFile,
+    CodeRelationship,
     CodeSymbol,
     DependencyManifest,
+    SourceIndexQuality,
+    SourceIndexQualityIssue,
     SourceIndexSummary,
     SourceSnapshot,
 )
@@ -328,6 +331,10 @@ def get_source_index_summary(project_id: str, snapshot_id: str) -> SourceIndexSu
             "SELECT COUNT(*) AS count FROM code_entrypoints WHERE snapshot_id = ?",
             (snapshot_id,),
         ).fetchone()["count"]
+        relationships = conn.execute(
+            "SELECT COUNT(*) AS count FROM code_relationships WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()["count"]
         manifests = conn.execute(
             "SELECT COUNT(*) AS count FROM dependency_manifests WHERE snapshot_id = ?",
             (snapshot_id,),
@@ -335,8 +342,331 @@ def get_source_index_summary(project_id: str, snapshot_id: str) -> SourceIndexSu
     return SourceIndexSummary(
         symbol_count=symbols,
         entrypoint_count=entrypoints,
+        relationship_count=relationships,
         manifest_count=manifests,
     )
+
+
+def get_source_index_quality(project_id: str, snapshot_id: str) -> SourceIndexQuality:
+    snapshot = get_snapshot(project_id, snapshot_id)
+    _ensure_code_index(snapshot)
+    summary = get_source_index_summary(project_id, snapshot_id)
+    with db.get_conn() as conn:
+        file_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM code_files WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()["count"]
+        code_file_count = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM code_files
+            WHERE snapshot_id = ?
+              AND is_binary = 0
+              AND language IS NOT NULL
+            """,
+            (snapshot_id,),
+        ).fetchone()["count"]
+        framework_counts = _count_rows(
+            conn.execute(
+                """
+                SELECT COALESCE(framework, 'unknown') AS key, COUNT(*) AS count
+                FROM code_entrypoints
+                WHERE snapshot_id = ?
+                GROUP BY COALESCE(framework, 'unknown')
+                ORDER BY count DESC, key
+                """,
+                (snapshot_id,),
+            ).fetchall()
+        )
+        relationship_counts = _count_rows(
+            conn.execute(
+                """
+                SELECT relation AS key, COUNT(*) AS count
+                FROM code_relationships
+                WHERE snapshot_id = ?
+                GROUP BY relation
+                ORDER BY count DESC, key
+                """,
+                (snapshot_id,),
+            ).fetchall()
+        )
+        symbol_kind_counts = _count_rows(
+            conn.execute(
+                """
+                SELECT kind AS key, COUNT(*) AS count
+                FROM code_symbols
+                WHERE snapshot_id = ?
+                GROUP BY kind
+                ORDER BY count DESC, key
+                """,
+                (snapshot_id,),
+            ).fetchall()
+        )
+        confidence = {
+            "symbols": _avg_confidence(conn, "code_symbols", snapshot_id),
+            "entrypoints": _avg_confidence(conn, "code_entrypoints", snapshot_id),
+            "relationships": _avg_confidence(conn, "code_relationships", snapshot_id),
+        }
+        low_confidence = {
+            "symbols": _low_confidence_count(conn, "code_symbols", snapshot_id, 0.65),
+            "entrypoints": _low_confidence_count(conn, "code_entrypoints", snapshot_id, 0.70),
+            "relationships": _low_confidence_count(conn, "code_relationships", snapshot_id, 0.55),
+        }
+        orphan_rows = conn.execute(
+            """
+            SELECT e.*
+            FROM code_entrypoints e
+            WHERE e.snapshot_id = ?
+              AND COALESCE(e.framework, '') != 'web_script'
+              AND e.handler IS NOT NULL
+              AND TRIM(e.handler) != ''
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM code_relationships r
+                  WHERE r.snapshot_id = e.snapshot_id
+                    AND r.from_path = e.path
+                    AND r.relation = 'calls'
+                    AND r.from_symbol = CASE
+                        WHEN e.method IS NULL THEN e.route
+                        ELSE e.method || ' ' || e.route
+                    END
+              )
+            ORDER BY e.path, COALESCE(e.line_start, 0), e.route
+            LIMIT 20
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        entrypoints = conn.execute(
+            """
+            SELECT path, method, route, handler
+            FROM code_entrypoints
+            WHERE snapshot_id = ?
+            ORDER BY path, COALESCE(line_start, 0), route
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        relationships = conn.execute(
+            """
+            SELECT from_path, from_symbol, to_path, to_symbol, relation
+            FROM code_relationships
+            WHERE snapshot_id = ?
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        data_objects = conn.execute(
+            """
+            SELECT path, name
+            FROM code_symbols
+            WHERE snapshot_id = ? AND kind = 'data_object'
+            """,
+            (snapshot_id,),
+        ).fetchall()
+
+    data_object_count = symbol_kind_counts.get("data_object", 0)
+    entrypoints_with_data_paths = _entrypoints_with_data_paths(entrypoints, relationships, data_objects)
+    issues: list[SourceIndexQualityIssue] = []
+    recommendations: list[str] = []
+    score = 100
+
+    def add_issue(severity: str, code: str, title: str, description: str, count: int, penalty: int, recommendation: str) -> None:
+        nonlocal score
+        issues.append(
+            SourceIndexQualityIssue(
+                severity=severity,  # type: ignore[arg-type]
+                code=code,
+                title=title,
+                description=description,
+                count=count,
+            )
+        )
+        recommendations.append(recommendation)
+        score -= penalty
+
+    if summary.entrypoint_count == 0 and code_file_count:
+        add_issue(
+            "critical",
+            "no_entrypoints",
+            "未识别入口",
+            "源码中没有可用于审计调度的入口，模型只能从文件列表开始猜测。",
+            0,
+            35,
+            "补充对应框架的路由适配器，或检查源码是否缺少 Web/CLI 入口文件。",
+        )
+    if summary.relationship_count == 0 and code_file_count > 1:
+        add_issue(
+            "warning",
+            "no_relationships",
+            "未识别跨文件关系",
+            "索引没有 import/call/use 关系，入口到服务/数据对象的链路会断开。",
+            0,
+            20,
+            "优先补充当前项目主语言的 import/call 解析规则。",
+        )
+    orphan_count = len(orphan_rows)
+    if orphan_count:
+        penalty = 8 if orphan_count < max(3, summary.entrypoint_count // 4) else 14
+        add_issue(
+            "warning",
+            "orphan_entrypoints",
+            "入口缺少处理器链路",
+            "部分入口没有解析到 handler 调用关系，模型需要手动追踪入口文件。",
+            orphan_count,
+            penalty,
+            "补强对应框架的 handler 解析，尤其是多行注解、router group、依赖注入写法。",
+        )
+    if data_object_count == 0 and summary.entrypoint_count > 0:
+        add_issue(
+            "warning",
+            "no_data_objects",
+            "未识别数据对象",
+            "入口已经识别，但没有模型、表或数据对象节点，业务资源理解会偏弱。",
+            0,
+            10,
+            "补充 ORM/model/table 识别规则，或检查项目是否把数据访问封装在外部依赖中。",
+        )
+    if data_object_count and summary.entrypoint_count:
+        linked_ratio = entrypoints_with_data_paths / max(1, summary.entrypoint_count)
+        if linked_ratio < 0.3:
+            add_issue(
+                "warning",
+                "weak_entrypoint_data_paths",
+                "入口到数据对象链路偏弱",
+                "已识别数据对象，但多数入口没有可达的数据对象关系。",
+                summary.entrypoint_count - entrypoints_with_data_paths,
+                12,
+                "增强 endpoint -> controller/service -> model/DAO 的调用链解析。",
+            )
+    if low_confidence["relationships"] > max(5, summary.relationship_count // 4):
+        add_issue(
+            "warning",
+            "low_confidence_relationships",
+            "低置信关系较多",
+            "大量关系来自弱启发式匹配，模型使用时需要优先核对源码证据。",
+            low_confidence["relationships"],
+            8,
+            "对主语言引入 AST/tree-sitter 解析，降低纯正则调用匹配比例。",
+        )
+    if summary.manifest_count == 0 and code_file_count > 20:
+        add_issue(
+            "info",
+            "no_dependency_manifest",
+            "未识别依赖清单",
+            "没有依赖清单会降低框架和组件识别质量。",
+            0,
+            4,
+            "补充项目构建文件适配，或确认快照是否缺少依赖清单。",
+        )
+
+    score = max(0, min(100, score))
+    if score >= 80:
+        grade = "strong"
+    elif score >= 60:
+        grade = "usable"
+    elif score >= 40:
+        grade = "weak"
+    else:
+        grade = "poor"
+    if not recommendations:
+        recommendations.append("当前索引质量良好，可以直接用于业务图导航和审计任务拆分。")
+    return SourceIndexQuality(
+        snapshot_id=snapshot_id,
+        score=score,
+        grade=grade,
+        summary=summary,
+        file_count=file_count,
+        code_file_count=code_file_count,
+        detected_languages=snapshot.detected_languages,
+        framework_counts=framework_counts,
+        relationship_counts=relationship_counts,
+        symbol_kind_counts=symbol_kind_counts,
+        confidence=confidence,
+        low_confidence=low_confidence,
+        orphan_entrypoints=[CodeEntrypoint(**dict(row)) for row in orphan_rows],
+        data_object_count=data_object_count,
+        entrypoints_with_data_paths=entrypoints_with_data_paths,
+        issues=issues,
+        recommendations=list(dict.fromkeys(recommendations)),
+    )
+
+
+def _count_rows(rows) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for row in rows:
+        key = str(row["key"] or "").strip()
+        if not key:
+            continue
+        result[key] = int(row["count"] or 0)
+    return result
+
+
+def _avg_confidence(conn, table: str, snapshot_id: str) -> float:
+    row = conn.execute(
+        f"SELECT AVG(confidence) AS value FROM {table} WHERE snapshot_id = ?",
+        (snapshot_id,),
+    ).fetchone()
+    return round(float(row["value"] or 0), 3)
+
+
+def _low_confidence_count(conn, table: str, snapshot_id: str, threshold: float) -> int:
+    row = conn.execute(
+        f"SELECT COUNT(*) AS count FROM {table} WHERE snapshot_id = ? AND confidence < ?",
+        (snapshot_id, threshold),
+    ).fetchone()
+    return int(row["count"] or 0)
+
+
+def _entrypoints_with_data_paths(entrypoints, relationships, data_objects) -> int:
+    data_targets = {(row["path"], row["name"]) for row in data_objects}
+    if not entrypoints or not data_targets:
+        return 0
+
+    adjacency: dict[tuple[str, str | None], set[tuple[str, str | None]]] = {}
+    for row in relationships:
+        if row["relation"] not in {"calls", "imports", "uses"}:
+            continue
+        start = (row["from_path"], row["from_symbol"])
+        adjacency.setdefault(start, set()).add((row["to_path"], row["to_symbol"]))
+        if row["from_symbol"] is not None:
+            adjacency.setdefault((row["from_path"], None), set()).add((row["to_path"], row["to_symbol"]))
+
+    linked = 0
+    for entrypoint in entrypoints:
+        label = _entrypoint_label(entrypoint["method"], entrypoint["route"])
+        starts = {
+            (entrypoint["path"], label),
+            (entrypoint["path"], entrypoint["handler"]),
+            (entrypoint["path"], None),
+        }
+        if any(_has_reachable_data_object(start, adjacency, data_targets) for start in starts):
+            linked += 1
+    return linked
+
+
+def _has_reachable_data_object(
+    start: tuple[str, str | None],
+    adjacency: dict[tuple[str, str | None], set[tuple[str, str | None]]],
+    data_targets: set[tuple[str, str]],
+    *,
+    max_depth: int = 4,
+) -> bool:
+    seen = {start}
+    frontier = [(start, 0)]
+    while frontier:
+        node, depth = frontier.pop(0)
+        path, symbol = node
+        if symbol is not None and (path, symbol) in data_targets:
+            return True
+        if depth >= max_depth:
+            continue
+        next_nodes = set(adjacency.get(node, set()))
+        if symbol is not None:
+            next_nodes.update(adjacency.get((path, None), set()))
+        for next_node in next_nodes:
+            if next_node in seen:
+                continue
+            seen.add(next_node)
+            frontier.append((next_node, depth + 1))
+    return False
 
 
 def list_code_symbols(project_id: str, snapshot_id: str, limit: int = 1000) -> list[CodeSymbol]:
@@ -373,6 +703,23 @@ def list_code_entrypoints(project_id: str, snapshot_id: str, limit: int = 1000) 
     return [CodeEntrypoint(**dict(row)) for row in rows]
 
 
+def list_code_relationships(project_id: str, snapshot_id: str, limit: int = 1000) -> list[CodeRelationship]:
+    snapshot = get_snapshot(project_id, snapshot_id)
+    _ensure_code_index(snapshot)
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM code_relationships
+            WHERE snapshot_id = ?
+            ORDER BY from_path, relation, to_path, COALESCE(line_start, 0)
+            LIMIT ?
+            """,
+            (snapshot_id, limit),
+        ).fetchall()
+    return [CodeRelationship(**dict(row)) for row in rows]
+
+
 def list_dependency_manifests(project_id: str, snapshot_id: str, limit: int = 1000) -> list[DependencyManifest]:
     snapshot = get_snapshot(project_id, snapshot_id)
     _ensure_code_index(snapshot)
@@ -401,7 +748,7 @@ def list_dependency_manifests(project_id: str, snapshot_id: str, limit: int = 10
     ]
 
 
-def rebuild_source_index(snapshot_id: str) -> None:
+def rebuild_source_index(snapshot_id: str) -> SourceIndexSummary:
     root = snapshot_path(snapshot_id)
     if not root.exists():
         raise ValueError("Source snapshot files not found")
@@ -411,11 +758,87 @@ def rebuild_source_index(snapshot_id: str) -> None:
             raise ValueError("Source snapshot not found")
         if snapshot_row["status"] != "ready":
             raise ValueError("Source snapshot is not ready")
+        project_id = snapshot_row["project_id"]
         files = _load_code_files(conn, snapshot_id)
         code_index = extract_code_index(snapshot_id, root, files)
+        _clear_source_index_for_rebuild(conn, project_id, snapshot_id)
         _insert_code_index(conn, code_index)
         _insert_audit_candidates_from_index(conn, snapshot_id, files, code_index, root=root)
         _ensure_business_graph_seed(conn, snapshot_id)
+    return get_source_index_summary(project_id, snapshot_id)
+
+
+def reindex_source_snapshot(project_id: str, snapshot_id: str) -> SourceIndexSummary:
+    snapshot = get_snapshot(project_id, snapshot_id)
+    if snapshot.status != "ready":
+        raise ValueError("Source snapshot is not ready")
+    return rebuild_source_index(snapshot_id)
+
+
+def _clear_source_index_for_rebuild(conn, project_id: str, snapshot_id: str) -> None:
+    protected_nodes = {
+        row["business_node_id"]
+        for row in conn.execute(
+            """
+            SELECT DISTINCT business_node_id
+            FROM audit_candidates
+            WHERE snapshot_id = ?
+              AND business_node_id IS NOT NULL
+              AND status != 'candidate'
+            """,
+            (snapshot_id,),
+        ).fetchall()
+    }
+    protected_nodes.update(
+        row["business_node_id"]
+        for row in conn.execute(
+            """
+            SELECT business_node_id
+            FROM business_node_conclusions
+            WHERE project_id = ?
+            """,
+            (project_id,),
+        ).fetchall()
+    )
+    protected_nodes.update(
+        row["business_node_id"]
+        for row in conn.execute(
+            """
+            SELECT business_node_id
+            FROM audit_findings
+            WHERE project_id = ? AND business_node_id IS NOT NULL
+            """,
+            (project_id,),
+        ).fetchall()
+    )
+    for table in ("code_relationships", "code_symbols", "code_entrypoints", "dependency_manifests"):
+        conn.execute(f"DELETE FROM {table} WHERE snapshot_id = ?", (snapshot_id,))
+    conn.execute(
+        """
+        DELETE FROM audit_candidates
+        WHERE snapshot_id = ?
+          AND source = 'index'
+          AND created_by = 'source_index'
+          AND status = 'candidate'
+          AND audit_finding_id IS NULL
+        """,
+        (snapshot_id,),
+    )
+    protected_params = list(protected_nodes)
+    protected_clause = ""
+    if protected_params:
+        protected_clause = f"AND id NOT IN ({', '.join('?' for _ in protected_params)})"
+    conn.execute(
+        f"""
+        DELETE FROM business_nodes
+        WHERE project_id = ?
+          AND created_by = 'source_index'
+          AND review_status = 'unreviewed'
+          AND (source_snapshot_id = ? OR source_snapshot_id IS NULL)
+          {protected_clause}
+        """,
+        [project_id, snapshot_id, *protected_params],
+    )
 
 
 def _validate_public_git_url(repository_url: str) -> None:
@@ -603,9 +1026,9 @@ def _insert_code_index(conn, code_index) -> None:
         """
         INSERT OR IGNORE INTO code_symbols (
             id, snapshot_id, path, language, kind, name, container,
-            signature, line_start, line_end
+            signature, line_start, line_end, confidence, source
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -619,6 +1042,8 @@ def _insert_code_index(conn, code_index) -> None:
                 item.signature,
                 item.line_start,
                 item.line_end,
+                item.confidence,
+                item.source,
             )
             for item in code_index.symbols
         ],
@@ -627,9 +1052,9 @@ def _insert_code_index(conn, code_index) -> None:
         """
         INSERT OR IGNORE INTO code_entrypoints (
             id, snapshot_id, path, language, kind, framework, method,
-            route, handler, line_start, evidence
+            route, handler, line_start, evidence, confidence, source
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -644,8 +1069,35 @@ def _insert_code_index(conn, code_index) -> None:
                 item.handler,
                 item.line_start,
                 item.evidence,
+                item.confidence,
+                item.source,
             )
             for item in code_index.entrypoints
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO code_relationships (
+            id, snapshot_id, from_path, from_symbol, to_path, to_symbol,
+            relation, evidence, confidence, source, line_start
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                item.id,
+                item.snapshot_id,
+                item.from_path,
+                item.from_symbol,
+                item.to_path,
+                item.to_symbol,
+                item.relation,
+                item.evidence,
+                item.confidence,
+                item.source,
+                item.line_start,
+            )
+            for item in code_index.relationships
         ],
     )
     conn.executemany(
@@ -850,18 +1302,152 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
         return
     project_id = row["project_id"]
     now = utcnow()
-    endpoint_by_path: dict[str, str] = {}
+    endpoint_by_path: dict[str, list[str]] = {}
     endpoint_by_label: dict[str, str] = {}
+    control_by_ref: dict[tuple[str, str], str] = {}
+    controls_by_path: dict[str, list[str]] = {}
+    data_by_ref: dict[tuple[str, str], str] = {}
+    data_by_path: dict[str, list[str]] = {}
 
     entrypoints = conn.execute(
         """
-        SELECT path, method, route, handler, line_start, evidence
+        SELECT path, method, route, handler, line_start, evidence, confidence, source
         FROM code_entrypoints
         WHERE snapshot_id = ?
         ORDER BY path, COALESCE(line_start, 0), route, COALESCE(method, '')
         """,
         (snapshot_id,),
     ).fetchall()
+    data_symbols = conn.execute(
+        """
+        SELECT path, name, signature, line_start, confidence, source
+        FROM code_symbols
+        WHERE snapshot_id = ?
+          AND kind = 'data_object'
+        ORDER BY path, COALESCE(line_start, 0), name
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    relationships = conn.execute(
+        """
+        SELECT from_path, from_symbol, to_path, to_symbol, relation,
+               evidence, confidence, source, line_start
+        FROM code_relationships
+        WHERE snapshot_id = ?
+        ORDER BY from_path, relation, to_path, COALESCE(line_start, 0)
+        """,
+        (snapshot_id,),
+    ).fetchall()
+
+    def ensure_feature(entrypoint) -> str | None:
+        feature_key = _route_feature_key(entrypoint["route"])
+        if feature_key is None:
+            return None
+        node_id = _stable_business_id("biz", snapshot_id, "feature", feature_key)
+        evidence = _business_evidence(entrypoint["path"], entrypoint["line_start"], entrypoint["evidence"])
+        _insert_business_node_seed(
+            conn,
+            project_id,
+            snapshot_id=snapshot_id,
+            node_id=node_id,
+            node_type="feature",
+            title=f"业务功能 {_feature_title(feature_key)}",
+            description=(
+                f"源码索引根据路由 {entrypoint['route']} 归纳出的业务功能分组。"
+                "该节点用于把相关入口聚合到同一审计上下文。"
+            ),
+            risk_level="medium",
+            review_status="unreviewed",
+            coverage_note="索引自动生成的功能聚合节点，供大模型理解业务边界。",
+            risk_tags=["业务功能"],
+            evidence=evidence,
+            confidence=min(0.78, max(0.45, float(entrypoint["confidence"] or 0.7))),
+            created_by="source_index",
+            now=now,
+        )
+        return node_id
+
+    def ensure_control(path: str | None, symbol: str | None, evidence_text: str | None, line_start: int | None, confidence: float) -> str | None:
+        if not path or not symbol:
+            return None
+        clean_symbol = symbol.strip()[:160]
+        if not clean_symbol:
+            return None
+        key = (path, clean_symbol)
+        existing = control_by_ref.get(key)
+        if existing:
+            return existing
+        node_id = _stable_business_id("biz", snapshot_id, "control", path, clean_symbol)
+        evidence = _business_evidence(path, line_start, evidence_text)
+        _insert_business_node_seed(
+            conn,
+            project_id,
+            snapshot_id=snapshot_id,
+            node_id=node_id,
+            node_type="control",
+            title=f"处理逻辑 {clean_symbol}",
+            description=(
+                f"源码索引识别到 {path} 中的处理逻辑 {clean_symbol}。"
+                "该节点用于连接入口、服务调用和数据对象。"
+            ),
+            risk_level="medium",
+            review_status="unreviewed",
+            coverage_note="索引自动生成的处理逻辑节点，供审计路径导航使用。",
+            risk_tags=["处理逻辑"],
+            evidence=evidence,
+            confidence=min(0.82, max(0.45, confidence)),
+            created_by="source_index",
+            now=now,
+        )
+        control_by_ref[key] = node_id
+        controls_by_path.setdefault(path, []).append(node_id)
+        return node_id
+
+    def ensure_data_object(path: str | None, name: str | None, evidence_text: str | None, line_start: int | None, confidence: float) -> str | None:
+        if not path or not name:
+            return None
+        clean_name = name.strip()[:160]
+        if not clean_name:
+            return None
+        key = (path, clean_name)
+        existing = data_by_ref.get(key)
+        if existing:
+            return existing
+        node_id = _stable_business_id("biz", snapshot_id, "data_object", path, clean_name)
+        evidence = _business_evidence(path, line_start, evidence_text)
+        _insert_business_node_seed(
+            conn,
+            project_id,
+            snapshot_id=snapshot_id,
+            node_id=node_id,
+            node_type="data_object",
+            title=f"数据对象 {clean_name}",
+            description=(
+                f"源码索引从 {path} 识别到数据对象 {clean_name}。"
+                "该节点用于帮助大模型理解业务资源、表或模型。"
+            ),
+            risk_level="medium",
+            review_status="unreviewed",
+            coverage_note="索引自动生成的数据对象节点，供业务图和数据流审计使用。",
+            risk_tags=["数据对象"],
+            evidence=evidence,
+            confidence=min(0.86, max(0.45, confidence)),
+            created_by="source_index",
+            now=now,
+        )
+        data_by_ref[key] = node_id
+        data_by_path.setdefault(path, []).append(node_id)
+        return node_id
+
+    for symbol in data_symbols:
+        ensure_data_object(
+            symbol["path"],
+            symbol["name"],
+            symbol["signature"],
+            symbol["line_start"],
+            float(symbol["confidence"] or 0.65),
+        )
+
     for entrypoint in entrypoints:
         if not _is_candidate_source_path(entrypoint["path"]):
             continue
@@ -875,12 +1461,13 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
             entrypoint["handler"],
             entrypoint["line_start"],
         )
-        endpoint_by_path.setdefault(entrypoint["path"], node_id)
+        endpoint_by_path.setdefault(entrypoint["path"], []).append(node_id)
         endpoint_by_label[label] = node_id
         evidence = _business_evidence(entrypoint["path"], entrypoint["line_start"], entrypoint["evidence"])
         _insert_business_node_seed(
             conn,
             project_id,
+            snapshot_id=snapshot_id,
             node_id=node_id,
             node_type="endpoint",
             title=f"入口 {label}",
@@ -893,9 +1480,54 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
             coverage_note="索引自动生成的入口节点，供审计调度和可视化使用。",
             risk_tags=["入口"],
             evidence=evidence,
+            confidence=min(0.9, max(0.45, float(entrypoint["confidence"] or 0.75))),
             created_by="source_index",
             now=now,
         )
+        feature_id = ensure_feature(entrypoint)
+        if feature_id:
+            _insert_business_edge_seed(
+                conn,
+                project_id,
+                from_node_id=feature_id,
+                to_node_id=node_id,
+                relation="exposes",
+                description="业务功能暴露该入口。",
+                confidence=0.74,
+                created_by="source_index",
+                now=now,
+            )
+        control_id = ensure_control(
+            entrypoint["path"],
+            entrypoint["handler"],
+            entrypoint["evidence"],
+            entrypoint["line_start"],
+            float(entrypoint["confidence"] or 0.7),
+        )
+        if control_id:
+            _insert_business_edge_seed(
+                conn,
+                project_id,
+                from_node_id=node_id,
+                to_node_id=control_id,
+                relation="calls",
+                description="入口路由调用对应处理逻辑。",
+                confidence=min(0.86, max(0.45, float(entrypoint["confidence"] or 0.7))),
+                created_by="source_index",
+                now=now,
+            )
+        for data_id in data_by_path.get(entrypoint["path"], []):
+            _insert_business_edge_seed(
+                conn,
+                project_id,
+                from_node_id=control_id or node_id,
+                to_node_id=data_id,
+                relation="uses",
+                description="入口处理逻辑与同文件数据对象相关。",
+                confidence=0.62,
+                created_by="source_index",
+                now=now,
+            )
         conn.execute(
             """
             UPDATE audit_candidates
@@ -908,6 +1540,67 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
             """,
             (node_id, now, snapshot_id, entrypoint["path"], label),
         )
+
+    for relationship in relationships:
+        source_nodes = controls_by_path.get(relationship["from_path"]) or endpoint_by_path.get(relationship["from_path"]) or []
+        source_id = None
+        if relationship["from_symbol"]:
+            source_id = endpoint_by_label.get(relationship["from_symbol"]) or control_by_ref.get(
+                (relationship["from_path"], relationship["from_symbol"])
+            )
+        if source_id is None and source_nodes:
+            source_id = source_nodes[0]
+        if source_id is None:
+            continue
+        target_data_id = None
+        if relationship["to_symbol"]:
+            target_data_id = data_by_ref.get((relationship["to_path"], relationship["to_symbol"]))
+        if target_data_id is not None:
+            _insert_business_edge_seed(
+                conn,
+                project_id,
+                from_node_id=source_id,
+                to_node_id=target_data_id,
+                relation="uses",
+                description="源码关系显示处理逻辑使用该数据对象。",
+                confidence=min(0.78, max(0.4, float(relationship["confidence"] or 0.55))),
+                created_by="source_index",
+                now=now,
+            )
+            continue
+        if relationship["relation"] in {"imports", "calls"}:
+            for data_id in data_by_path.get(relationship["to_path"], []):
+                _insert_business_edge_seed(
+                    conn,
+                    project_id,
+                    from_node_id=source_id,
+                    to_node_id=data_id,
+                    relation="uses",
+                    description="源码关系显示入口路径依赖包含数据对象的文件。",
+                    confidence=min(0.68, max(0.35, float(relationship["confidence"] or 0.5))),
+                    created_by="source_index",
+                    now=now,
+                )
+        if relationship["relation"] == "calls" and relationship["to_symbol"]:
+            target_control_id = ensure_control(
+                relationship["to_path"],
+                relationship["to_symbol"],
+                relationship["evidence"],
+                relationship["line_start"],
+                float(relationship["confidence"] or 0.55),
+            )
+            if target_control_id:
+                _insert_business_edge_seed(
+                    conn,
+                    project_id,
+                    from_node_id=source_id,
+                    to_node_id=target_control_id,
+                    relation="calls",
+                    description="源码索引识别到处理逻辑之间的调用关系。",
+                    confidence=min(0.68, max(0.35, float(relationship["confidence"] or 0.55))),
+                    created_by="source_index",
+                    now=now,
+                )
 
     candidates = conn.execute(
         """
@@ -928,6 +1621,7 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
         _insert_business_node_seed(
             conn,
             project_id,
+            snapshot_id=snapshot_id,
             node_id=node_id,
             node_type="risk",
             title=f"待审计风险面 {candidate['title']}",
@@ -940,6 +1634,7 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
             coverage_note="索引自动生成的高价值待审计风险面，需要源码证据闭环。",
             risk_tags=[risk_tag] if risk_tag else ["待审计风险面"],
             evidence=evidence,
+            confidence=0.72,
             created_by="source_index",
             now=now,
         )
@@ -951,7 +1646,8 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
             """,
             (node_id, now, candidate["id"], snapshot_id),
         )
-        endpoint_id = endpoint_by_label.get(candidate["entry_point"] or "") or endpoint_by_path.get(candidate["file_path"] or "")
+        endpoint_ids = endpoint_by_path.get(candidate["file_path"] or "") or []
+        endpoint_id = endpoint_by_label.get(candidate["entry_point"] or "") or (endpoint_ids[0] if endpoint_ids else None)
         if endpoint_id:
             _insert_business_edge_seed(
                 conn,
@@ -960,6 +1656,31 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
                 to_node_id=node_id,
                 relation="risk_of",
                 description="入口关联到索引发现的待审计风险面。",
+                confidence=0.7,
+                created_by="source_index",
+                now=now,
+            )
+        for control_id in controls_by_path.get(candidate["file_path"] or "", []):
+            _insert_business_edge_seed(
+                conn,
+                project_id,
+                from_node_id=control_id,
+                to_node_id=node_id,
+                relation="risk_of",
+                description="处理逻辑关联到索引发现的待审计风险面。",
+                confidence=0.66,
+                created_by="source_index",
+                now=now,
+            )
+        for data_id in data_by_path.get(candidate["file_path"] or "", []):
+            _insert_business_edge_seed(
+                conn,
+                project_id,
+                from_node_id=data_id,
+                to_node_id=node_id,
+                relation="risk_of",
+                description="数据对象关联到索引发现的待审计风险面。",
+                confidence=0.6,
                 created_by="source_index",
                 now=now,
             )
@@ -969,6 +1690,7 @@ def _insert_business_node_seed(
     conn,
     project_id: str,
     *,
+    snapshot_id: str,
     node_id: str,
     node_type: str,
     title: str,
@@ -978,6 +1700,7 @@ def _insert_business_node_seed(
     coverage_note: str,
     risk_tags: list[str],
     evidence: list[str],
+    confidence: float,
     created_by: str,
     now: str,
 ) -> None:
@@ -986,9 +1709,9 @@ def _insert_business_node_seed(
         INSERT OR IGNORE INTO business_nodes (
             id, project_id, node_type, title, description, risk_level,
             review_status, coverage_note, last_intent_id, risk_tags_json,
-            evidence_json, created_by, created_at, updated_at
+            evidence_json, source_snapshot_id, confidence, created_by, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             node_id,
@@ -1001,6 +1724,8 @@ def _insert_business_node_seed(
             coverage_note[:1000],
             json.dumps(risk_tags, ensure_ascii=False),
             json.dumps(evidence[:5], ensure_ascii=False),
+            snapshot_id,
+            confidence,
             created_by,
             now,
             now,
@@ -1016,6 +1741,7 @@ def _insert_business_edge_seed(
     to_node_id: str,
     relation: str,
     description: str,
+    confidence: float,
     created_by: str,
     now: str,
 ) -> None:
@@ -1024,9 +1750,9 @@ def _insert_business_edge_seed(
         """
         INSERT OR IGNORE INTO business_edges (
             id, project_id, from_node_id, to_node_id, relation,
-            description, created_by, created_at
+            description, confidence, created_by, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             edge_id,
@@ -1035,6 +1761,7 @@ def _insert_business_edge_seed(
             to_node_id,
             relation,
             description,
+            confidence,
             created_by,
             now,
         ),
@@ -1048,6 +1775,30 @@ def _business_evidence(path: str | None, line_start: int | None, detail: str | N
     if detail:
         return [f"{location} {detail[:220]}"]
     return [location]
+
+
+ROUTE_GROUP_PREFIXES = {"api", "v1", "v2", "v3", "rest", "admin"}
+
+
+def _route_feature_key(route: str | None) -> str | None:
+    if not route:
+        return None
+    text = route.split("?", 1)[0].strip("/")
+    if not text:
+        return None
+    for part in text.split("/"):
+        clean = part.strip()
+        if not clean or clean.startswith("{") or clean.startswith(":") or clean.startswith("<"):
+            continue
+        if clean.lower() in ROUTE_GROUP_PREFIXES:
+            continue
+        return clean[:80]
+    return None
+
+
+def _feature_title(key: str) -> str:
+    text = key.replace("_", " ").replace("-", " ").strip()
+    return text or key
 
 
 def _candidate_backfill_evidence(file_path: str | None, line_start: int | None, description: str) -> str:

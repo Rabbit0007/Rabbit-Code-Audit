@@ -363,6 +363,8 @@ def _node_from_row(row) -> BusinessNode:
         last_intent_id=row["last_intent_id"],
         risk_tags=_decode_json_list(row["risk_tags_json"]),
         evidence=_decode_json_list(row["evidence_json"]),
+        source_snapshot_id=row["source_snapshot_id"],
+        confidence=row["confidence"],
         created_by=row["created_by"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -377,6 +379,7 @@ def _edge_from_row(row) -> BusinessEdge:
         to_node_id=row["to_node_id"],
         relation=row["relation"],
         description=row["description"],
+        confidence=row["confidence"],
         created_by=row["created_by"],
         created_at=row["created_at"],
     )

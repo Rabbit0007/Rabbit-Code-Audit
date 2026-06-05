@@ -4,6 +4,7 @@ import ast
 from dataclasses import dataclass, field
 import hashlib
 import json
+import posixpath
 from pathlib import Path, PurePosixPath
 import re
 import tomllib
@@ -75,6 +76,8 @@ class CodeSymbolRecord:
     signature: str | None = None
     line_start: int | None = None
     line_end: int | None = None
+    confidence: float = 0.8
+    source: str = "heuristic"
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,23 @@ class CodeEntrypointRecord:
     handler: str | None = None
     line_start: int | None = None
     evidence: str | None = None
+    confidence: float = 0.8
+    source: str = "heuristic"
+
+
+@dataclass(frozen=True)
+class CodeRelationshipRecord:
+    id: str
+    snapshot_id: str
+    from_path: str
+    from_symbol: str | None
+    to_path: str
+    to_symbol: str | None
+    relation: str
+    evidence: str | None = None
+    confidence: float = 0.55
+    source: str = "heuristic"
+    line_start: int | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +127,7 @@ class DependencyManifestRecord:
 class CodeIndexRecords:
     symbols: list[CodeSymbolRecord]
     entrypoints: list[CodeEntrypointRecord]
+    relationships: list[CodeRelationshipRecord]
     manifests: list[DependencyManifestRecord]
 
 
@@ -133,9 +154,13 @@ def extract_code_index(snapshot_id: str, root: Path, files: list[CodeFile]) -> C
         manifest = _extract_manifest(snapshot_id, file, text)
         if manifest is not None:
             manifests.append(manifest)
+    symbols = _dedupe_symbols(symbols)
+    entrypoints = _dedupe_entrypoints(entrypoints)
+    relationships = _extract_relationships(snapshot_id, readable, symbols, entrypoints)
     return CodeIndexRecords(
-        symbols=_dedupe_symbols(symbols),
-        entrypoints=_dedupe_entrypoints(entrypoints),
+        symbols=symbols,
+        entrypoints=entrypoints,
+        relationships=_dedupe_relationships(relationships),
         manifests=_dedupe_manifests(manifests),
     )
 
@@ -156,8 +181,11 @@ def _id(prefix: str, *parts: object) -> str:
 
 def _extract_symbols(snapshot_id: str, file: CodeFile, text: str) -> list[CodeSymbolRecord]:
     if file.language == "Python":
-        return _python_symbols(snapshot_id, file, text)
-    return _regex_symbols(snapshot_id, file, text)
+        symbols = _python_symbols(snapshot_id, file, text)
+    else:
+        symbols = _regex_symbols(snapshot_id, file, text)
+    symbols.extend(_data_object_symbols(snapshot_id, file, text))
+    return symbols
 
 
 def _python_symbols(snapshot_id: str, file: CodeFile, text: str) -> list[CodeSymbolRecord]:
@@ -255,6 +283,92 @@ def _regex_symbols(snapshot_id: str, file: CodeFile, text: str) -> list[CodeSymb
     return symbols
 
 
+DATA_OBJECT_SQL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`\"'\[]?([A-Za-z_][\w.$-]*)", re.IGNORECASE),
+    re.compile(r"\b(?:FROM|JOIN|UPDATE|INTO)\s+[`\"'\[]?([A-Za-z_][\w.$-]*)", re.IGNORECASE),
+)
+DATA_OBJECT_RESERVED_NAMES = {
+    "select",
+    "where",
+    "values",
+    "set",
+    "returning",
+    "dual",
+    "public",
+}
+
+
+def _data_object_symbols(snapshot_id: str, file: CodeFile, text: str) -> list[CodeSymbolRecord]:
+    symbols: list[CodeSymbolRecord] = []
+    seen: set[tuple[str, int | None]] = set()
+
+    def add(name: str, offset: int, signature: str, confidence: float, source: str) -> None:
+        cleaned = _clean_data_object_name(name)
+        if cleaned is None:
+            return
+        line_start = _line_no(text, offset)
+        key = (cleaned, line_start)
+        if key in seen:
+            return
+        seen.add(key)
+        symbols.append(
+            CodeSymbolRecord(
+                id=_id("sym", snapshot_id, file.path, "data_object", cleaned, line_start),
+                snapshot_id=snapshot_id,
+                path=file.path,
+                language=file.language,
+                kind="data_object",
+                name=cleaned,
+                signature=signature.strip()[:240],
+                line_start=line_start,
+                confidence=confidence,
+                source=source,
+            )
+        )
+
+    for pattern in DATA_OBJECT_SQL_PATTERNS:
+        for match in pattern.finditer(text):
+            add(match.group(1), match.start(), _line_at(text, _line_no(text, match.start())), 0.82, "heuristic:sql")
+
+    for match in re.finditer(r"__tablename__\s*=\s*['\"]([^'\"]+)['\"]", text):
+        add(match.group(1), match.start(), _line_at(text, _line_no(text, match.start())), 0.88, "heuristic:orm")
+    for match in re.finditer(r"\bclass\s+([A-Za-z_][\w]*)\s*\([^)]*(?:models\.Model|Model)[^)]*\)", text):
+        add(match.group(1), match.start(), _line_at(text, _line_no(text, match.start())), 0.82, "heuristic:orm")
+    for match in re.finditer(r"@(?:Entity|Table)\s*(?:\(\s*(?:name\s*=\s*)?['\"]([^'\"]+)['\"])?", text):
+        explicit = match.group(1)
+        if explicit:
+            add(explicit, match.start(), _line_at(text, _line_no(text, match.start())), 0.86, "heuristic:orm")
+            continue
+        class_match = re.search(r"\bclass\s+([A-Za-z_][\w]*)", text[match.end() : match.end() + 500])
+        if class_match:
+            add(class_match.group(1), match.end() + class_match.start(), class_match.group(0), 0.78, "heuristic:orm")
+    for match in re.finditer(r"\[Table\(\s*['\"]([^'\"]+)['\"]\s*\)\]", text):
+        add(match.group(1), match.start(), _line_at(text, _line_no(text, match.start())), 0.86, "heuristic:orm")
+    for match in re.finditer(r"\bDbSet\s*<\s*([A-Za-z_][\w]*)\s*>\s+([A-Za-z_][\w]*)", text):
+        add(match.group(2), match.start(), _line_at(text, _line_no(text, match.start())), 0.8, "heuristic:orm")
+    for match in re.finditer(r"@Entity\s*\(\s*['\"]([^'\"]+)['\"]\s*\)", text):
+        add(match.group(1), match.start(), _line_at(text, _line_no(text, match.start())), 0.86, "heuristic:orm")
+    for match in re.finditer(r"\bmodel\s*\(\s*['\"]([^'\"]+)['\"]", text):
+        add(match.group(1), match.start(), _line_at(text, _line_no(text, match.start())), 0.76, "heuristic:orm")
+    for match in re.finditer(r"\btype\s+([A-Za-z_][\w]*)\s+struct\s*\{", text):
+        block = text[match.start() : match.start() + 800]
+        if "gorm." in block or "`json:" in block or "`db:" in block:
+            add(match.group(1), match.start(), _line_at(text, _line_no(text, match.start())), 0.64, "heuristic:model")
+    for match in re.finditer(r"\bclass\s+([A-Za-z_][\w]*(?:Model|Entity|Record|Repository))\b", text):
+        add(match.group(1), match.start(), _line_at(text, _line_no(text, match.start())), 0.62, "heuristic:model")
+    return symbols
+
+
+def _clean_data_object_name(value: str) -> str | None:
+    text = value.strip().strip("`\"'[]")
+    text = text.split()[0].strip("`\"'[]")
+    if not text or text.lower() in DATA_OBJECT_RESERVED_NAMES:
+        return None
+    if text.startswith("$") or text.startswith(":"):
+        return None
+    return text[:120]
+
+
 def _extract_entrypoints(
     snapshot_id: str,
     file: CodeFile,
@@ -336,9 +450,33 @@ def _python_router_prefixes(text: str) -> dict[str, str]:
 
 def _python_django_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
     records: list[CodeEntrypointRecord] = []
+    include_pattern = re.compile(r"\b(path|re_path)\(\s*r?['\"]([^'\"]+)['\"]\s*,\s*include\(\s*['\"]([^'\"]+)['\"]\s*\)")
+    for match in include_pattern.finditer(text):
+        call, route, include_target = match.group(1), match.group(2), match.group(3)
+        if call == "re_path":
+            route = route.strip("^").rstrip("$")
+        route = _join_routes(None, route)
+        line_start = _line_no(text, match.start())
+        records.append(
+            _entrypoint(
+                snapshot_id,
+                file,
+                "http_route",
+                "django",
+                None,
+                route,
+                f"include({include_target})",
+                line_start,
+                _line_at(text, line_start).strip(),
+                0.7,
+                "heuristic:django_include",
+            )
+        )
     pattern = re.compile(r"\b(path|re_path)\(\s*r?['\"]([^'\"]+)['\"]\s*,\s*([^,\)\n]+)")
     for match in pattern.finditer(text):
         call, route, handler = match.group(1), match.group(2), match.group(3)
+        if handler.strip().startswith("include("):
+            continue
         if call == "re_path":
             route = route.strip("^").rstrip("$")
         route = _join_routes(None, route)
@@ -458,11 +596,83 @@ def _php_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEn
     if file.language != "PHP":
         return []
     records: list[CodeEntrypointRecord] = []
+    prefix_ranges = _php_laravel_prefix_ranges(text)
     pattern = re.compile(r"Route::(get|post|put|delete|patch|options|any)\(\s*['\"]([^'\"]+)['\"]\s*,\s*([^)\n]+)", re.IGNORECASE)
     for match in pattern.finditer(text):
         method = match.group(1).upper()
-        records.append(_entrypoint(snapshot_id, file, "http_route", "laravel", None if method == "ANY" else method, match.group(2), _handler_text(match.group(3)), _line_no(text, match.start()), _line_at(text, _line_no(text, match.start())).strip()))
+        route = _join_routes(_php_route_prefix_at(prefix_ranges, match.start()), match.group(2))
+        records.append(
+            _entrypoint(
+                snapshot_id,
+                file,
+                "http_route",
+                "laravel",
+                None if method == "ANY" else method,
+                route,
+                _php_handler_text(match.group(3)),
+                _line_no(text, match.start()),
+                _line_at(text, _line_no(text, match.start())).strip(),
+            )
+        )
     return records
+
+
+def _php_laravel_prefix_ranges(text: str) -> list[tuple[int, int, str]]:
+    ranges: list[tuple[int, int, str]] = []
+    patterns = (
+        re.compile(r"Route::prefix\(\s*['\"]([^'\"]+)['\"]\s*\)\s*->\s*group\s*\(\s*function\s*\([^)]*\)\s*\{", re.IGNORECASE),
+        re.compile(
+            r"Route::group\(\s*\[[^\]]*['\"]prefix['\"]\s*=>\s*['\"]([^'\"]+)['\"][^\]]*\]\s*,\s*function\s*\([^)]*\)\s*\{",
+            re.IGNORECASE | re.DOTALL,
+        ),
+    )
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            open_brace = text.find("{", match.start(), match.end())
+            if open_brace < 0:
+                continue
+            close_brace = _find_matching_brace(text, open_brace)
+            if close_brace is not None:
+                ranges.append((open_brace, close_brace, match.group(1)))
+    return sorted(ranges)
+
+
+def _php_route_prefix_at(ranges: list[tuple[int, int, str]], offset: int) -> str | None:
+    prefix: str | None = None
+    for start, end, value in ranges:
+        if start <= offset <= end:
+            prefix = _join_routes(prefix, value)
+    return prefix
+
+
+def _find_matching_brace(text: str, open_brace: int) -> int | None:
+    depth = 0
+    for index in range(open_brace, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _php_handler_text(value: str) -> str | None:
+    text = _handler_text(value)
+    if not text:
+        return None
+    class_method = re.search(
+        r"([A-Za-z_][\w\\]*Controller)::class\s*,\s*['\"]([A-Za-z_][\w]*)['\"]",
+        text,
+    )
+    if class_method:
+        controller = class_method.group(1).split("\\")[-1]
+        return f"{controller}@{class_method.group(2)}"
+    string_handler = re.search(r"['\"]([A-Za-z_][\w\\]*Controller@[A-Za-z_][\w]*)['\"]", text)
+    if string_handler:
+        return string_handler.group(1).split("\\")[-1]
+    return text
 
 
 def _csharp_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
@@ -506,9 +716,24 @@ def _java_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeE
     pending: list[tuple[int, str, str | None, str | None, str]] = []
     class_prefix = ""
     class_jax_prefix = ""
+    annotation_lines: list[str] = []
+    annotation_start = 0
+    annotation_balance = 0
     for lineno, line in enumerate(lines, start=1):
-        pending.extend(_java_mapping_annotations(line, lineno))
         stripped = line.strip()
+        if annotation_lines:
+            annotation_lines.append(stripped)
+            annotation_balance += stripped.count("(") - stripped.count(")")
+            if annotation_balance <= 0:
+                pending.extend(_java_mapping_annotations(" ".join(annotation_lines), annotation_start))
+                annotation_lines = []
+            continue
+        if _is_java_route_annotation(stripped) and stripped.count("(") > stripped.count(")"):
+            annotation_lines = [stripped]
+            annotation_start = lineno
+            annotation_balance = stripped.count("(") - stripped.count(")")
+            continue
+        pending.extend(_java_mapping_annotations(stripped, lineno))
         if re.search(r"\b(?:class|interface|record)\s+[A-Za-z_][\w]*", stripped):
             spring_routes = [item for item in pending if item[1] == "spring" and item[3] is not None]
             jax_routes = [item for item in pending if item[1] == "jaxrs" and item[3] is not None]
@@ -544,6 +769,7 @@ def _go_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEnt
     patterns = (
         ("net/http", re.compile(rf"http\.HandleFunc\(\s*['\"]([^'\"]+)['\"]\s*,\s*{handler_name}")),
         ("net/http", re.compile(r"http\.Handle\(\s*['\"]([^'\"]+)['\"]\s*,\s*([A-Za-z_][\w.]*(?:\([^)]*\))?)")),
+        ("go-method-router", re.compile(rf"\b([A-Za-z_][\w]*)\.(?:Handle|HandleFunc|Method|MethodFunc)\(\s*['\"]([A-Za-z]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*,\s*{handler_name}")),
         ("gin", re.compile(rf"\b(router|r|group)\.(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\(\s*['\"]([^'\"]+)['\"]\s*,\s*{handler_name}")),
         ("go-router", re.compile(rf"\b([A-Za-z_][\w]*)\.(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\(\s*['\"]([^'\"]+)['\"]\s*,\s*{handler_name}")),
         ("go-router", re.compile(rf"\b([A-Za-z_][\w]*)\.(Get|Post|Put|Delete|Patch|Options|Head)\(\s*['\"]([^'\"]+)['\"]\s*,\s*{handler_name}")),
@@ -551,14 +777,18 @@ def _go_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEnt
     )
     for framework, pattern in patterns:
         for match in pattern.finditer(text):
+            entry_framework = framework
             if framework == "net/http":
                 method, route, handler = None, match.group(1), match.group(2)
+            elif framework == "go-method-router":
+                entry_framework = "go-router"
+                method, route, handler = match.group(2).upper(), _join_routes(group_prefixes.get(match.group(1)), match.group(3)), match.group(4)
             elif framework == "mux":
                 method, route, handler = _go_http_method(match.group(4)), _join_routes(group_prefixes.get(match.group(1)), match.group(2)), match.group(3)
             else:
                 method, route, handler = match.group(2).upper(), _join_routes(group_prefixes.get(match.group(1)), match.group(3)), match.group(4)
             line_start = _line_no(text, match.start())
-            records.append(_entrypoint(snapshot_id, file, "http_route", framework, method, route, handler, line_start, _line_at(text, line_start).strip()))
+            records.append(_entrypoint(snapshot_id, file, "http_route", entry_framework, method, route, handler, line_start, _line_at(text, line_start).strip()))
     return records
 
 
@@ -632,14 +862,20 @@ JAVA_JAX_METHOD_RE = re.compile(r"@(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\b")
 JAVA_JAX_PATH_RE = re.compile(r"@Path\s*\(\s*['\"]([^'\"]+)['\"]\s*\)", re.IGNORECASE)
 
 
+def _is_java_route_annotation(line: str) -> bool:
+    return bool(JAVA_SPRING_MAPPING_RE.search(line) or JAVA_JAX_PATH_RE.search(line) or JAVA_JAX_METHOD_RE.search(line))
+
+
 def _java_mapping_annotations(line: str, lineno: int) -> list[tuple[int, str, str | None, str | None, str]]:
     items: list[tuple[int, str, str | None, str | None, str]] = []
     for match in JAVA_SPRING_MAPPING_RE.finditer(line):
         mapping = match.group(1).upper()
         args = match.group(2) or ""
-        route = _first_string(args)
-        method = JAVA_SPRING_METHOD_BY_MAPPING.get(mapping) or _request_method(args)
-        items.append((lineno, "spring", method, route, line.strip()))
+        routes = _java_route_strings(args) or [None]
+        methods = [JAVA_SPRING_METHOD_BY_MAPPING[mapping]] if mapping in JAVA_SPRING_METHOD_BY_MAPPING else (_request_methods(args) or [None])
+        for route in routes:
+            for method in methods:
+                items.append((lineno, "spring", method, route, line.strip()))
     path_match = JAVA_JAX_PATH_RE.search(line)
     if path_match:
         items.append((lineno, "jaxrs", None, path_match.group(1), line.strip()))
@@ -648,6 +884,19 @@ def _java_mapping_annotations(line: str, lineno: int) -> list[tuple[int, str, st
         if method in JAVA_HTTP_METHOD_ANNOTATIONS:
             items.append((lineno, "jaxrs", method, None, line.strip()))
     return items
+
+
+def _java_route_strings(value: str) -> list[str]:
+    routes: list[str] = []
+    for match in re.finditer(r"\b(?:value|path)\s*=\s*(?:\{([^}]*)\}|['\"]([^'\"]+)['\"])", value):
+        if match.group(1):
+            routes.extend(re.findall(r"['\"]([^'\"]+)['\"]", match.group(1)))
+        elif match.group(2):
+            routes.append(match.group(2))
+    if routes:
+        return routes
+    first = _first_string(value)
+    return [first] if first else []
 
 
 def _java_like_method_name(line: str) -> str | None:
@@ -685,6 +934,308 @@ def _go_http_method(value: str) -> str | None:
     return None
 
 
+def _extract_relationships(
+    snapshot_id: str,
+    readable: list[tuple[CodeFile, str]],
+    symbols: list[CodeSymbolRecord],
+    entrypoints: list[CodeEntrypointRecord],
+) -> list[CodeRelationshipRecord]:
+    relationships: list[CodeRelationshipRecord] = []
+    paths = {file.path for file, _ in readable}
+    module_map = _module_path_map(paths)
+    symbols_by_name: dict[str, list[CodeSymbolRecord]] = {}
+    for symbol in symbols:
+        if len(symbol.name) < 3 or symbol.name.lower() in SYMBOL_RESERVED_NAMES:
+            continue
+        symbols_by_name.setdefault(symbol.name, []).append(symbol)
+    unique_symbols = {
+        name: items[0]
+        for name, items in symbols_by_name.items()
+        if len({item.path for item in items}) == 1
+    }
+    entrypoints_by_path: dict[str, list[CodeEntrypointRecord]] = {}
+    for entrypoint in entrypoints:
+        entrypoints_by_path.setdefault(entrypoint.path, []).append(entrypoint)
+    data_objects_by_path: dict[str, list[CodeSymbolRecord]] = {}
+    for symbol in symbols:
+        if symbol.kind == "data_object":
+            data_objects_by_path.setdefault(symbol.path, []).append(symbol)
+
+    for file, text in readable:
+        relationships.extend(_entrypoint_handler_relationships(snapshot_id, file, entrypoints_by_path.get(file.path, [])))
+        relationships.extend(_import_relationships(snapshot_id, file, text, paths, module_map, unique_symbols))
+        relationships.extend(_call_relationships(snapshot_id, file, text, unique_symbols))
+        relationships.extend(_data_object_use_relationships(snapshot_id, file, data_objects_by_path.get(file.path, [])))
+    return relationships
+
+
+def _entrypoint_handler_relationships(
+    snapshot_id: str,
+    file: CodeFile,
+    entrypoints: list[CodeEntrypointRecord],
+) -> list[CodeRelationshipRecord]:
+    relationships: list[CodeRelationshipRecord] = []
+    for entrypoint in entrypoints:
+        if not entrypoint.handler:
+            continue
+        handler_text = entrypoint.handler.strip()
+        if handler_text == PurePosixPath(entrypoint.path).name:
+            continue
+        handler = handler_text.split(".")[-1].strip()
+        if not handler:
+            continue
+        relationships.append(
+            _relationship(
+                snapshot_id,
+                from_path=entrypoint.path,
+                from_symbol=_entrypoint_label(entrypoint.method, entrypoint.route),
+                to_path=entrypoint.path,
+                to_symbol=handler,
+                relation="calls",
+                evidence=entrypoint.evidence,
+                confidence=min(0.88, max(0.5, entrypoint.confidence)),
+                source="heuristic:entrypoint_handler",
+                line_start=entrypoint.line_start,
+            )
+        )
+    return relationships
+
+
+def _import_relationships(
+    snapshot_id: str,
+    file: CodeFile,
+    text: str,
+    paths: set[str],
+    module_map: dict[str, str],
+    unique_symbols: dict[str, CodeSymbolRecord],
+) -> list[CodeRelationshipRecord]:
+    relationships: list[CodeRelationshipRecord] = []
+    if file.language == "Python":
+        pattern = re.compile(r"^\s*from\s+([.\w]+)\s+import\s+([A-Za-z_][\w]*(?:\s*,\s*[A-Za-z_][\w]*)*)", re.MULTILINE)
+        for match in pattern.finditer(text):
+            target = _resolve_module_import(file.path, match.group(1), paths, module_map)
+            imported_names = [item.strip() for item in match.group(2).split(",")]
+            if target is None:
+                target_symbol = next((unique_symbols[name] for name in imported_names if name in unique_symbols), None)
+                target = target_symbol.path if target_symbol is not None else None
+            if target:
+                relationships.append(_import_relationship(snapshot_id, file, text, match.start(), target, match.group(0).strip(), 0.72, "heuristic:python_import"))
+        pattern = re.compile(r"^\s*import\s+([A-Za-z_][\w.]*)(?:\s+as\s+[A-Za-z_][\w]*)?", re.MULTILINE)
+        for match in pattern.finditer(text):
+            target = _resolve_module_import(file.path, match.group(1), paths, module_map)
+            if target:
+                relationships.append(_import_relationship(snapshot_id, file, text, match.start(), target, match.group(0).strip(), 0.68, "heuristic:python_import"))
+    if file.language in {"JavaScript", "TypeScript", "Vue"}:
+        pattern = re.compile(r"\b(?:import\s+(?:[^'\"]+\s+from\s+)?|require\()\s*['\"]([^'\"]+)['\"]", re.MULTILINE)
+        for match in pattern.finditer(text):
+            target = _resolve_relative_path(file.path, match.group(1), paths)
+            if target:
+                relationships.append(_import_relationship(snapshot_id, file, text, match.start(), target, _line_at(text, _line_no(text, match.start())).strip(), 0.74, "heuristic:js_import"))
+    if file.language == "PHP":
+        pattern = re.compile(r"\b(?:require|include)(?:_once)?\s*\(?\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
+        for match in pattern.finditer(text):
+            target = _resolve_relative_path(file.path, match.group(1), paths)
+            if target:
+                relationships.append(_import_relationship(snapshot_id, file, text, match.start(), target, _line_at(text, _line_no(text, match.start())).strip(), 0.76, "heuristic:php_include"))
+    if file.language in {"Java", "Kotlin", "Scala"}:
+        pattern = re.compile(r"^\s*import\s+(?:static\s+)?([A-Za-z_][\w.]*);", re.MULTILINE)
+        for match in pattern.finditer(text):
+            name = match.group(1).split(".")[-1]
+            target_symbol = unique_symbols.get(name)
+            if target_symbol and target_symbol.path != file.path:
+                relationships.append(
+                    _relationship(
+                        snapshot_id,
+                        from_path=file.path,
+                        from_symbol=None,
+                        to_path=target_symbol.path,
+                        to_symbol=target_symbol.name,
+                        relation="imports",
+                        evidence=match.group(0).strip(),
+                        confidence=0.68,
+                        source="heuristic:java_import",
+                        line_start=_line_no(text, match.start()),
+                    )
+                )
+    return relationships
+
+
+def _call_relationships(
+    snapshot_id: str,
+    file: CodeFile,
+    text: str,
+    unique_symbols: dict[str, CodeSymbolRecord],
+) -> list[CodeRelationshipRecord]:
+    relationships: list[CodeRelationshipRecord] = []
+    per_file_count = 0
+    for name, target in sorted(unique_symbols.items()):
+        if per_file_count >= 80:
+            break
+        if target.path == file.path or target.kind == "data_object":
+            continue
+        pattern = re.compile(rf"\b(?:new\s+)?{re.escape(name)}\s*(?:\(|\{{)")
+        for match in pattern.finditer(text):
+            line_start = _line_no(text, match.start())
+            line = _line_at(text, line_start).strip()
+            if _looks_like_symbol_declaration(line, name):
+                continue
+            relationships.append(
+                _relationship(
+                    snapshot_id,
+                    from_path=file.path,
+                    from_symbol=None,
+                    to_path=target.path,
+                    to_symbol=target.name,
+                    relation="calls",
+                    evidence=line,
+                    confidence=0.58,
+                    source="heuristic:unique_symbol_call",
+                    line_start=line_start,
+                )
+            )
+            per_file_count += 1
+            break
+    return relationships
+
+
+def _data_object_use_relationships(
+    snapshot_id: str,
+    file: CodeFile,
+    data_objects: list[CodeSymbolRecord],
+) -> list[CodeRelationshipRecord]:
+    relationships: list[CodeRelationshipRecord] = []
+    for symbol in data_objects:
+        relationships.append(
+            _relationship(
+                snapshot_id,
+                from_path=file.path,
+                from_symbol=None,
+                to_path=symbol.path,
+                to_symbol=symbol.name,
+                relation="uses",
+                evidence=symbol.signature,
+                confidence=min(0.82, max(0.5, symbol.confidence)),
+                source=symbol.source,
+                line_start=symbol.line_start,
+            )
+        )
+    return relationships
+
+
+def _relationship(
+    snapshot_id: str,
+    *,
+    from_path: str,
+    from_symbol: str | None,
+    to_path: str,
+    to_symbol: str | None,
+    relation: str,
+    evidence: str | None,
+    confidence: float,
+    source: str,
+    line_start: int | None,
+) -> CodeRelationshipRecord:
+    return CodeRelationshipRecord(
+        id=_id("rel", snapshot_id, from_path, from_symbol, relation, to_path, to_symbol, line_start),
+        snapshot_id=snapshot_id,
+        from_path=from_path,
+        from_symbol=from_symbol,
+        to_path=to_path,
+        to_symbol=to_symbol,
+        relation=relation,
+        evidence=evidence[:240] if isinstance(evidence, str) else None,
+        confidence=confidence,
+        source=source,
+        line_start=line_start,
+    )
+
+
+def _import_relationship(
+    snapshot_id: str,
+    file: CodeFile,
+    text: str,
+    offset: int,
+    target: str,
+    evidence: str,
+    confidence: float,
+    source: str,
+) -> CodeRelationshipRecord:
+    return _relationship(
+        snapshot_id,
+        from_path=file.path,
+        from_symbol=None,
+        to_path=target,
+        to_symbol=None,
+        relation="imports",
+        evidence=evidence,
+        confidence=confidence,
+        source=source,
+        line_start=_line_no(text, offset),
+    )
+
+
+def _module_path_map(paths: set[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for path in sorted(paths):
+        pure_path = PurePosixPath(path)
+        suffix = pure_path.suffix.lower()
+        if suffix not in {".py", ".js", ".jsx", ".ts", ".tsx", ".vue", ".java", ".kt", ".scala"}:
+            continue
+        stem_path = pure_path.with_suffix("").as_posix()
+        module = stem_path.replace("/", ".")
+        if module.endswith(".__init__"):
+            module = module[: -len(".__init__")]
+        result.setdefault(module, path)
+        result.setdefault(pure_path.stem, path)
+    return result
+
+
+def _resolve_module_import(
+    current_path: str,
+    module: str,
+    paths: set[str],
+    module_map: dict[str, str],
+) -> str | None:
+    if module.startswith("."):
+        dots = len(module) - len(module.lstrip("."))
+        rest = module[dots:].replace(".", "/")
+        base = PurePosixPath(current_path).parent
+        for _ in range(max(0, dots - 1)):
+            base = base.parent
+        return _resolve_path_candidates((base / rest).as_posix(), paths)
+    if module in module_map:
+        return module_map[module]
+    suffix = f".{module}"
+    matches = [path for name, path in module_map.items() if name.endswith(suffix)]
+    return matches[0] if len(set(matches)) == 1 else None
+
+
+def _resolve_relative_path(current_path: str, target: str, paths: set[str]) -> str | None:
+    if not target.startswith("."):
+        return None
+    base = (PurePosixPath(current_path).parent / target).as_posix()
+    return _resolve_path_candidates(base, paths)
+
+
+def _resolve_path_candidates(base: str, paths: set[str]) -> str | None:
+    normalized = posixpath.normpath(PurePosixPath(base).as_posix())
+    candidates = [normalized]
+    candidates.extend(f"{normalized}{suffix}" for suffix in (".py", ".js", ".jsx", ".ts", ".tsx", ".vue", ".php", ".java", ".kt", ".scala", ".go"))
+    candidates.extend(f"{normalized}/index{suffix}" for suffix in (".js", ".jsx", ".ts", ".tsx", ".php"))
+    candidates.append(f"{normalized}/__init__.py")
+    for candidate in candidates:
+        if candidate in paths:
+            return candidate
+    return None
+
+
+def _looks_like_symbol_declaration(line: str, name: str) -> bool:
+    return bool(
+        re.search(rf"\b(?:function|func|def|class|interface|struct|enum|record)\s+{re.escape(name)}\b", line)
+        or re.search(rf"\b{re.escape(name)}\s*[:=]\s*(?:async\s*)?\(?", line)
+    )
+
+
 def _generic_web_script_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
     if not is_likely_generic_web_script(file.path, text):
         return []
@@ -700,6 +1251,8 @@ def _generic_web_script_entrypoints(snapshot_id: str, file: CodeFile, text: str)
             path.name,
             1,
             f"{file.path} is a web-executable script file",
+            0.72,
+            "heuristic:web_script",
         )
     ]
 
@@ -773,6 +1326,8 @@ def _entrypoint(
     handler: str | None,
     line_start: int | None,
     evidence: str | None,
+    confidence: float = 0.82,
+    source: str = "heuristic:route",
 ) -> CodeEntrypointRecord:
     return CodeEntrypointRecord(
         id=_id("entry", snapshot_id, file.path, kind, framework, method, route, handler, line_start),
@@ -786,6 +1341,8 @@ def _entrypoint(
         handler=handler,
         line_start=line_start,
         evidence=evidence,
+        confidence=confidence,
+        source=source,
     )
 
 
@@ -935,8 +1492,16 @@ def _methods_from_args(value: str) -> list[str]:
 
 
 def _request_method(value: str) -> str | None:
-    match = re.search(r"RequestMethod\.([A-Z]+)", value)
-    return match.group(1) if match else None
+    methods = _request_methods(value)
+    return methods[0] if methods else None
+
+
+def _request_methods(value: str) -> list[str]:
+    return list(dict.fromkeys(re.findall(r"RequestMethod\.([A-Z]+)", value)))
+
+
+def _entrypoint_label(method: str | None, route: str) -> str:
+    return f"{method} {route}" if method else route
 
 
 def _next_java_like_method(lines: list[str], line_start: int) -> str | None:
@@ -970,6 +1535,18 @@ def _dedupe_entrypoints(items: list[CodeEntrypointRecord]) -> list[CodeEntrypoin
     result: list[CodeEntrypointRecord] = []
     for item in items:
         key = (item.path, item.method, item.route, item.handler)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _dedupe_relationships(items: list[CodeRelationshipRecord]) -> list[CodeRelationshipRecord]:
+    seen: set[tuple[str, str | None, str, str, str | None]] = set()
+    result: list[CodeRelationshipRecord] = []
+    for item in items:
+        key = (item.from_path, item.from_symbol, item.relation, item.to_path, item.to_symbol)
         if key in seen:
             continue
         seen.add(key)

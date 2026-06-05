@@ -47,6 +47,8 @@ class BusinessNode(BaseModel):
     last_intent_id: str | None = None
     risk_tags: list[str] = Field(default_factory=list)
     evidence: list[str] = Field(default_factory=list)
+    source_snapshot_id: str | None = None
+    confidence: float = 0.7
     created_by: str
     created_at: str
     updated_at: str
@@ -59,6 +61,7 @@ class BusinessEdge(BaseModel):
     to_node_id: str
     relation: BusinessEdgeRelation
     description: str | None = None
+    confidence: float = 0.7
     created_by: str
     created_at: str
 

@@ -354,7 +354,7 @@ def test_source_import_indexes_common_python_java_go_routes(temp_db, monkeypatch
         {
             "demo/api.py": b"""
 from fastapi import APIRouter, FastAPI
-from django.urls import path
+from django.urls import include, path
 from . import views
 
 app = FastAPI()
@@ -372,6 +372,7 @@ def lock_user(user_id: str):
 
 urlpatterns = [
     path("health/", views.health),
+    path("api/", include("users.urls")),
 ]
 """,
             "demo/UserController.java": b"""
@@ -389,6 +390,14 @@ public class UserController {
 
     @RequestMapping(value = "/search", method = RequestMethod.POST)
     public List<User> search() {
+        return List.of();
+    }
+
+    @RequestMapping(
+        path = {"/bulk", "/lookup"},
+        method = RequestMethod.POST
+    )
+    public List<User> bulk() {
         return List.of();
     }
 }
@@ -421,6 +430,7 @@ func main() {
     app.Post("/fiber", createFiber)
     e.GET("/echo", echoHandler)
     router.GET("/gin", ginHandler)
+    router.Handle("GET", "/handle", handleRoot)
     api := router.Group("/api")
     api.GET("/grouped", handlers.Grouped)
     v1 := api.Group("/v1")
@@ -433,6 +443,7 @@ func getOrder(w http.ResponseWriter, r *http.Request) {}
 func createFiber(c *fiber.Ctx) error { return nil }
 func echoHandler(c echo.Context) error { return nil }
 func ginHandler(c *gin.Context) {}
+func handleRoot(w http.ResponseWriter, r *http.Request) {}
 """,
             "demo/UsersController.cs": b"""
 using Microsoft.AspNetCore.Mvc;
@@ -453,6 +464,14 @@ public class UsersController : ControllerBase
     }
 }
 """,
+            "demo/routes/web.php": b"""<?php
+use App\\Http\\Controllers\\UserController;
+
+Route::prefix('api')->group(function () {
+    Route::get('/profile', [UserController::class, 'profile']);
+    Route::post('/profile', 'UserController@update');
+});
+""",
         }
     )
     snapshot = client.post(
@@ -466,8 +485,11 @@ public class UsersController : ControllerBase
         ("/api/v1/users/{user_id}", "GET"),
         ("/api/v2/users/{user_id}/lock", "POST"),
         ("/health/", None),
+        ("/api/", None),
         ("/api/{id}", "GET"),
         ("/api/search", "POST"),
+        ("/api/bulk", "POST"),
+        ("/api/lookup", "POST"),
         ("/legacy/{id}", "GET"),
         ("/admin", "GET"),
         ("/ready", None),
@@ -477,17 +499,104 @@ public class UsersController : ControllerBase
         ("/fiber", "POST"),
         ("/echo", "GET"),
         ("/gin", "GET"),
+        ("/handle", "GET"),
         ("/api/grouped", "GET"),
         ("/api/v1/nested", "POST"),
         ("/api/Users/{id}", "GET"),
         ("/api/Users/search", "POST"),
+        ("/api/profile", "GET"),
+        ("/api/profile", "POST"),
     } <= route_methods
 
     frameworks = {item["framework"] for item in entrypoints}
-    assert {"python", "django", "spring", "jaxrs", "net/http", "mux", "go-router", "gin", "aspnet"} <= frameworks
+    assert {"python", "django", "spring", "jaxrs", "net/http", "mux", "go-router", "gin", "aspnet", "laravel"} <= frameworks
 
     symbols = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/symbols").json()
     assert {"get_user", "lock_user", "UserController", "AdminController", "UsersController", "ready", "getUser"} <= {item["name"] for item in symbols}
+
+
+def test_source_index_builds_relationships_and_business_graph_chain(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/app/api.py": b"""
+from fastapi import APIRouter
+from .services import UserService
+
+router = APIRouter(prefix="/api")
+service = UserService()
+
+@router.post("/users/{user_id}/lock")
+def lock_user(user_id: str):
+    return service.lock_user(user_id)
+""",
+            "demo/app/services.py": b"""
+from flask import request
+from .models import User
+
+class UserService:
+    def lock_user(self, user_id):
+        request_user_id = request.args["id"]
+        cursor.execute("UPDATE users SET locked = 1 WHERE id = %s" % request_user_id)
+        return User(id=user_id)
+""",
+            "demo/app/models.py": b"""
+from django.db import models
+
+class User(models.Model):
+    locked = models.BooleanField(default=False)
+""",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("business-chain.zip", payload, "application/zip")},
+    ).json()
+
+    summary = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/index-summary").json()
+    assert summary["entrypoint_count"] == 1
+    assert summary["relationship_count"] >= 4
+
+    quality = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/index-quality").json()
+    assert quality["score"] >= 70
+    assert quality["grade"] in {"strong", "usable"}
+    assert quality["entrypoints_with_data_paths"] >= 1
+    assert quality["relationship_counts"]["calls"] >= 1
+    assert quality["data_object_count"] >= 1
+
+    relationships = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/relationships").json()
+    relationship_pairs = {
+        (item["from_path"], item["relation"], item["to_path"], item["to_symbol"])
+        for item in relationships
+    }
+    assert ("app/api.py", "imports", "app/services.py", None) in relationship_pairs
+    assert ("app/api.py", "calls", "app/services.py", "UserService") in relationship_pairs
+    assert ("app/services.py", "imports", "app/models.py", None) in relationship_pairs
+    assert ("app/services.py", "calls", "app/models.py", "User") in relationship_pairs
+    assert all(0 < item["confidence"] <= 1 for item in relationships)
+
+    graph = client.get(f"/api/projects/{project_id}/business-graph").json()
+    node_types = {item["node_type"] for item in graph["nodes"]}
+    assert {"feature", "endpoint", "control", "data_object", "risk"} <= node_types
+    assert any(item["title"] == "业务功能 users" for item in graph["nodes"])
+    assert any(item["title"] == "处理逻辑 lock_user" for item in graph["nodes"])
+    assert any(item["title"] == "处理逻辑 UserService" for item in graph["nodes"])
+    assert any(item["title"] == "数据对象 User" for item in graph["nodes"])
+    assert any(item["source_snapshot_id"] == snapshot["id"] for item in graph["nodes"])
+    assert all(0 < item["confidence"] <= 1 for item in graph["nodes"])
+    assert {"exposes", "calls", "uses", "risk_of"} <= {item["relation"] for item in graph["edges"]}
+
+    reindexed = client.post(f"/api/projects/{project_id}/sources/{snapshot['id']}/reindex")
+    assert reindexed.status_code == 200
+    assert reindexed.json()["relationship_count"] >= 4
+    graph_after = client.get(f"/api/projects/{project_id}/business-graph").json()
+    node_ids = [item["id"] for item in graph_after["nodes"]]
+    edge_ids = [item["id"] for item in graph_after["edges"]]
+    assert len(node_ids) == len(set(node_ids))
+    assert len(edge_ids) == len(set(edge_ids))
 
 
 def test_source_import_indexes_satrda_routes_and_seeds_business_graph(temp_db, monkeypatch, tmp_path):

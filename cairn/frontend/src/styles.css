@@ -1765,6 +1765,222 @@ select:focus {
   overflow-wrap: anywhere;
 }
 
+.index-quality-panel {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.84);
+}
+
+.index-quality-panel header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.index-quality-panel header > div:first-child {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.index-quality-panel header span,
+.quality-section > span,
+.quality-confidence-row span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 620;
+}
+
+.index-quality-panel header strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 15px;
+  font-weight: 680;
+}
+
+.index-quality-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.quality-score-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+}
+
+.quality-score {
+  width: 74px;
+  height: 74px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  background: rgba(248, 250, 252, 0.82);
+}
+
+.quality-score strong {
+  font-size: 24px;
+  line-height: 1;
+  font-weight: 720;
+}
+
+.quality-score span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.quality-score.success strong {
+  color: #07864f;
+}
+
+.quality-score.info strong {
+  color: var(--blue);
+}
+
+.quality-score.warning strong {
+  color: #c65f00;
+}
+
+.quality-score.danger strong {
+  color: var(--red);
+}
+
+.quality-score-detail {
+  min-width: 0;
+  display: grid;
+  gap: 9px;
+}
+
+.quality-score-detail > div:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.quality-score-detail span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 620;
+}
+
+.quality-score-detail strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.quality-meter {
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(100, 116, 139, 0.16);
+  overflow: hidden;
+}
+
+.quality-meter span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #0a84ff, #30d158);
+}
+
+.quality-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.quality-stat-grid .mini-stat {
+  min-height: 60px;
+  border-radius: 10px;
+}
+
+.quality-stat-grid .mini-stat strong {
+  font-size: 18px;
+}
+
+.quality-section {
+  display: grid;
+  gap: 8px;
+}
+
+.quality-pill-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.quality-confidence-row {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(248, 250, 252, 0.72);
+}
+
+.quality-confidence-row strong {
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.quality-issue-list {
+  display: grid;
+  gap: 8px;
+}
+
+.quality-issue-list article {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: flex-start;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(248, 250, 252, 0.72);
+}
+
+.quality-issue-list strong {
+  display: block;
+  margin-bottom: 3px;
+  font-size: 13px;
+}
+
+.quality-issue-list p,
+.orphan-entrypoint-list p {
+  margin: 0;
+  color: #435168;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.orphan-entrypoint-list {
+  display: grid;
+  gap: 6px;
+}
+
+.quality-recommendations {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
+  color: #435168;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .source-error,
 .finding-note {
   margin: 0;
@@ -4611,6 +4827,7 @@ strong {
 [data-theme="dark"] .modal-card,
 [data-theme="dark"] .empty-state,
 [data-theme="dark"] .detail-card,
+[data-theme="dark"] .index-quality-panel,
 [data-theme="dark"] .info-box,
 [data-theme="dark"] .vuln-table-card,
 [data-theme="dark"] .vuln-analysis-card,
@@ -4646,6 +4863,8 @@ strong {
 [data-theme="dark"] .static-poc-panel,
 [data-theme="dark"] .poc-steps,
 [data-theme="dark"] .poc-note-block,
+[data-theme="dark"] .quality-confidence-row,
+[data-theme="dark"] .quality-issue-list article,
 [data-theme="dark"] .template-section,
 [data-theme="dark"] .history-list article,
 [data-theme="dark"] .process-step {

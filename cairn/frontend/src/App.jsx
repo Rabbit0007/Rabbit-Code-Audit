@@ -130,6 +130,38 @@ function sourceStatusTone(status) {
   }[status] || "muted";
 }
 
+function indexQualityGradeLabel(grade) {
+  return {
+    strong: "强",
+    usable: "可用",
+    weak: "偏弱",
+    poor: "不足",
+  }[grade] || "未知";
+}
+
+function indexQualityTone(grade) {
+  return {
+    strong: "success",
+    usable: "info",
+    weak: "warning",
+    poor: "danger",
+  }[grade] || "muted";
+}
+
+function indexIssueTone(severity) {
+  return {
+    critical: "danger",
+    warning: "warning",
+    info: "info",
+  }[severity] || "muted";
+}
+
+function sortedCountEntries(value, limit = 6) {
+  return Object.entries(value || {})
+    .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0) || a[0].localeCompare(b[0]))
+    .slice(0, limit);
+}
+
 function formatToolScanStatus(status) {
   return {
     pending: "等待中",
@@ -2080,6 +2112,7 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
   const [auditFindings, setAuditFindings] = useState([]);
   const [businessGraph, setBusinessGraph] = useState({ nodes: [], edges: [], conclusions: [] });
   const [sourceIndexSummary, setSourceIndexSummary] = useState(null);
+  const [sourceIndexQuality, setSourceIndexQuality] = useState(null);
   const [dynamicValidationPlan, setDynamicValidationPlan] = useState(null);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState(null);
@@ -2117,14 +2150,15 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
         projectSources.find((source) => source.status === "ready") ||
         projectSources[0] ||
         null;
-      const [plan, indexSummary, scanTasks, validationPlan] = selectedSource?.status === "ready"
+      const [plan, indexSummary, indexQuality, scanTasks, validationPlan] = selectedSource?.status === "ready"
         ? await Promise.all([
             apiRequest(`/api/projects/${projectId}/sources/${selectedSource.id}/tool-plan`).catch(() => []),
             apiRequest(`/api/projects/${projectId}/sources/${selectedSource.id}/index-summary`).catch(() => null),
+            apiRequest(`/api/projects/${projectId}/sources/${selectedSource.id}/index-quality`).catch(() => null),
             apiRequest(`/api/projects/${projectId}/tool-scan-tasks?snapshot_id=${encodeURIComponent(selectedSource.id)}`).catch(() => []),
             apiRequest(`/api/projects/${projectId}/sources/${selectedSource.id}/dynamic-validation-plan`).catch(() => null),
           ])
-        : [[], null, [], null];
+        : [[], null, null, [], null];
       setDetail(project);
       setTimeline(events);
       setToolPlan(plan);
@@ -2134,6 +2168,7 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
       setAuditCandidates(projectAuditCandidates);
       setAuditFindings(projectAuditFindings);
       setSourceIndexSummary(indexSummary);
+      setSourceIndexQuality(indexQuality);
       setDynamicValidationPlan(validationPlan);
       setBusinessGraph({
         nodes: Array.isArray(graph?.nodes) ? graph.nodes : [],
@@ -2299,6 +2334,17 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
       repositoryUrl: source.repository_url,
       ref: source.requested_ref || "",
     });
+  };
+
+  const reindexCurrentSource = async () => {
+    if (!currentSource || currentSource.status !== "ready") {
+      setToast({ type: "warning", message: "源码快照尚未准备完成，暂不能重建索引" });
+      return;
+    }
+    await runAction("源码索引已重建", () =>
+      apiRequest(`/api/projects/${project.id}/sources/${currentSource.id}/reindex`, { method: "POST" }),
+    );
+    await load();
   };
 
   const createToolScanTask = async ({ tools = [], timeout_per_tool = 180 } = {}) => {
@@ -2503,7 +2549,7 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
                 <span>结构索引</span>
                 <strong>
                   {sourceIndexSummary
-                    ? `${sourceIndexSummary.symbol_count} 符号 / ${sourceIndexSummary.entrypoint_count} 入口 / ${sourceIndexSummary.manifest_count} 依赖`
+                    ? `${sourceIndexSummary.symbol_count} 符号 / ${sourceIndexSummary.entrypoint_count} 入口 / ${sourceIndexSummary.relationship_count || 0} 关系`
                     : "未生成"}
                 </strong>
               </div>
@@ -2559,6 +2605,7 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
           sources={sources}
           currentSource={currentSource}
           selectedSourceId={currentSource?.id || ""}
+          sourceIndexQuality={sourceIndexQuality}
           dynamicValidationPlan={dynamicValidationPlan}
           onRefresh={load}
           runAction={runAction}
@@ -2572,6 +2619,7 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
           onSelectSource={(sourceId) => setSelectedSourceId(sourceId)}
           onImportSource={() => setModal("source-import")}
           onRetrySource={retrySourceImport}
+          onReindexSource={reindexCurrentSource}
           onCreateAuditFinding={() => setModal("audit-finding")}
           onConcludeAuditCandidate={(candidate) => setModal({ type: "candidate-conclusion", candidate })}
           onAddBusinessNode={() => setModal("business-node")}
@@ -2926,6 +2974,7 @@ function Inspector({
   sources,
   currentSource,
   selectedSourceId,
+  sourceIndexQuality,
   dynamicValidationPlan,
   onRefresh,
   runAction,
@@ -2939,6 +2988,7 @@ function Inspector({
   onSelectSource,
   onImportSource,
   onRetrySource,
+  onReindexSource,
   onCreateAuditFinding,
   onConcludeAuditCandidate,
   onAddBusinessNode,
@@ -3060,9 +3110,11 @@ function Inspector({
             sources={sources}
             currentSource={currentSource}
             selectedSourceId={selectedSourceId}
+            sourceIndexQuality={sourceIndexQuality}
             onSelectSource={onSelectSource}
             onImportSource={onImportSource}
             onRetrySource={onRetrySource}
+            onReindexSource={onReindexSource}
           />
         )}
         {tab === "hints" && (
@@ -3242,7 +3294,16 @@ function MaturityChecklist({ sources, currentSource, toolScanTasks, reportEnrich
   );
 }
 
-function SourceSnapshotPanel({ sources, currentSource, selectedSourceId, onSelectSource, onImportSource, onRetrySource }) {
+function SourceSnapshotPanel({
+  sources,
+  currentSource,
+  selectedSourceId,
+  sourceIndexQuality,
+  onSelectSource,
+  onImportSource,
+  onRetrySource,
+  onReindexSource,
+}) {
   return (
     <div className="source-panel">
       <div className="panel-toolbar">
@@ -3251,6 +3312,13 @@ function SourceSnapshotPanel({ sources, currentSource, selectedSourceId, onSelec
           导入新快照
         </button>
       </div>
+      {currentSource && (
+        <IndexQualityPanel
+          currentSource={currentSource}
+          quality={sourceIndexQuality}
+          onReindexSource={onReindexSource}
+        />
+      )}
       {sources.length === 0 ? (
         <EmptyState icon={Folder} title="暂无源码快照" subtitle="导入 Git 仓库或 ZIP 源码后会在这里生成不可变快照。" />
       ) : (
@@ -3295,6 +3363,162 @@ function SourceSnapshotPanel({ sources, currentSource, selectedSourceId, onSelec
         </div>
       )}
     </div>
+  );
+}
+
+function IndexQualityPanel({ currentSource, quality, onReindexSource }) {
+  if (currentSource.status !== "ready") {
+    return (
+      <section className="index-quality-panel">
+        <header>
+          <div>
+            <span>索引质量</span>
+            <strong>{formatSourceStatus(currentSource.status)}</strong>
+          </div>
+          <Badge tone={sourceStatusTone(currentSource.status)}>{currentSource.id}</Badge>
+        </header>
+      </section>
+    );
+  }
+
+  if (!quality) {
+    return (
+      <section className="index-quality-panel">
+        <header>
+          <div>
+            <span>索引质量</span>
+            <strong>未生成</strong>
+          </div>
+          <button className="ghost-button compact" type="button" onClick={onReindexSource}>
+            <RefreshCw size={16} />
+            重建索引
+          </button>
+        </header>
+      </section>
+    );
+  }
+
+  const summary = quality.summary || {};
+  const score = Number(quality.score || 0);
+  const entrypointTotal = Number(summary.entrypoint_count || 0);
+  const dataPathRatio = entrypointTotal ? `${quality.entrypoints_with_data_paths || 0}/${entrypointTotal}` : "-";
+  const confidence = quality.confidence || {};
+  const lowConfidence = quality.low_confidence || {};
+  const issues = quality.issues || [];
+  const recommendations = quality.recommendations || [];
+  const orphanEntryPoints = quality.orphan_entrypoints || [];
+  return (
+    <section className="index-quality-panel">
+      <header>
+        <div>
+          <span>索引质量</span>
+          <strong>{currentSource.id}</strong>
+        </div>
+        <div className="index-quality-actions">
+          <Badge tone={indexQualityTone(quality.grade)}>{indexQualityGradeLabel(quality.grade)}</Badge>
+          <button className="ghost-button compact" type="button" onClick={onReindexSource}>
+            <RefreshCw size={16} />
+            重建索引
+          </button>
+        </div>
+      </header>
+      <div className="quality-score-row">
+        <div className={cn("quality-score", indexQualityTone(quality.grade))}>
+          <strong>{score}</strong>
+          <span>/100</span>
+        </div>
+        <div className="quality-score-detail">
+          <div>
+            <span>结构覆盖</span>
+            <strong>
+              {summary.symbol_count || 0} 符号 / {summary.entrypoint_count || 0} 入口 / {summary.relationship_count || 0} 关系
+            </strong>
+          </div>
+          <div className="quality-meter" aria-hidden="true">
+            <span style={{ width: `${Math.max(0, Math.min(100, score))}%` }} />
+          </div>
+        </div>
+      </div>
+      <div className="quality-stat-grid">
+        <MiniStat label="代码文件" value={quality.code_file_count || 0} />
+        <MiniStat label="数据对象" value={quality.data_object_count || 0} />
+        <MiniStat label="入口数据链" value={dataPathRatio} />
+        <MiniStat label="低置信关系" value={lowConfidence.relationships || 0} />
+      </div>
+      <div className="quality-section">
+        <span>框架</span>
+        <div className="quality-pill-row">
+          {sortedCountEntries(quality.framework_counts).length ? (
+            sortedCountEntries(quality.framework_counts).map(([key, count]) => (
+              <Badge key={key} tone="info">
+                {key} {count}
+              </Badge>
+            ))
+          ) : (
+            <Badge>未识别</Badge>
+          )}
+        </div>
+      </div>
+      <div className="quality-section">
+        <span>关系</span>
+        <div className="quality-pill-row">
+          {sortedCountEntries(quality.relationship_counts).length ? (
+            sortedCountEntries(quality.relationship_counts).map(([key, count]) => (
+              <Badge key={key} tone="muted">
+                {key} {count}
+              </Badge>
+            ))
+          ) : (
+            <Badge>无关系</Badge>
+          )}
+        </div>
+      </div>
+      <div className="quality-confidence-row">
+        <span>平均置信度</span>
+        <strong>
+          symbols {confidence.symbols ?? 0} / entrypoints {confidence.entrypoints ?? 0} / relationships {confidence.relationships ?? 0}
+        </strong>
+      </div>
+      {issues.length > 0 && (
+        <div className="quality-section">
+          <span>问题</span>
+          <div className="quality-issue-list">
+            {issues.map((issue) => (
+              <article key={issue.code}>
+                <Badge tone={indexIssueTone(issue.severity)}>{issue.severity}</Badge>
+                <div>
+                  <strong>{issue.title}</strong>
+                  <p>{issue.description}</p>
+                </div>
+              </article>
+            ))}
+          </div>
+        </div>
+      )}
+      {orphanEntryPoints.length > 0 && (
+        <div className="quality-section">
+          <span>孤立入口</span>
+          <div className="orphan-entrypoint-list">
+            {orphanEntryPoints.slice(0, 5).map((entrypoint) => (
+              <p key={entrypoint.id}>
+                {entrypoint.method ? `${entrypoint.method} ` : ""}
+                {entrypoint.route} · {entrypoint.path}
+              </p>
+            ))}
+          </div>
+        </div>
+      )}
+      {recommendations.length > 0 && (
+        <div className="quality-section">
+          <span>修复建议</span>
+          <ul className="quality-recommendations">
+            {recommendations.slice(0, 4).map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
   );
 }
 

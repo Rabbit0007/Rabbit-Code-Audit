@@ -182,7 +182,9 @@ CREATE TABLE IF NOT EXISTS code_symbols (
     container TEXT,
     signature TEXT,
     line_start INTEGER,
-    line_end INTEGER
+    line_end INTEGER,
+    confidence REAL NOT NULL DEFAULT 0.8,
+    source TEXT NOT NULL DEFAULT 'heuristic'
 );
 
 CREATE INDEX IF NOT EXISTS idx_code_symbols_snapshot
@@ -201,13 +203,35 @@ CREATE TABLE IF NOT EXISTS code_entrypoints (
     route TEXT NOT NULL,
     handler TEXT,
     line_start INTEGER,
-    evidence TEXT
+    evidence TEXT,
+    confidence REAL NOT NULL DEFAULT 0.8,
+    source TEXT NOT NULL DEFAULT 'heuristic'
 );
 
 CREATE INDEX IF NOT EXISTS idx_code_entrypoints_snapshot
     ON code_entrypoints(snapshot_id, path, kind);
 CREATE INDEX IF NOT EXISTS idx_code_entrypoints_route
     ON code_entrypoints(snapshot_id, route);
+
+CREATE TABLE IF NOT EXISTS code_relationships (
+    id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
+    from_path TEXT NOT NULL,
+    from_symbol TEXT,
+    to_path TEXT NOT NULL,
+    to_symbol TEXT,
+    relation TEXT NOT NULL
+        CHECK(relation IN ('imports', 'calls', 'uses', 'references')),
+    evidence TEXT,
+    confidence REAL NOT NULL DEFAULT 0.55,
+    source TEXT NOT NULL DEFAULT 'heuristic',
+    line_start INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_relationships_snapshot
+    ON code_relationships(snapshot_id, from_path, relation);
+CREATE INDEX IF NOT EXISTS idx_code_relationships_target
+    ON code_relationships(snapshot_id, to_path, relation);
 
 CREATE TABLE IF NOT EXISTS dependency_manifests (
     id TEXT PRIMARY KEY,
@@ -293,6 +317,7 @@ CREATE TABLE IF NOT EXISTS business_nodes (
     last_intent_id TEXT,
     risk_tags_json TEXT NOT NULL DEFAULT '[]',
     evidence_json TEXT NOT NULL DEFAULT '[]',
+    source_snapshot_id TEXT,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -468,6 +493,22 @@ BUSINESS_NODE_COLUMNS: dict[str, str] = {
     ),
     "coverage_note": "TEXT",
     "last_intent_id": "TEXT",
+    "source_snapshot_id": "TEXT",
+    "confidence": "REAL NOT NULL DEFAULT 0.7",
+}
+
+BUSINESS_EDGE_COLUMNS: dict[str, str] = {
+    "confidence": "REAL NOT NULL DEFAULT 0.7",
+}
+
+CODE_SYMBOL_COLUMNS: dict[str, str] = {
+    "confidence": "REAL NOT NULL DEFAULT 0.8",
+    "source": "TEXT NOT NULL DEFAULT 'heuristic'",
+}
+
+CODE_ENTRYPOINT_COLUMNS: dict[str, str] = {
+    "confidence": "REAL NOT NULL DEFAULT 0.8",
+    "source": "TEXT NOT NULL DEFAULT 'heuristic'",
 }
 
 WORKER_TASK_HISTORY_COLUMNS: dict[str, str] = {
@@ -523,6 +564,9 @@ def configure_product_db() -> None:
         _ensure_vulnerability_columns(conn)
         _ensure_columns(conn, "audit_findings", AUDIT_FINDING_COLUMNS)
         _ensure_columns(conn, "business_nodes", BUSINESS_NODE_COLUMNS)
+        _ensure_columns(conn, "business_edges", BUSINESS_EDGE_COLUMNS)
+        _ensure_columns(conn, "code_symbols", CODE_SYMBOL_COLUMNS)
+        _ensure_columns(conn, "code_entrypoints", CODE_ENTRYPOINT_COLUMNS)
         _ensure_columns(conn, "worker_task_history", WORKER_TASK_HISTORY_COLUMNS)
         _ensure_columns(conn, "report_enrichment_tasks", REPORT_ENRICHMENT_COLUMNS)
         from cairn.server.services import sync_business_node_coverage_from_latest_conclusions
