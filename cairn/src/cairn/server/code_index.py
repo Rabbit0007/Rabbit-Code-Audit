@@ -29,6 +29,38 @@ GENERIC_WEB_SCRIPT_EXCLUDED_PARTS = {
     "vendor",
     "venv",
 }
+SYMBOL_RESERVED_NAMES = {
+    "case",
+    "catch",
+    "default",
+    "do",
+    "else",
+    "elseif",
+    "for",
+    "foreach",
+    "if",
+    "return",
+    "switch",
+    "try",
+    "while",
+    "with",
+}
+PHP_DIRECT_SCRIPT_NAME_RE = re.compile(
+    r"^(?:index|app|main|server|setup|install|upgrade|migrate|admin|login|logout|"
+    r"callback|webhook|test)(?:[-_.][A-Za-z0-9_.-]+)?\.php$",
+    re.IGNORECASE,
+)
+PHP_DECLARATION_START_RE = re.compile(
+    r"^\s*(?:final\s+|abstract\s+)?(?:function|class|interface|trait)\b",
+    re.IGNORECASE,
+)
+PHP_TOP_LEVEL_WEB_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\b|php://input"),
+    re.compile(r"\b(?:echo|print|printf|header|setcookie|http_response_code)\b", re.IGNORECASE),
+    re.compile(r"\b(?:session_start|move_uploaded_file)\s*\(", re.IGNORECASE),
+    re.compile(r"\b(?:DROP\s+DATABASE|CREATE\s+DATABASE|CREATE\s+TABLE|INSERT\s+INTO)\b", re.IGNORECASE),
+    re.compile(r"^\s*(?:<!doctype\s+html|<html\b|<body\b|<form\b)", re.IGNORECASE),
+)
 
 
 @dataclass(frozen=True)
@@ -183,6 +215,8 @@ SYMBOL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("function", re.compile(r"^\s*function\s+([A-Za-z_][\w]*)\s*\(", re.MULTILINE)),
     ("class", re.compile(r"^\s*(?:final\s+|abstract\s+)?class\s+([A-Za-z_][\w]*)\b", re.MULTILINE)),
     ("interface", re.compile(r"^\s*interface\s+([A-Za-z_][\w]*)\b", re.MULTILINE)),
+    ("class", re.compile(r"^\s*(?:(?:public|private|protected|static|final|abstract)\s+)*(?:class|enum|record)\s+([A-Za-z_][\w]*)\b", re.MULTILINE)),
+    ("interface", re.compile(r"^\s*(?:(?:public|private|protected|static|final|abstract)\s+)*interface\s+([A-Za-z_][\w]*)\b", re.MULTILINE)),
     ("function", re.compile(r"^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)\s*\(", re.MULTILINE)),
     ("function", re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_][\w]*)\s*\(", re.MULTILINE)),
     ("class", re.compile(r"^\s*(?:pub\s+)?(?:struct|enum)\s+([A-Za-z_][\w]*)\b", re.MULTILINE)),
@@ -198,6 +232,8 @@ def _regex_symbols(snapshot_id: str, file: CodeFile, text: str) -> list[CodeSymb
     for kind, pattern in SYMBOL_PATTERNS:
         for match in pattern.finditer(text):
             name = match.group(1)
+            if name.lower() in SYMBOL_RESERVED_NAMES:
+                continue
             line_start = text.count("\n", 0, match.start()) + 1
             key = (kind, name, line_start)
             if key in seen:
@@ -230,6 +266,7 @@ def _extract_entrypoints(
     records.extend(_python_entrypoints(snapshot_id, file, text))
     records.extend(_js_entrypoints(snapshot_id, file, text, string_constants=string_constants))
     records.extend(_php_entrypoints(snapshot_id, file, text))
+    records.extend(_csharp_entrypoints(snapshot_id, file, text))
     records.extend(_java_entrypoints(snapshot_id, file, text))
     records.extend(_go_entrypoints(snapshot_id, file, text))
     records.extend(_generic_web_script_entrypoints(snapshot_id, file, text))
@@ -241,15 +278,18 @@ def _python_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[Cod
         return []
     records: list[CodeEntrypointRecord] = []
     pending: list[tuple[int, str | None, str, str]] = []
-    route_pattern = re.compile(r"@\w+(?:\.\w+)*\.(get|post|put|delete|patch|options|head|route)\((.*)")
+    router_prefixes = _python_router_prefixes(text)
+    route_pattern = re.compile(r"@([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)*)\.(get|post|put|delete|patch|options|head|route)\((.*)")
     def_pattern = re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_][\w]*)\s*\(")
     for lineno, line in enumerate(text.splitlines(), start=1):
         route_match = route_pattern.search(line)
         if route_match:
-            method = route_match.group(1).upper()
-            args = route_match.group(2)
+            target = route_match.group(1).split(".")[-1]
+            method = route_match.group(2).upper()
+            args = route_match.group(3)
             route = _first_string(args)
             if route:
+                route = _join_routes(router_prefixes.get(target), route)
                 methods = _methods_from_args(args)
                 if method != "ROUTE":
                     methods = [method]
@@ -266,6 +306,56 @@ def _python_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[Cod
             pending = []
         elif line.strip() and not line.lstrip().startswith("@") and pending:
             pending = []
+    records.extend(_python_django_entrypoints(snapshot_id, file, text))
+    return records
+
+
+def _python_router_prefixes(text: str) -> dict[str, str]:
+    prefixes: dict[str, str] = {}
+    router_pattern = re.compile(
+        r"\b([A-Za-z_][\w]*)\s*=\s*(?:[A-Za-z_][\w]*\.)?(?:APIRouter|Blueprint)\(([^)\n]*)\)"
+    )
+    for match in router_pattern.finditer(text):
+        prefix = _keyword_string(match.group(2), "prefix") or _keyword_string(match.group(2), "url_prefix")
+        if prefix:
+            prefixes[match.group(1)] = prefix
+    register_pattern = re.compile(
+        r"\bregister_blueprint\(\s*([A-Za-z_][\w]*)\s*,[^)\n]*url_prefix\s*=\s*['\"]([^'\"]+)['\"]"
+    )
+    for match in register_pattern.finditer(text):
+        target = match.group(1)
+        prefixes[target] = _join_routes(match.group(2), prefixes.get(target))
+    include_pattern = re.compile(
+        r"\binclude_router\(\s*([A-Za-z_][\w]*)\s*,[^)\n]*prefix\s*=\s*['\"]([^'\"]+)['\"]"
+    )
+    for match in include_pattern.finditer(text):
+        target = match.group(1)
+        prefixes[target] = _join_routes(match.group(2), prefixes.get(target))
+    return prefixes
+
+
+def _python_django_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
+    records: list[CodeEntrypointRecord] = []
+    pattern = re.compile(r"\b(path|re_path)\(\s*r?['\"]([^'\"]+)['\"]\s*,\s*([^,\)\n]+)")
+    for match in pattern.finditer(text):
+        call, route, handler = match.group(1), match.group(2), match.group(3)
+        if call == "re_path":
+            route = route.strip("^").rstrip("$")
+        route = _join_routes(None, route)
+        line_start = _line_no(text, match.start())
+        records.append(
+            _entrypoint(
+                snapshot_id,
+                file,
+                "http_route",
+                "django",
+                None,
+                route,
+                _handler_text(handler),
+                line_start,
+                _line_at(text, line_start).strip(),
+            )
+        )
     return records
 
 
@@ -375,27 +465,73 @@ def _php_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEn
     return records
 
 
-def _java_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
-    if file.language not in {"Java", "Kotlin", "Scala", "C#"}:
+def _csharp_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
+    if file.language != "C#":
         return []
     records: list[CodeEntrypointRecord] = []
-    pattern = re.compile(r"@(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestMapping)\s*(?:\(([^)]*)\))?", re.IGNORECASE)
-    method_by_mapping = {
-        "GETMAPPING": "GET",
-        "POSTMAPPING": "POST",
-        "PUTMAPPING": "PUT",
-        "DELETEMAPPING": "DELETE",
-        "PATCHMAPPING": "PATCH",
-    }
     lines = text.splitlines()
-    for match in pattern.finditer(text):
-        mapping = match.group(1).upper()
-        args = match.group(2) or ""
-        route = _first_string(args) or "/"
-        method = method_by_mapping.get(mapping) or _request_method(args)
-        line_start = _line_no(text, match.start())
-        handler = _next_java_like_method(lines, line_start)
-        records.append(_entrypoint(snapshot_id, file, "http_route", "spring", method, route, handler, line_start, _line_at(text, line_start).strip()))
+    pending: list[tuple[int, str | None, str | None, str]] = []
+    class_prefix = ""
+    class_name: str | None = None
+    for lineno, line in enumerate(lines, start=1):
+        pending.extend(_csharp_route_attributes(line, lineno))
+        stripped = line.strip()
+        class_match = re.search(r"\bclass\s+([A-Za-z_][\w]*)", stripped)
+        if class_match:
+            class_name = class_match.group(1)
+            class_route = next((item[2] for item in reversed(pending) if item[1] is None and item[2] is not None), "")
+            class_prefix = _csharp_route_tokens(class_route or "", class_name, None)
+            pending = []
+            continue
+        handler = _csharp_method_name(stripped)
+        if handler and pending:
+            method_route = next((item[2] for item in reversed(pending) if item[2] is not None), "")
+            has_method_attr = any(item[1] is not None for item in pending)
+            for attr_lineno, method, route, evidence in pending:
+                if method is None and has_method_attr:
+                    continue
+                full_route = _join_routes(class_prefix, _csharp_route_tokens(route if route is not None else method_route, class_name, handler))
+                records.append(_entrypoint(snapshot_id, file, "http_route", "aspnet", method, full_route, handler, attr_lineno, evidence))
+            pending = []
+        elif stripped and not stripped.startswith("[") and pending:
+            pending = []
+    return records
+
+
+def _java_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
+    if file.language not in {"Java", "Kotlin", "Scala"}:
+        return []
+    records: list[CodeEntrypointRecord] = []
+    lines = text.splitlines()
+    pending: list[tuple[int, str, str | None, str | None, str]] = []
+    class_prefix = ""
+    class_jax_prefix = ""
+    for lineno, line in enumerate(lines, start=1):
+        pending.extend(_java_mapping_annotations(line, lineno))
+        stripped = line.strip()
+        if re.search(r"\b(?:class|interface|record)\s+[A-Za-z_][\w]*", stripped):
+            spring_routes = [item for item in pending if item[1] == "spring" and item[3] is not None]
+            jax_routes = [item for item in pending if item[1] == "jaxrs" and item[3] is not None]
+            class_prefix = spring_routes[-1][3] or "" if spring_routes else ""
+            class_jax_prefix = jax_routes[-1][3] or "" if jax_routes else ""
+            pending = []
+            continue
+        handler = _java_like_method_name(stripped)
+        if handler and pending:
+            method_route = next((item[3] for item in reversed(pending) if item[3] is not None), "")
+            for anno_lineno, framework, method, route, evidence in pending:
+                if framework == "jaxrs" and method is None:
+                    continue
+                if framework == "spring":
+                    if route is None and method is None:
+                        continue
+                    full_route = _join_routes(class_prefix, route if route is not None else method_route)
+                else:
+                    full_route = _join_routes(class_jax_prefix, route if route is not None else method_route)
+                records.append(_entrypoint(snapshot_id, file, "http_route", framework, method, full_route, handler, anno_lineno, evidence))
+            pending = []
+        elif stripped and not stripped.startswith("@") and pending:
+            pending = []
     return records
 
 
@@ -403,27 +539,156 @@ def _go_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEnt
     if file.language != "Go":
         return []
     records: list[CodeEntrypointRecord] = []
+    group_prefixes = _go_group_prefixes(text)
+    handler_name = r"([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?)"
     patterns = (
-        ("net/http", re.compile(r"http\.HandleFunc\(\s*['\"]([^'\"]+)['\"]\s*,\s*([A-Za-z_][\w]*)")),
-        ("gin", re.compile(r"\b(?:router|r|group)\.(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\(\s*['\"]([^'\"]+)['\"]\s*,\s*([A-Za-z_][\w]*)")),
+        ("net/http", re.compile(rf"http\.HandleFunc\(\s*['\"]([^'\"]+)['\"]\s*,\s*{handler_name}")),
+        ("net/http", re.compile(r"http\.Handle\(\s*['\"]([^'\"]+)['\"]\s*,\s*([A-Za-z_][\w.]*(?:\([^)]*\))?)")),
+        ("gin", re.compile(rf"\b(router|r|group)\.(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\(\s*['\"]([^'\"]+)['\"]\s*,\s*{handler_name}")),
+        ("go-router", re.compile(rf"\b([A-Za-z_][\w]*)\.(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\(\s*['\"]([^'\"]+)['\"]\s*,\s*{handler_name}")),
+        ("go-router", re.compile(rf"\b([A-Za-z_][\w]*)\.(Get|Post|Put|Delete|Patch|Options|Head)\(\s*['\"]([^'\"]+)['\"]\s*,\s*{handler_name}")),
+        ("mux", re.compile(rf"\b([A-Za-z_][\w]*)\.HandleFunc\(\s*['\"]([^'\"]+)['\"]\s*,\s*{handler_name}\s*\)\.Methods\(\s*([^)]+)\)")),
     )
     for framework, pattern in patterns:
         for match in pattern.finditer(text):
             if framework == "net/http":
                 method, route, handler = None, match.group(1), match.group(2)
+            elif framework == "mux":
+                method, route, handler = _go_http_method(match.group(4)), _join_routes(group_prefixes.get(match.group(1)), match.group(2)), match.group(3)
             else:
-                method, route, handler = match.group(1), match.group(2), match.group(3)
+                method, route, handler = match.group(2).upper(), _join_routes(group_prefixes.get(match.group(1)), match.group(3)), match.group(4)
             line_start = _line_no(text, match.start())
             records.append(_entrypoint(snapshot_id, file, "http_route", framework, method, route, handler, line_start, _line_at(text, line_start).strip()))
     return records
 
 
+CSHARP_HTTP_METHOD_BY_ATTR = {
+    "HTTPGET": "GET",
+    "HTTPPOST": "POST",
+    "HTTPPUT": "PUT",
+    "HTTPDELETE": "DELETE",
+    "HTTPPATCH": "PATCH",
+    "HTTPOPTIONS": "OPTIONS",
+    "HTTPHEAD": "HEAD",
+}
+CSHARP_ROUTE_ATTR_RE = re.compile(
+    r"\[(Route|HttpGet|HttpPost|HttpPut|HttpDelete|HttpPatch|HttpOptions|HttpHead)\s*(?:\((.*?)\))?\]",
+    re.IGNORECASE,
+)
+
+
+def _csharp_route_attributes(line: str, lineno: int) -> list[tuple[int, str | None, str | None, str]]:
+    items: list[tuple[int, str | None, str | None, str]] = []
+    for match in CSHARP_ROUTE_ATTR_RE.finditer(line):
+        attr = match.group(1).upper()
+        args = match.group(2) or ""
+        items.append((lineno, CSHARP_HTTP_METHOD_BY_ATTR.get(attr), _first_string(args), line.strip()))
+    return items
+
+
+def _csharp_method_name(line: str) -> str | None:
+    method_pattern = re.compile(
+        r"^(?:public|private|protected|internal|static|virtual|override|async|sealed|new|partial|\s)*"
+        r"(?:[A-Za-z_][\w<>\[\],.?]*(?:\s*<[^>]+>)?\s+)+([A-Za-z_][\w]*)\s*\("
+    )
+    match = method_pattern.search(line)
+    if not match:
+        return None
+    name = match.group(1)
+    return None if name in {"if", "for", "while", "switch", "catch"} else name
+
+
+def _csharp_route_tokens(route: str | None, class_name: str | None, handler: str | None) -> str:
+    text = route or ""
+    if class_name:
+        controller = class_name.removesuffix("Controller")
+        text = re.sub(r"\[controller\]", controller, text, flags=re.IGNORECASE)
+    if handler:
+        text = re.sub(r"\[action\]", handler, text, flags=re.IGNORECASE)
+    return text
+
+
+JAVA_SPRING_METHOD_BY_MAPPING = {
+    "GETMAPPING": "GET",
+    "POSTMAPPING": "POST",
+    "PUTMAPPING": "PUT",
+    "DELETEMAPPING": "DELETE",
+    "PATCHMAPPING": "PATCH",
+}
+JAVA_HTTP_METHOD_ANNOTATIONS = {
+    "GET",
+    "POST",
+    "PUT",
+    "DELETE",
+    "PATCH",
+    "OPTIONS",
+    "HEAD",
+}
+JAVA_SPRING_MAPPING_RE = re.compile(
+    r"@(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestMapping)\s*(?:\(([^)]*)\))?",
+    re.IGNORECASE,
+)
+JAVA_JAX_METHOD_RE = re.compile(r"@(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\b")
+JAVA_JAX_PATH_RE = re.compile(r"@Path\s*\(\s*['\"]([^'\"]+)['\"]\s*\)", re.IGNORECASE)
+
+
+def _java_mapping_annotations(line: str, lineno: int) -> list[tuple[int, str, str | None, str | None, str]]:
+    items: list[tuple[int, str, str | None, str | None, str]] = []
+    for match in JAVA_SPRING_MAPPING_RE.finditer(line):
+        mapping = match.group(1).upper()
+        args = match.group(2) or ""
+        route = _first_string(args)
+        method = JAVA_SPRING_METHOD_BY_MAPPING.get(mapping) or _request_method(args)
+        items.append((lineno, "spring", method, route, line.strip()))
+    path_match = JAVA_JAX_PATH_RE.search(line)
+    if path_match:
+        items.append((lineno, "jaxrs", None, path_match.group(1), line.strip()))
+    for match in JAVA_JAX_METHOD_RE.finditer(line):
+        method = match.group(1).upper()
+        if method in JAVA_HTTP_METHOD_ANNOTATIONS:
+            items.append((lineno, "jaxrs", method, None, line.strip()))
+    return items
+
+
+def _java_like_method_name(line: str) -> str | None:
+    method_pattern = re.compile(
+        r"^(?:public|private|protected|static|final|suspend|async|\s)*"
+        r"(?:[A-Za-z_<>\[\], ?]+\s+)?([A-Za-z_][\w]*)\s*\([^;{}]*\)"
+    )
+    match = method_pattern.search(line)
+    if not match:
+        return None
+    name = match.group(1)
+    return None if name in {"if", "for", "while", "switch", "catch"} else name
+
+
+def _go_group_prefixes(text: str) -> dict[str, str]:
+    prefixes: dict[str, str] = {}
+    pattern = re.compile(r"\b([A-Za-z_][\w]*)\s*:?=\s*([A-Za-z_][\w]*)\.Group\(\s*['\"]([^'\"]+)['\"]")
+    for line in text.splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        target, parent, route = match.group(1), match.group(2), match.group(3)
+        prefixes[target] = _join_routes(prefixes.get(parent), route)
+    return prefixes
+
+
+def _go_http_method(value: str) -> str | None:
+    text = value.strip()
+    string_match = re.search(r"['\"]([A-Za-z]+)['\"]", text)
+    if string_match:
+        return string_match.group(1).upper()
+    const_match = re.search(r"\bMethod([A-Za-z]+)\b", text)
+    if const_match:
+        return const_match.group(1).upper()
+    return None
+
+
 def _generic_web_script_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
+    if not is_likely_generic_web_script(file.path, text):
+        return []
     path = PurePosixPath(file.path)
-    if path.suffix.lower() not in GENERIC_WEB_SCRIPT_SUFFIXES:
-        return []
-    if any(part in GENERIC_WEB_SCRIPT_EXCLUDED_PARTS for part in path.parts):
-        return []
     return [
         _entrypoint(
             snapshot_id,
@@ -437,6 +702,65 @@ def _generic_web_script_entrypoints(snapshot_id: str, file: CodeFile, text: str)
             f"{file.path} is a web-executable script file",
         )
     ]
+
+
+def is_likely_generic_web_script(path: str, text: str | None = None) -> bool:
+    pure_path = PurePosixPath(path)
+    if pure_path.suffix.lower() not in GENERIC_WEB_SCRIPT_SUFFIXES:
+        return False
+    if any(part in GENERIC_WEB_SCRIPT_EXCLUDED_PARTS for part in pure_path.parts):
+        return False
+    if pure_path.suffix.lower() == ".php":
+        return text is not None and _is_likely_direct_php_script(pure_path, text)
+    return True
+
+
+def _is_likely_direct_php_script(path: PurePosixPath, text: str) -> bool:
+    """Heuristic for generic PHP entrypoints.
+
+    PHP projects often place helper files such as ``functions.php`` or
+    ``sql-connect.php`` under the web root. Treating every ``.php`` file as a
+    route overwhelms the audit graph. This keeps direct scripts that have
+    top-level request/response behavior, while leaving function-only include
+    files out of the entrypoint set.
+    """
+    if path.name.lower() == "index.php":
+        return True
+    if not PHP_DIRECT_SCRIPT_NAME_RE.match(path.name):
+        return _has_php_top_level_web_behavior(text)
+    return _has_php_top_level_web_behavior(text)
+
+
+def _has_php_top_level_web_behavior(text: str) -> bool:
+    declaration_depth = 0
+    pending_declaration = False
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith(("//", "#", "*")):
+            continue
+        if declaration_depth > 0:
+            declaration_depth += _brace_delta(stripped)
+            if declaration_depth <= 0:
+                declaration_depth = 0
+            continue
+        if pending_declaration:
+            if "{" in stripped:
+                declaration_depth = max(1, _brace_delta(stripped))
+                pending_declaration = False
+            continue
+        if PHP_DECLARATION_START_RE.match(stripped):
+            if "{" in stripped:
+                declaration_depth = max(1, _brace_delta(stripped))
+            else:
+                pending_declaration = True
+            continue
+        if any(pattern.search(stripped) for pattern in PHP_TOP_LEVEL_WEB_PATTERNS):
+            return True
+    return False
+
+
+def _brace_delta(text: str) -> int:
+    return text.count("{") - text.count("}")
 
 
 def _entrypoint(
@@ -580,6 +904,27 @@ def _line_at(text: str, line_no: int) -> str:
 def _first_string(value: str) -> str | None:
     match = re.search(r"['\"]([^'\"]+)['\"]", value)
     return match.group(1) if match else None
+
+
+def _keyword_string(value: str, key: str) -> str | None:
+    match = re.search(rf"\b{re.escape(key)}\s*=\s*['\"]([^'\"]+)['\"]", value)
+    return match.group(1) if match else None
+
+
+def _join_routes(prefix: str | None, route: str | None) -> str:
+    prefix_text = (prefix or "").strip()
+    route_text = (route or "").strip()
+    if route_text.startswith("^"):
+        route_text = route_text[1:]
+    if route_text.endswith("$"):
+        route_text = route_text[:-1]
+    if not prefix_text and not route_text:
+        return "/"
+    if not prefix_text:
+        return route_text if route_text.startswith("/") else f"/{route_text}"
+    if not route_text:
+        return prefix_text if prefix_text.startswith("/") else f"/{prefix_text}"
+    return f"/{prefix_text.strip('/')}/{route_text.strip('/')}"
 
 
 def _methods_from_args(value: str) -> list[str]:

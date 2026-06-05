@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 import uuid
 import zipfile
 
-from cairn.server.code_index import extract_code_index
+from cairn.server.code_index import extract_code_index, is_likely_generic_web_script
 from cairn.server import db
 from cairn.server.services import get_project_or_404, utcnow
 from cairn.server.source_models import (
@@ -42,7 +42,10 @@ LANGUAGE_BY_SUFFIX: dict[str, str] = {
     ".cc": "C++",
     ".cpp": "C++",
     ".cs": "C#",
+    ".css": "CSS",
     ".go": "Go",
+    ".htm": "HTML",
+    ".html": "HTML",
     ".java": "Java",
     ".js": "JavaScript",
     ".jsx": "JavaScript",
@@ -52,6 +55,7 @@ LANGUAGE_BY_SUFFIX: dict[str, str] = {
     ".rb": "Ruby",
     ".rs": "Rust",
     ".scala": "Scala",
+    ".sql": "SQL",
     ".ts": "TypeScript",
     ".tsx": "TypeScript",
     ".vue": "Vue",
@@ -776,7 +780,8 @@ def _insert_audit_candidates_from_index(
     for file in files:
         if file.is_binary or file.path in indexed_entrypoint_paths:
             continue
-        if not _is_web_script_candidate_path(file.path):
+        text = _read_candidate_text(source_root / file.path)
+        if not _is_web_script_candidate_path(file.path, text):
             continue
         route = f"/{file.path}"
         add_candidate(
@@ -799,7 +804,7 @@ def _insert_audit_candidates_from_index(
         if text is None:
             continue
         entry_point = entrypoint_by_path.get(file.path)
-        if entry_point is None and _is_web_script_candidate_path(file.path):
+        if entry_point is None and _is_web_script_candidate_path(file.path, text):
             entry_point = f"/{file.path}"
         for signal in _extract_risk_signals(text):
             add_candidate(
@@ -1079,10 +1084,12 @@ def _is_candidate_source_path(path: str) -> bool:
     return not any(part in WEB_SCRIPT_EXCLUDED_PARTS for part in parts)
 
 
-def _is_web_script_candidate_path(path: str) -> bool:
+def _is_web_script_candidate_path(path: str, text: str | None = None) -> bool:
     if PurePosixPath(path).suffix.lower() not in WEB_SCRIPT_SUFFIXES:
         return False
-    return _is_candidate_source_path(path)
+    if not _is_candidate_source_path(path):
+        return False
+    return is_likely_generic_web_script(path, text)
 
 
 def _read_candidate_text(path: Path) -> str | None:
@@ -1335,7 +1342,7 @@ def _index_snapshot(snapshot_id: str):
         if total_bytes + size > MAX_EXTRACTED_BYTES:
             raise ValueError(f"Source snapshot exceeds {MAX_EXTRACTED_BYTES} bytes")
         digest, is_binary = _hash_file(path)
-        language = LANGUAGE_BY_SUFFIX.get(path.suffix.lower())
+        language = _detect_language(path, is_binary)
         if language:
             languages[language] = languages.get(language, 0) + 1
         total_bytes += size
@@ -1378,6 +1385,22 @@ def _hash_file(path: Path) -> tuple[str, bool]:
                 first = chunk[:8192]
             digest.update(chunk)
     return digest.hexdigest(), b"\0" in first
+
+
+def _detect_language(path: Path, is_binary: bool) -> str | None:
+    language = LANGUAGE_BY_SUFFIX.get(path.suffix.lower())
+    if language or is_binary:
+        return language
+    try:
+        sample = path.read_bytes()[:4096].decode("utf-8", errors="ignore")
+    except OSError:
+        return None
+    stripped = sample.lstrip()
+    if stripped.startswith("<?php") or "<?php" in sample[:512]:
+        return "PHP"
+    if stripped.lower().startswith(("<!doctype html", "<html")):
+        return "HTML"
+    return None
 
 
 def _new_snapshot_id() -> str:

@@ -345,6 +345,151 @@ function healthHandler(req, res) { res.send("ok"); }
     assert {item["route"] for item in data["code_index"]["entrypoints"]} == {"/orders/{order_id}/refund", "/health"}
 
 
+def test_source_import_indexes_common_python_java_go_routes(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/api.py": b"""
+from fastapi import APIRouter, FastAPI
+from django.urls import path
+from . import views
+
+app = FastAPI()
+router = APIRouter(prefix="/api/v1")
+scoped_router = APIRouter(prefix="/users")
+app.include_router(scoped_router, prefix="/api/v2")
+
+@router.get("/users/{user_id}")
+def get_user(user_id: str):
+    return {"id": user_id}
+
+@scoped_router.post("/{user_id}/lock")
+def lock_user(user_id: str):
+    return {"id": user_id}
+
+urlpatterns = [
+    path("health/", views.health),
+]
+""",
+            "demo/UserController.java": b"""
+import javax.ws.rs.GET;
+import javax.ws.rs.Path;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api")
+public class UserController {
+    @GetMapping("/{id}")
+    public User getUser() {
+        return null;
+    }
+
+    @RequestMapping(value = "/search", method = RequestMethod.POST)
+    public List<User> search() {
+        return List.of();
+    }
+}
+
+@Path("/legacy")
+class LegacyResource {
+    @GET
+    @Path("/{id}")
+    public Response getLegacy() {
+        return null;
+    }
+}
+
+@RestController
+class AdminController {
+    @GetMapping("/admin")
+    public String admin() {
+        return "ok";
+    }
+}
+""",
+            "demo/main.go": b"""
+package main
+
+func main() {
+    http.HandleFunc("/ready", ready)
+    r.HandleFunc("/users/{id}", getUser).Methods("GET")
+    r.HandleFunc("/reports/{id}", reports.Show).Methods(http.MethodPost)
+    chiRouter.Get("/orders/{id}", getOrder)
+    app.Post("/fiber", createFiber)
+    e.GET("/echo", echoHandler)
+    router.GET("/gin", ginHandler)
+    api := router.Group("/api")
+    api.GET("/grouped", handlers.Grouped)
+    v1 := api.Group("/v1")
+    v1.Post("/nested", handlers.Nested)
+}
+
+func ready(w http.ResponseWriter, r *http.Request) {}
+func getUser(w http.ResponseWriter, r *http.Request) {}
+func getOrder(w http.ResponseWriter, r *http.Request) {}
+func createFiber(c *fiber.Ctx) error { return nil }
+func echoHandler(c echo.Context) error { return nil }
+func ginHandler(c *gin.Context) {}
+""",
+            "demo/UsersController.cs": b"""
+using Microsoft.AspNetCore.Mvc;
+
+[ApiController]
+[Route("api/[controller]")]
+public class UsersController : ControllerBase
+{
+    [HttpGet("{id}")]
+    public IActionResult Get(string id) {
+        return Ok();
+    }
+
+    [Route("search")]
+    [HttpPost]
+    public IActionResult Search() {
+        return Ok();
+    }
+}
+""",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("polyglot.zip", payload, "application/zip")},
+    ).json()
+
+    entrypoints = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/entrypoints").json()
+    route_methods = {(item["route"], item["method"]) for item in entrypoints}
+    assert {
+        ("/api/v1/users/{user_id}", "GET"),
+        ("/api/v2/users/{user_id}/lock", "POST"),
+        ("/health/", None),
+        ("/api/{id}", "GET"),
+        ("/api/search", "POST"),
+        ("/legacy/{id}", "GET"),
+        ("/admin", "GET"),
+        ("/ready", None),
+        ("/users/{id}", "GET"),
+        ("/reports/{id}", "POST"),
+        ("/orders/{id}", "GET"),
+        ("/fiber", "POST"),
+        ("/echo", "GET"),
+        ("/gin", "GET"),
+        ("/api/grouped", "GET"),
+        ("/api/v1/nested", "POST"),
+        ("/api/Users/{id}", "GET"),
+        ("/api/Users/search", "POST"),
+    } <= route_methods
+
+    frameworks = {item["framework"] for item in entrypoints}
+    assert {"python", "django", "spring", "jaxrs", "net/http", "mux", "go-router", "gin", "aspnet"} <= frameworks
+
+    symbols = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/symbols").json()
+    assert {"get_user", "lock_user", "UserController", "AdminController", "UsersController", "ready", "getUser"} <= {item["name"] for item in symbols}
+
+
 def test_source_import_indexes_satrda_routes_and_seeds_business_graph(temp_db, monkeypatch, tmp_path):
     monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
     client = _client(temp_db)
@@ -501,6 +646,66 @@ function loginHandler(req, res) { res.send("ok"); }
     assert data["audit_candidates"]["coverage"]["total"] == len(candidates) + 1
     assert data["audit_candidates"]["coverage"]["open_required"]
     assert any(item["id"] == manual.json()["id"] for item in data["audit_candidates"]["items"])
+
+
+def test_source_index_filters_php_include_noise_and_control_symbols(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/public/index.php": b"""<?php
+$id = $_GET['id'];
+echo $id;
+""",
+            "demo/includes/functions.php": b"""<?php
+function render_value($value) {
+    if ($value) {
+        echo $value;
+    }
+}
+""",
+            "demo/includes/sql-connect.php": b"""<?php
+$conn = mysql_connect("localhost", "root", "");
+mysql_select_db("security", $conn);
+""",
+            "demo/sql-connections/setup-db.php": b"""<?php
+$sql = "DROP DATABASE IF EXISTS security";
+mysql_query($sql);
+echo "done";
+""",
+            "demo/config/db-creds.inc": b"<?php $host = 'localhost';\n",
+            "demo/README.md": b"# Demo\n",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("php-noise.zip", payload, "application/zip")},
+    ).json()
+
+    assert snapshot["detected_languages"]["PHP"] == 5
+    assert "Markdown" not in snapshot["detected_languages"]
+
+    entrypoints = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/entrypoints").json()
+    assert {item["route"] for item in entrypoints} == {
+        "/public/index.php",
+        "/sql-connections/setup-db.php",
+    }
+    assert "includes/functions.php" not in {item["path"] for item in entrypoints}
+    assert "includes/sql-connect.php" not in {item["path"] for item in entrypoints}
+
+    symbols = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/symbols").json()
+    assert "render_value" in {item["name"] for item in symbols}
+    assert "if" not in {item["name"] for item in symbols}
+
+    candidates = client.get(f"/api/projects/{project_id}/audit-candidates").json()
+    entrypoint_paths = {
+        item["file_path"]
+        for item in candidates
+        if item["candidate_type"] in {"entrypoint", "web_entrypoint"}
+    }
+    assert entrypoint_paths == {"public/index.php", "sql-connections/setup-db.php"}
 
 
 def test_source_import_creates_data_flow_candidates_for_sql_sinks(temp_db, monkeypatch, tmp_path):
