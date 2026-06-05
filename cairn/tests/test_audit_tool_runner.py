@@ -221,6 +221,34 @@ def test_tool_scan_task_queue_cancel_and_retry(temp_db, monkeypatch, tmp_path):
     assert retried.json()["summaries"] == []
 
 
+def test_stale_running_tool_scan_is_recovered_to_pending(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("demo.zip", _zip_bytes({"app.py": b"print('ok')"}), "application/zip")},
+    ).json()
+    task = client.post(
+        f"/api/projects/{project_id}/sources/{snapshot['id']}/tool-scan-tasks",
+        json={"created_by": "tester", "tools": ["semgrep"], "timeout_per_tool": 30},
+    ).json()
+    claimed = client.post(f"/api/tool-scans/{task['id']}/claim", json={"worker": "dispatcher.tool_scan"})
+    assert claimed.status_code == 200
+    with db.get_conn() as conn:
+        conn.execute(
+            "UPDATE tool_scan_tasks SET last_heartbeat_at = '2020-01-01T00:00:00Z' WHERE id = ?",
+            (task["id"],),
+        )
+
+    pending = client.get("/api/tool-scans/pending", params={"project_id": project_id}).json()
+
+    assert [item["id"] for item in pending] == [task["id"]]
+    assert pending[0]["status"] == "pending"
+    assert pending[0]["worker"] is None
+    assert "Recovered stale tool scan task" in pending[0]["error_message"]
+
+
 def test_dispatcher_tool_scan_task_runs_tools_one_by_one():
     class _FakeResponse:
         status_code = 200

@@ -10,6 +10,8 @@ from fastapi import HTTPException
 from cairn.server.models import Intent, ProjectMeta, ProjectReason
 
 BUSINESS_NODE_COVERAGE_NOTE_LIMIT = 1000
+BACKGROUND_TASK_STALE_MIN_SECONDS = 60
+BACKGROUND_TASK_STALE_TIMEOUT_MULTIPLIER = 3
 
 
 def utcnow() -> str:
@@ -768,6 +770,10 @@ def get_reason_timeout(conn: sqlite3.Connection) -> int:
     return row["reason_timeout"]
 
 
+def get_background_task_timeout(conn: sqlite3.Connection) -> int:
+    return max(BACKGROUND_TASK_STALE_MIN_SECONDS, get_intent_timeout(conn) * BACKGROUND_TASK_STALE_TIMEOUT_MULTIPLIER)
+
+
 def project_reason_from_row(row: sqlite3.Row) -> ProjectReason | None:
     if row["reason_worker"] is None:
         return None
@@ -847,4 +853,50 @@ def expire_reason_leases(conn: sqlite3.Connection, project_id: str | None = None
         WHERE {where}
         """,
         params,
+    )
+
+
+def expire_report_enrichment_tasks(conn: sqlite3.Connection, project_id: str | None = None) -> None:
+    _expire_background_tasks(conn, "report_enrichment_tasks", "report enrichment", project_id)
+
+
+def expire_tool_scan_tasks(conn: sqlite3.Connection, project_id: str | None = None) -> None:
+    _expire_background_tasks(conn, "tool_scan_tasks", "tool scan", project_id)
+
+
+def _expire_background_tasks(
+    conn: sqlite3.Connection,
+    table: str,
+    label: str,
+    project_id: str | None,
+) -> None:
+    timeout = get_background_task_timeout(conn)
+    now = utcnow()
+    where = """
+        status = 'running'
+        AND (
+            last_heartbeat_at IS NULL
+            OR (julianday(?) - julianday(last_heartbeat_at)) * 86400 > ?
+        )
+    """
+    params: list[object] = [now, timeout]
+    if project_id is not None:
+        where = f"project_id = ? AND {where}"
+        params.insert(0, project_id)
+    expired = conn.execute(f"SELECT 1 FROM {table} WHERE {where} LIMIT 1", params).fetchone()
+    if expired is None:
+        return
+    message = f"Recovered stale {label} task after missing heartbeat for more than {timeout}s"
+    conn.execute(
+        f"""
+        UPDATE {table}
+        SET status = 'pending',
+            worker = NULL,
+            started_at = NULL,
+            last_heartbeat_at = NULL,
+            completed_at = NULL,
+            error_message = ?
+        WHERE {where}
+        """,
+        [message, *params],
     )

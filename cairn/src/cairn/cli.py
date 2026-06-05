@@ -5,6 +5,7 @@ import click
 import uvicorn
 
 from cairn.dispatcher.logging import configure_logging
+from cairn.dispatcher.runtime.instance_lock import DispatcherAlreadyRunning, DispatcherInstanceLock
 from cairn.dispatcher.scheduler.loop import DispatcherLoop
 from cairn.server import db, product_db
 
@@ -63,7 +64,12 @@ def dispatch(config_path: Path, once: bool, startup_healthcheck_only: bool, log_
         if startup_healthcheck_only:
             loop.run_startup_healthchecks_only()
             return
-        loop.run(once=once)
+        lock = DispatcherInstanceLock.for_config(config_path, loop.config)
+        with lock:
+            loop.run(once=once)
+    except DispatcherAlreadyRunning as exc:
+        loop.close()
+        raise click.ClickException(str(exc)) from exc
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
 

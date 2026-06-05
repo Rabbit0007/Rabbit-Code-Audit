@@ -15,6 +15,7 @@ from cairn.dispatcher.runtime.heartbeat import HeartbeatLease
 from cairn.dispatcher.tasks.common import (
     cancel_reason,
     did_timeout,
+    is_rate_limited,
     preview,
     run_healthcheck,
     run_worker_process,
@@ -117,6 +118,15 @@ def run_report_enrichment_task(
             return task_outcome("failed", error_type="timeout", result=result)
         if result.returncode != 0:
             detail = f"returncode={result.returncode}"
+            if is_rate_limited(detail, result.stdout, result.stderr):
+                client.release_report_enrichment(task_id, worker.name)
+                return task_outcome(
+                    "released",
+                    error_type="rate_limited",
+                    error_detail=detail,
+                    result=result,
+                    rate_limited=True,
+                )
             _fail_task(client, task_id, worker.name, detail)
             return task_outcome("failed", error_type="command_failed", error_detail=detail, result=result)
 
@@ -126,6 +136,15 @@ def run_report_enrichment_task(
             kind, data = validate_report_enrichment_payload(payload)
         except Exception as exc:
             detail = str(exc)
+            if is_rate_limited(detail, result.stdout, result.stderr):
+                client.release_report_enrichment(task_id, worker.name)
+                return task_outcome(
+                    "released",
+                    error_type="rate_limited",
+                    error_detail=detail,
+                    result=result,
+                    rate_limited=True,
+                )
             LOG.warning(
                 "report enrichment parse failed project=%s task=%s finding=%s worker=%s error=%s stdout_preview=%s stderr_preview=%s",
                 project.project.id,

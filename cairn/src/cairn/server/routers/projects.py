@@ -208,7 +208,7 @@ def claim_project_reason(project_id: str, body: ReasonClaimRequest):
             return project_meta_from_row(row)
 
         now = utcnow()
-        conn.execute(
+        updated_count = conn.execute(
             """
             UPDATE projects
             SET reason_worker = ?,
@@ -216,10 +216,21 @@ def claim_project_reason(project_id: str, body: ReasonClaimRequest):
                 reason_started_at = ?,
                 reason_last_heartbeat_at = ?
             WHERE id = ?
+              AND status = 'active'
+              AND reason_worker IS NULL
             """,
             (body.worker, body.trigger, now, now, project_id),
-        )
+        ).rowcount
         updated = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        if updated_count != 1:
+            if updated is None:
+                raise HTTPException(404, "Project not found")
+            current_worker = updated["reason_worker"]
+            if current_worker == body.worker:
+                return project_meta_from_row(updated)
+            if current_worker is not None:
+                raise HTTPException(409, f"Project reason is currently claimed by {current_worker}")
+            raise HTTPException(409, "Project reason claim was updated by another worker")
         return project_meta_from_row(updated)
 
 

@@ -30,6 +30,7 @@ from cairn.server.models import Intent, ProjectDetail, ProjectSummary
 LOG = logging.getLogger(__name__)
 UNHEALTHY_RETRY_AFTER_SECONDS = 5
 REJECTED_RETRY_AFTER_SECONDS = 5
+RATE_LIMIT_RETRY_AFTER_SECONDS = 120
 SOURCE_PREFLIGHT_RETRY_AFTER_SECONDS = 60
 REASON_PARSE_FAILURE_LIMIT = 3
 REASON_PARSE_FAILURE_RETRY_AFTER_SECONDS = 180
@@ -47,6 +48,7 @@ class WorkerSelection:
     worker: WorkerConfig | None
     blocked_busy: list[str]
     blocked_unhealthy: list[str]
+    blocked_rate_limited: list[str]
     blocked_rejected: list[str]
     blocked_task_type: list[str]
     blocked_disabled: list[str]
@@ -82,6 +84,7 @@ class DispatcherLoop:
         self.reason_checkpoints: dict[str, ReasonCheckpoint] = {}
         self.runtime_project_ids: set[str] = set()
         self.worker_unhealthy_until: dict[str, float] = {}
+        self.worker_rate_limited_until: dict[tuple[str, str], float] = {}
         self.worker_rejected_until: dict[tuple[str, str, str], float] = {}
         self.source_preflight_blocked_until: dict[tuple[str, str], float] = {}
         self.reason_failure_state: dict[str, ReasonFailureState] = {}
@@ -118,6 +121,9 @@ class DispatcherLoop:
             for key in list(self.worker_rejected_until):
                 if key[2] not in worker_names:
                     self.worker_rejected_until.pop(key, None)
+            for key in list(self.worker_rate_limited_until):
+                if key[1] not in worker_names:
+                    self.worker_rate_limited_until.pop(key, None)
 
     def enable_internal_state_tracking(self, history_size: int = 200) -> None:
         """Enable the optional read-only task-history buffer.
@@ -621,10 +627,11 @@ class DispatcherLoop:
             self._log_changed(
                 f"project:{project.project.id}:worker:reason",
                 logging.INFO,
-                "no worker available for reason project=%s blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s",
+                "no worker available for reason project=%s blocked_busy=%s blocked_unhealthy=%s blocked_rate_limited=%s blocked_rejected=%s",
                 project.project.id,
                 selection.blocked_busy,
                 selection.blocked_unhealthy,
+                selection.blocked_rate_limited,
                 selection.blocked_rejected,
             )
             return False
@@ -688,11 +695,12 @@ class DispatcherLoop:
             self._log_changed(
                 f"project:{project.project.id}:worker:bootstrap",
                 logging.INFO,
-                "no worker available for bootstrap project=%s intent=%s blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s",
+                "no worker available for bootstrap project=%s intent=%s blocked_busy=%s blocked_unhealthy=%s blocked_rate_limited=%s blocked_rejected=%s",
                 project.project.id,
                 intent.id,
                 selection.blocked_busy,
                 selection.blocked_unhealthy,
+                selection.blocked_rate_limited,
                 selection.blocked_rejected,
             )
             return False
@@ -750,11 +758,12 @@ class DispatcherLoop:
             self._log_changed(
                 f"project:{project.project.id}:worker:explore",
                 logging.INFO,
-                "no worker available for explore project=%s intent=%s blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s blocked_policy=%s",
+                "no worker available for explore project=%s intent=%s blocked_busy=%s blocked_unhealthy=%s blocked_rate_limited=%s blocked_rejected=%s blocked_policy=%s",
                 project.project.id,
                 intent.id,
                 selection.blocked_busy,
                 selection.blocked_unhealthy,
+                selection.blocked_rate_limited,
                 selection.blocked_rejected,
                 selection.blocked_policy,
             )
@@ -814,11 +823,12 @@ class DispatcherLoop:
             self._log_changed(
                 f"project:{project.project.id}:worker:report_enrichment",
                 logging.INFO,
-                "no worker available for report enrichment project=%s task=%s blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s",
+                "no worker available for report enrichment project=%s task=%s blocked_busy=%s blocked_unhealthy=%s blocked_rate_limited=%s blocked_rejected=%s",
                 project.project.id,
                 task_id,
                 selection.blocked_busy,
                 selection.blocked_unhealthy,
+                selection.blocked_rate_limited,
                 selection.blocked_rejected,
             )
             return False
@@ -877,6 +887,7 @@ class DispatcherLoop:
         candidates: list[WorkerConfig] = []
         blocked_busy: list[str] = []
         blocked_unhealthy: list[str] = []
+        blocked_rate_limited: list[str] = []
         blocked_rejected: list[str] = []
         blocked_task_type: list[str] = []
         blocked_disabled: list[str] = []
@@ -902,6 +913,10 @@ class DispatcherLoop:
             if unhealthy_until > now:
                 blocked_unhealthy.append(f"{worker.name}({unhealthy_until - now:.1f}s)")
                 continue
+            rate_limited_until = self.worker_rate_limited_until.get((task_type, worker.name), 0)
+            if rate_limited_until > now:
+                blocked_rate_limited.append(f"{worker.name}({rate_limited_until - now:.1f}s)")
+                continue
             rejected_until = self.worker_rejected_until.get((project_id, task_type, worker.name), 0)
             if rejected_until > now:
                 blocked_rejected.append(f"{worker.name}({rejected_until - now:.1f}s)")
@@ -909,11 +924,12 @@ class DispatcherLoop:
             candidates.append(worker)
         if not candidates:
             LOG.debug(
-                "worker selection project=%s task=%s no candidates blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s blocked_task_type=%s blocked_disabled=%s blocked_policy=%s",
+                "worker selection project=%s task=%s no candidates blocked_busy=%s blocked_unhealthy=%s blocked_rate_limited=%s blocked_rejected=%s blocked_task_type=%s blocked_disabled=%s blocked_policy=%s",
                 project_id,
                 task_type,
                 blocked_busy,
                 blocked_unhealthy,
+                blocked_rate_limited,
                 blocked_rejected,
                 blocked_task_type,
                 blocked_disabled,
@@ -923,6 +939,7 @@ class DispatcherLoop:
                 worker=None,
                 blocked_busy=blocked_busy,
                 blocked_unhealthy=blocked_unhealthy,
+                blocked_rate_limited=blocked_rate_limited,
                 blocked_rejected=blocked_rejected,
                 blocked_task_type=blocked_task_type,
                 blocked_disabled=blocked_disabled,
@@ -930,12 +947,13 @@ class DispatcherLoop:
             )
         ordered = choose_worker(candidates, running_counts)
         LOG.debug(
-            "worker selection project=%s task=%s candidates=%s blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s blocked_task_type=%s blocked_disabled=%s blocked_policy=%s chosen=%s",
+            "worker selection project=%s task=%s candidates=%s blocked_busy=%s blocked_unhealthy=%s blocked_rate_limited=%s blocked_rejected=%s blocked_task_type=%s blocked_disabled=%s blocked_policy=%s chosen=%s",
             project_id,
             task_type,
             [f"{worker.name}({running_counts.get(worker.name, 0)}/{worker.max_running},p{worker.priority})" for worker in candidates],
             blocked_busy,
             blocked_unhealthy,
+            blocked_rate_limited,
             blocked_rejected,
             blocked_task_type,
             blocked_disabled,
@@ -946,6 +964,7 @@ class DispatcherLoop:
             worker=ordered[0] if ordered else None,
             blocked_busy=blocked_busy,
             blocked_unhealthy=blocked_unhealthy,
+            blocked_rate_limited=blocked_rate_limited,
             blocked_rejected=blocked_rejected,
             blocked_task_type=blocked_task_type,
             blocked_disabled=blocked_disabled,
@@ -1269,6 +1288,17 @@ class DispatcherLoop:
                     )
                 else:
                     self.worker_unhealthy_until.pop(task.worker_name, None)
+                rate_limit_key = (task.task_type, task.worker_name)
+                if outcome.rate_limited and status != "success":
+                    self.worker_rate_limited_until[rate_limit_key] = time.time() + RATE_LIMIT_RETRY_AFTER_SECONDS
+                    LOG.warning(
+                        "worker rate limited; cooling down worker=%s task=%s retry_after=%.0fs",
+                        task.worker_name,
+                        task.task_type,
+                        RATE_LIMIT_RETRY_AFTER_SECONDS,
+                    )
+                elif status == "success":
+                    self.worker_rate_limited_until.pop(rate_limit_key, None)
                 rejection_key = (task.project_id, task.task_type, task.worker_name)
                 if outcome.error_type == "source_preflight_failed":
                     retry_until = time.time() + SOURCE_PREFLIGHT_RETRY_AFTER_SECONDS

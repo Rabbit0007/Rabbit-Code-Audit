@@ -192,6 +192,29 @@ def test_report_enrichment_queue_cancel_retry_and_dedupes_active_task(client, te
     assert retried.json()["reproduction_poc"] == {}
 
 
+def test_stale_running_report_enrichment_is_recovered_to_pending(client, temp_db):
+    _setup_confirmed_finding()
+    created = client.post(
+        "/api/projects/p1/report-enrichments",
+        json={"finding_id": "finding_1", "created_by": "tester"},
+    )
+    task_id = created.json()["id"]
+    claimed = client.post(f"/api/report-enrichments/{task_id}/claim", json={"worker": "reporter-1"})
+    assert claimed.status_code == 200
+    with db.get_conn() as conn:
+        conn.execute(
+            "UPDATE report_enrichment_tasks SET last_heartbeat_at = '2020-01-01T00:00:00Z' WHERE id = ?",
+            (task_id,),
+        )
+
+    pending = client.get("/api/report-enrichments/pending", params={"project_id": "p1"}).json()
+
+    assert [item["id"] for item in pending] == [task_id]
+    assert pending[0]["status"] == "pending"
+    assert pending[0]["worker"] is None
+    assert "Recovered stale report enrichment task" in pending[0]["error_message"]
+
+
 def test_complete_rejects_observed_response_in_packet_template(client, temp_db):
     _setup_confirmed_finding()
     created = client.post("/api/projects/p1/report-enrichments", json={"finding_id": "finding_1"})

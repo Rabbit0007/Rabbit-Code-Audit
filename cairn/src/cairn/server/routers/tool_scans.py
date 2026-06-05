@@ -6,7 +6,12 @@ import uuid
 from fastapi import APIRouter, HTTPException
 
 from cairn.server.db import get_conn
-from cairn.server.services import check_project_active, get_project_or_404, utcnow
+from cairn.server.services import (
+    check_project_active,
+    expire_tool_scan_tasks,
+    get_project_or_404,
+    utcnow,
+)
 from cairn.server.source_models import (
     ClaimToolScanTaskRequest,
     CompleteToolScanTaskRequest,
@@ -27,6 +32,7 @@ def list_project_tool_scan_tasks(
 ):
     with get_conn() as conn:
         get_project_or_404(conn, project_id)
+        expire_tool_scan_tasks(conn, project_id)
         clauses = ["project_id = ?"]
         params: list[object] = [project_id]
         if snapshot_id:
@@ -57,6 +63,7 @@ def create_tool_scan_task(project_id: str, snapshot_id: str, body: CreateToolSca
     now = utcnow()
     with get_conn() as conn:
         check_project_active(conn, project_id)
+        expire_tool_scan_tasks(conn, project_id)
         _validate_ready_snapshot(conn, project_id, snapshot_id)
         existing = conn.execute(
             """
@@ -106,6 +113,7 @@ def list_pending_tool_scan_tasks(project_id: str | None = None, limit: int = 10)
         params.append(project_id)
     params.append(limit)
     with get_conn() as conn:
+        expire_tool_scan_tasks(conn, project_id)
         rows = conn.execute(
             f"""
             SELECT t.*
@@ -138,6 +146,7 @@ def list_tool_scan_task_queue(
     params.append(limit)
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with get_conn() as conn:
+        expire_tool_scan_tasks(conn)
         rows = conn.execute(
             f"""
             SELECT t.*, p.title AS project_title, s.source_type, s.resolved_commit,
@@ -172,6 +181,9 @@ def claim_tool_scan_task(task_id: str, body: ClaimToolScanTaskRequest):
         if row is None:
             raise HTTPException(404, "Tool scan task not found")
         check_project_active(conn, row["project_id"])
+        expire_tool_scan_tasks(conn, row["project_id"])
+        row = conn.execute("SELECT * FROM tool_scan_tasks WHERE id = ?", (task_id,)).fetchone()
+        assert row is not None
         if row["status"] != "pending":
             raise HTTPException(409, f"Tool scan task is {row['status']}")
         conn.execute(
@@ -182,7 +194,7 @@ def claim_tool_scan_task(task_id: str, body: ClaimToolScanTaskRequest):
                 started_at = COALESCE(started_at, ?),
                 last_heartbeat_at = ?,
                 error_message = NULL
-            WHERE id = ? AND status = 'pending'
+            WHERE id = ? AND status = 'pending' AND worker IS NULL
             """,
             (body.worker, now, now, task_id),
         )

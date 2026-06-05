@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from cairn.server.db import get_conn
 from cairn.server.models import (
@@ -80,15 +80,30 @@ def heartbeat(project_id: str, intent_id: str, body: HeartbeatRequest):
         get_claimable_open_intent_or_404(conn, project_id, intent_id, body.worker)
 
         now = utcnow()
-        conn.execute(
-            "UPDATE intents SET worker = ?, last_heartbeat_at = ? WHERE id = ? AND project_id = ?",
-            (body.worker, now, intent_id, project_id),
-        )
+        updated_count = conn.execute(
+            """
+            UPDATE intents
+            SET worker = ?, last_heartbeat_at = ?
+            WHERE id = ?
+              AND project_id = ?
+              AND to_fact_id IS NULL
+              AND (worker IS NULL OR worker = ?)
+            """,
+            (body.worker, now, intent_id, project_id, body.worker),
+        ).rowcount
 
         updated = conn.execute(
             "SELECT * FROM intents WHERE id = ? AND project_id = ?",
             (intent_id, project_id),
         ).fetchone()
+        if updated_count != 1:
+            if updated is None:
+                raise HTTPException(404, "Intent not found")
+            if updated["to_fact_id"] is not None:
+                raise HTTPException(409, "Intent already concluded")
+            if updated["worker"] is not None and updated["worker"] != body.worker:
+                raise HTTPException(409, f"Intent is currently claimed by {updated['worker']}")
+            raise HTTPException(409, "Intent claim was updated by another worker")
         return intent_to_model(conn, updated, project_id)
 
 
@@ -126,13 +141,32 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
         now = utcnow()
         fid = next_fact_id(conn, project_id)
 
+        updated_count = conn.execute(
+            """
+            UPDATE intents
+            SET to_fact_id = ?, worker = ?, last_heartbeat_at = ?, concluded_at = ?
+            WHERE id = ?
+              AND project_id = ?
+              AND to_fact_id IS NULL
+              AND (worker IS NULL OR worker = ?)
+            """,
+            (fid, body.worker, now, now, intent_id, project_id, body.worker),
+        ).rowcount
+        if updated_count != 1:
+            updated = conn.execute(
+                "SELECT * FROM intents WHERE id = ? AND project_id = ?",
+                (intent_id, project_id),
+            ).fetchone()
+            if updated is None:
+                raise HTTPException(404, "Intent not found")
+            if updated["to_fact_id"] is not None:
+                raise HTTPException(409, "Intent already concluded")
+            if updated["worker"] is not None and updated["worker"] != body.worker:
+                raise HTTPException(409, f"Intent is currently claimed by {updated['worker']}")
+            raise HTTPException(409, "Intent conclude was updated by another worker")
         conn.execute(
             "INSERT INTO facts (id, project_id, description) VALUES (?, ?, ?)",
             (fid, project_id, body.description),
-        )
-        conn.execute(
-            "UPDATE intents SET to_fact_id = ?, worker = ?, last_heartbeat_at = ?, concluded_at = ? WHERE id = ? AND project_id = ?",
-            (fid, body.worker, now, now, intent_id, project_id),
         )
 
         updated = conn.execute(

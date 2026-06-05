@@ -14,7 +14,12 @@ from cairn.server.report_models import (
     FailReportEnrichmentRequest,
     ReportEnrichmentTask,
 )
-from cairn.server.services import check_project_active, get_project_or_404, utcnow
+from cairn.server.services import (
+    check_project_active,
+    expire_report_enrichment_tasks,
+    get_project_or_404,
+    utcnow,
+)
 from cairn.server.source_service import snapshot_container_path, snapshot_path
 
 
@@ -29,6 +34,7 @@ def list_project_report_enrichments(
 ):
     with get_conn() as conn:
         get_project_or_404(conn, project_id)
+        expire_report_enrichment_tasks(conn, project_id)
         clauses = ["project_id = ?"]
         params: list[object] = [project_id]
         if finding_id:
@@ -55,6 +61,7 @@ def create_report_enrichment(project_id: str, body: CreateReportEnrichmentReques
     now = utcnow()
     with get_conn() as conn:
         get_project_or_404(conn, project_id)
+        expire_report_enrichment_tasks(conn, project_id)
         finding = conn.execute(
             """
             SELECT id, status
@@ -106,6 +113,7 @@ def list_pending_report_enrichments(project_id: str | None = None, limit: int = 
         params.append(project_id)
     params.append(limit)
     with get_conn() as conn:
+        expire_report_enrichment_tasks(conn, project_id)
         rows = conn.execute(
             f"""
             SELECT t.*
@@ -145,6 +153,7 @@ def list_report_enrichment_task_queue(
     params.append(limit)
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with get_conn() as conn:
+        expire_report_enrichment_tasks(conn, project_id)
         rows = conn.execute(
             f"""
             SELECT t.*, p.title AS project_title, f.title AS finding_title,
@@ -179,6 +188,9 @@ def claim_report_enrichment(task_id: str, body: ClaimReportEnrichmentRequest):
         if row is None:
             raise HTTPException(404, "Report enrichment task not found")
         check_project_active(conn, row["project_id"])
+        expire_report_enrichment_tasks(conn, row["project_id"])
+        row = conn.execute("SELECT * FROM report_enrichment_tasks WHERE id = ?", (task_id,)).fetchone()
+        assert row is not None
         if row["status"] != "pending":
             raise HTTPException(409, f"Report enrichment task is {row['status']}")
         conn.execute(
@@ -189,11 +201,13 @@ def claim_report_enrichment(task_id: str, body: ClaimReportEnrichmentRequest):
                 started_at = COALESCE(started_at, ?),
                 last_heartbeat_at = ?,
                 error_message = NULL
-            WHERE id = ? AND status = 'pending'
+            WHERE id = ? AND status = 'pending' AND worker IS NULL
             """,
             (body.worker, now, now, task_id),
         )
         updated = conn.execute("SELECT * FROM report_enrichment_tasks WHERE id = ?", (task_id,)).fetchone()
+        if updated is None or updated["status"] != "running" or updated["worker"] != body.worker:
+            raise HTTPException(409, "Report enrichment task was claimed by another worker")
     assert updated is not None
     return _task_from_row(updated)
 

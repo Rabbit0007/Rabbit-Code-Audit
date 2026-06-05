@@ -88,10 +88,11 @@ class _FakeProcess:
 
 
 class _FakeContainerManager:
-    def __init__(self, execute_stdout: str) -> None:
+    def __init__(self, execute_stdout: str = "", execute_result: ProcessResult | None = None) -> None:
         self.commands: list[list[str]] = []
         self.writes: dict[str, str] = {}
         self._execute_stdout = execute_stdout
+        self._execute_result = execute_result
 
     def ensure_running(self, project_id: str) -> str:
         return "container-1"
@@ -109,6 +110,8 @@ class _FakeContainerManager:
         self.commands.append(command)
         if command == ["healthcheck"]:
             return _FakeProcess(ProcessResult(returncode=0, stdout="", stderr=""))
+        if self._execute_result is not None:
+            return _FakeProcess(self._execute_result)
         return _FakeProcess(ProcessResult(returncode=0, stdout=self._execute_stdout, stderr=""))
 
 
@@ -117,11 +120,13 @@ class _FakeClient:
         self.evidence_packet = evidence_packet
         self.completed_payload: dict | None = None
         self.failed: str | None = None
+        self.released = False
 
     def report_enrichment_heartbeat(self, task_id: str, worker: str) -> ApiResult:
         return ApiResult(status_code=200, data={})
 
     def release_report_enrichment(self, task_id: str, worker: str) -> ApiResult:
+        self.released = True
         return ApiResult(status_code=200, data={})
 
     def get_report_enrichment_packet(self, task_id: str) -> dict:
@@ -191,3 +196,33 @@ def test_report_enrichment_large_evidence_packet_is_written_to_file(monkeypatch)
     assert large_marker not in driver.prompts[0]
     assert "evidence_packet.json" in driver.prompts[0]
     assert max(len(arg) for command in container_manager.commands for arg in command) < 10_000
+
+
+def test_report_enrichment_rate_limit_releases_task(monkeypatch):
+    evidence_packet = {"finding": {"id": "finding_1", "status": "confirmed"}}
+    driver = _FakeDriver()
+    monkeypatch.setattr(report_enrichment, "get_driver", lambda worker_type: driver)
+
+    config = _config()
+    client = _FakeClient(evidence_packet)
+    container_manager = _FakeContainerManager(
+        execute_result=ProcessResult(returncode=1, stdout="", stderr="429 rate limit exceeded")
+    )
+    project = SimpleNamespace(project=SimpleNamespace(id="proj_1"))
+
+    outcome: TaskOutcome = report_enrichment.run_report_enrichment_task(
+        config,
+        client,
+        container_manager,
+        project,
+        {"id": "rpt_1", "finding_id": "finding_1"},
+        config.workers[0],
+        TaskCancellation(),
+    )
+
+    assert outcome.status == "released"
+    assert outcome.error_type == "rate_limited"
+    assert outcome.rate_limited is True
+    assert client.released is True
+    assert client.failed is None
+    assert client.completed_payload is None
