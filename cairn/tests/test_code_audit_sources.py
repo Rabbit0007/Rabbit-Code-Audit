@@ -9,12 +9,15 @@ import yaml
 
 from cairn.dispatcher.contracts import validate_explore_payload
 from cairn.server import db
-from cairn.server.routers import business_graph, export, findings, projects, sources, vulnerabilities
+from cairn.server.routers import business_graph, export, findings, intents, projects, sources, vulnerabilities
+from cairn.server.services import utcnow
+from cairn.server.source_service import rebuild_source_index
 
 
 def _app(temp_db) -> FastAPI:
     app = FastAPI()
     app.include_router(projects.router)
+    app.include_router(intents.router)
     app.include_router(sources.router)
     app.include_router(findings.router)
     app.include_router(business_graph.router)
@@ -202,13 +205,53 @@ def test_explore_payload_accepts_structured_finding_and_review():
         {
             "accepted": True,
             "data": {
-                "description": "independent review completed",
+                "description": "confirmation completed",
                 "reviews": [{"finding_id": "finding_1", "decision": "confirmed"}],
             },
         }
     )
     assert review_result["review"]["finding_id"] == "finding_1"
     assert review_result["reviews"][0]["finding_id"] == "finding_1"
+
+
+def test_candidate_confirmed_without_finding_id_does_not_fail_whole_payload():
+    _, missing_evidence = validate_explore_payload(
+        {
+            "accepted": True,
+            "data": {
+                "description": "candidate review",
+                "candidate_conclusions": [
+                    {
+                        "candidate_id": "cand_1",
+                        "decision": "confirmed",
+                        "summary": "model asserted vulnerability but did not bind finding",
+                    }
+                ],
+            },
+        }
+    )
+    assert missing_evidence["candidate_conclusions"] == []
+
+    _, with_evidence = validate_explore_payload(
+        {
+            "accepted": True,
+            "data": {
+                "description": "candidate review",
+                "candidate_conclusions": [
+                    {
+                        "candidate_id": "cand_1",
+                        "decision": "confirmed",
+                        "summary": "source path looks vulnerable but no finding id was emitted",
+                        "evidence": "app/search.php:12 concatenates q into SQL; finding object missing",
+                    }
+                ],
+            },
+        }
+    )
+    conclusion = with_evidence["candidate_conclusions"][0]
+    assert conclusion["decision"] == "needs_more_evidence"
+    assert conclusion["audit_finding_id"] is None
+    assert conclusion["evidence"] == "app/search.php:12 concatenates q into SQL; finding object missing"
 
 
 def test_zip_source_import_creates_immutable_snapshot_and_file_index(temp_db, monkeypatch, tmp_path):
@@ -302,6 +345,82 @@ function healthHandler(req, res) { res.send("ok"); }
     assert {item["route"] for item in data["code_index"]["entrypoints"]} == {"/orders/{order_id}/refund", "/health"}
 
 
+def test_source_import_indexes_satrda_routes_and_seeds_business_graph(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/server/plugins/erp/util.js": b"""
+(function(root) {
+  root.ApiPre = "/erp";
+})(typeof window !== "undefined" ? window : null);
+""",
+            "demo/server/plugins/erp/erp.js": b"""
+let fileSvr = {
+  _all(ctx, r, w, key) {
+    ctx.serveContent("myfile/" + key);
+  }
+};
+satrda.Router.all(ApiPre + "/file", fileSvr);
+""",
+            "demo/server/plugins/erp/h5dw.js": b"""
+let dw = {
+  saveReport(ctx, r, w) {
+    const param = r.jsonBody;
+    const { key, filename, dw } = param;
+    const filepath = `./plugins/data/${filename}`;
+    satrda.writeFile(filepath, JSON.stringify(dw));
+    w.write({ status: 0, msg: "ok" });
+  }
+};
+satrda.Router.all(ApiPre + "/h5dw", dw);
+""",
+            "demo/server/plugins/erp/user.js": b"""
+let profile = {
+  query(ctx, r, w) {
+    const session = ctx.getSession();
+    w.write({ code: 200, userId: session.get("userId") });
+  }
+};
+satrda.Router.all(ApiPre + "/system/user/profile", profile);
+""",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("satrda.zip", payload, "application/zip")},
+    ).json()
+
+    entrypoints = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/entrypoints").json()
+    assert {item["route"] for item in entrypoints} >= {
+        "/erp/file",
+        "/erp/h5dw",
+        "/erp/system/user/profile",
+    }
+    assert {item["framework"] for item in entrypoints} == {"satrda"}
+
+    candidates = client.get(f"/api/projects/{project_id}/audit-candidates").json()
+    assert any(item["entry_point"] == "/erp/file" for item in candidates)
+    file_write = next(
+        item
+        for item in candidates
+        if item["candidate_type"] == "data_flow"
+        and item["file_path"] == "server/plugins/erp/h5dw.js"
+        and "文件/包含操作面" in item["title"]
+    )
+    assert file_write["business_node_id"]
+
+    graph = client.get(f"/api/projects/{project_id}/business-graph").json()
+    endpoint_titles = {node["title"] for node in graph["nodes"] if node["node_type"] == "endpoint"}
+    assert {"入口 /erp/file", "入口 /erp/h5dw", "入口 /erp/system/user/profile"} <= endpoint_titles
+    risk_nodes = [node for node in graph["nodes"] if node["node_type"] == "risk"]
+    assert any("文件/包含操作面" in node["title"] for node in risk_nodes)
+    assert any(node["risk_level"] == "unknown" for node in risk_nodes)
+    assert graph["edges"]
+
+
 def test_source_import_creates_generic_audit_candidates(temp_db, monkeypatch, tmp_path):
     monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
     client = _client(temp_db)
@@ -325,9 +444,22 @@ function loginHandler(req, res) { res.send("ok"); }
 
     candidates = client.get(f"/api/projects/{project_id}/audit-candidates").json()
     candidate_types = {item["candidate_type"] for item in candidates}
-    assert {"entrypoint", "web_entrypoint"} <= candidate_types
+    assert {"entrypoint", "data_flow"} <= candidate_types
     assert all(item["severity"] == "unknown" for item in candidates)
     assert "vendor/package/ignored.php" not in {item["file_path"] for item in candidates}
+    assert any(
+        item["candidate_type"] == "data_flow"
+        and item["file_path"] == "public/index.php"
+        and "不代表已确认漏洞" in item["description"]
+        for item in candidates
+    )
+
+    entrypoints = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/entrypoints").json()
+    assert any(
+        item["framework"] == "web_script"
+        and item["route"] == "/public/index.php"
+        for item in entrypoints
+    )
 
     manual = client.post(
         f"/api/projects/{project_id}/audit-candidates",
@@ -369,6 +501,239 @@ function loginHandler(req, res) { res.send("ok"); }
     assert data["audit_candidates"]["coverage"]["total"] == len(candidates) + 1
     assert data["audit_candidates"]["coverage"]["open_required"]
     assert any(item["id"] == manual.json()["id"] for item in data["audit_candidates"]["items"])
+
+
+def test_source_import_creates_data_flow_candidates_for_sql_sinks(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/Less-1/index.php": b"""<?php
+$id=$_GET['id'];
+$sql="SELECT * FROM users WHERE id='$id' LIMIT 0,1";
+$result=mysql_query($sql);
+echo "ok";
+""",
+            "demo/Less-2/index.php": b"""<?php
+$id=$_GET['id'];
+$sql="SELECT * FROM users WHERE id=$id LIMIT 0,1";
+$result=mysql_query($sql);
+echo "ok";
+""",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("sqli.zip", payload, "application/zip")},
+    ).json()
+
+    entrypoints = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/entrypoints").json()
+    assert {item["route"] for item in entrypoints} == {"/Less-1/index.php", "/Less-2/index.php"}
+
+    candidates = client.get(f"/api/projects/{project_id}/audit-candidates").json()
+    sql_candidates = [
+        item
+        for item in candidates
+        if item["candidate_type"] == "data_flow" and "SQL 注入面" in item["title"]
+    ]
+    assert len(sql_candidates) == 2
+    assert {item["file_path"] for item in sql_candidates} == {"Less-1/index.php", "Less-2/index.php"}
+    assert {item["symbol"] for item in sql_candidates} == {"id"}
+    assert all(item["status"] == "candidate" for item in sql_candidates)
+
+
+def test_source_index_does_not_tie_far_same_name_input_to_sink(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    filler = "\n".join("$noop = 1;" for _ in range(85))
+
+    payload = _zip_bytes(
+        {
+            "demo/app.php": (
+                "<?php\n"
+                "$id=$_GET['id'];\n"
+                f"{filler}\n"
+                "$sql=\"SELECT * FROM users WHERE id=$id\";\n"
+                "$result=mysql_query($sql);\n"
+            ).encode(),
+        }
+    )
+    client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("far.zip", payload, "application/zip")},
+    )
+
+    candidates = client.get(f"/api/projects/{project_id}/audit-candidates").json()
+    assert not [
+        item
+        for item in candidates
+        if item["candidate_type"] == "data_flow" and "SQL 注入面" in item["title"]
+    ]
+
+
+def test_rebuild_source_index_closes_new_candidates_for_completed_project(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/app.php": b"""<?php
+$id=$_GET['id'];
+$sql="SELECT * FROM users WHERE id=$id";
+$result=mysql_query($sql);
+""",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("legacy.zip", payload, "application/zip")},
+    ).json()
+
+    with db.get_conn() as conn:
+        conn.execute("DELETE FROM audit_candidates WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM business_nodes WHERE project_id = ?", (project_id,))
+        conn.execute("UPDATE projects SET status = 'completed' WHERE id = ?", (project_id,))
+
+    rebuild_source_index(snapshot["id"])
+
+    candidates = client.get(f"/api/projects/{project_id}/audit-candidates").json()
+    assert candidates
+    assert {item["status"] for item in candidates} == {"needs_more_evidence"}
+    assert all(item["conclusion_summary"] for item in candidates)
+    assert all(item["evidence"] for item in candidates)
+    assert all(item["business_node_id"] for item in candidates if item["candidate_type"] == "data_flow")
+
+
+def test_export_profiles_focus_graph_context_and_validation_strategy(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/docker-compose.yml": b"services:\n  app:\n    image: php:8.2-apache\n",
+            "demo/Less-1/index.php": b"""<?php
+$id=$_GET['id'];
+$sql="SELECT * FROM users WHERE id='$id'";
+$result=mysql_query($sql);
+""",
+            "demo/Less-2/index.php": b"""<?php
+$id=$_GET['id'];
+$sql="SELECT * FROM users WHERE id=$id";
+$result=mysql_query($sql);
+""",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("focus.zip", payload, "application/zip")},
+    ).json()
+    assert snapshot["status"] == "ready"
+
+    candidates = client.get(f"/api/projects/{project_id}/audit-candidates").json()
+    focused = next(
+        item for item in candidates if item["candidate_type"] == "data_flow" and item["file_path"] == "Less-1/index.php"
+    )
+    intent = client.post(
+        f"/projects/{project_id}/intents",
+        json={
+            "from": ["origin"],
+            "description": f"审计候选 {focused['id']} 对应的 SQL 数据流，只关闭这个候选。",
+            "creator": "reason-worker",
+            "worker": None,
+        },
+    ).json()
+
+    exported = client.get(
+        f"/projects/{project_id}/export",
+        params={"format": "yaml", "profile": "explore", "intent_id": intent["id"]},
+    )
+    data = yaml.safe_load(exported.text)
+    assert data["context_profile"]["profile"] == "explore"
+    assert data["context_profile"]["focused_candidate_ids"] == [focused["id"]]
+    assert data["validation_strategy"]["default_mode"] == "static_first"
+    assert data["validation_strategy"]["dynamic_mode"] == "targeted_optional"
+    assert data["validation_strategy"]["has_compose"] is True
+    included_ids = {item["id"] for item in data["audit_candidates"]["items"]}
+    assert focused["id"] in included_ids
+    assert all(
+        item["file_path"] == "Less-1/index.php"
+        for item in data["audit_candidates"]["items"]
+        if item["candidate_type"] == "data_flow"
+    )
+
+    reason_export = client.get(
+        f"/projects/{project_id}/export",
+        params={"format": "yaml", "profile": "reason"},
+    )
+    reason_data = yaml.safe_load(reason_export.text)
+    assert reason_data["context_profile"]["profile"] == "reason"
+    assert reason_data["audit_candidates"]["coverage"]["open_required"]
+    assert reason_data["audit_candidates"]["view"]["profile"] == "reason"
+
+
+def test_completion_blocks_ready_index_without_business_graph_seed(temp_db):
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    now = utcnow()
+
+    with db.get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO source_snapshots (
+                id, project_id, source_type, original_name, status,
+                file_count, total_bytes, detected_languages_json, created_at
+            )
+            VALUES ('snap_missing_biz', ?, 'zip', 'fixture.zip', 'ready', 1, 10, '{}', ?)
+            """,
+            (project_id, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO code_entrypoints (
+                id, snapshot_id, path, language, kind, framework, method,
+                route, handler, line_start, evidence
+            )
+            VALUES (
+                'entry_missing_biz', 'snap_missing_biz', 'app.js', 'JavaScript',
+                'http_route', 'satrda', NULL, '/erp/file', 'fileSvr', 1,
+                'satrda.Router.all(ApiPre + "/file", fileSvr)'
+            )
+            """
+        )
+
+    blocked = client.post(
+        f"/projects/{project_id}/complete",
+        json={"from": ["origin"], "description": "done", "worker": "reason"},
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["message"] == "Ready source index requires business graph seed before completion"
+
+    with db.get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO business_nodes (
+                id, project_id, node_type, title, description, risk_level,
+                review_status, coverage_note, last_intent_id, risk_tags_json,
+                evidence_json, created_by, created_at, updated_at
+            )
+            VALUES (
+                'biz_existing', ?, 'endpoint', '入口 /erp/file', NULL, 'medium',
+                'unreviewed', 'seeded', NULL, '[]', '[]', 'source_index', ?, ?
+            )
+            """,
+            (project_id, now, now),
+        )
+
+    completed = client.post(
+        f"/projects/{project_id}/complete",
+        json={"from": ["origin"], "description": "done", "worker": "reason"},
+    )
+    assert completed.status_code == 200
 
 
 def test_zip_source_import_rejects_path_escape(temp_db, monkeypatch, tmp_path):
@@ -421,7 +786,7 @@ def test_git_source_import_rejects_private_network_url(temp_db):
     assert "public network addresses" in response.json()["detail"]
 
 
-def test_high_severity_finding_requires_quality_evidence_and_business_node(temp_db, monkeypatch, tmp_path):
+def test_high_severity_finding_requires_quality_evidence_and_infers_business_node(temp_db, monkeypatch, tmp_path):
     monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
     client = _client(temp_db)
     project_id = _create_project(client)
@@ -456,7 +821,7 @@ def test_high_severity_finding_requires_quality_evidence_and_business_node(temp_
         },
     ).json()
 
-    missing_business_node = client.post(
+    inferred_business_node = client.post(
         f"/api/projects/{project_id}/audit-findings",
         json={
             "snapshot_id": snapshot["id"],
@@ -473,8 +838,8 @@ def test_high_severity_finding_requires_quality_evidence_and_business_node(temp_
             "discovered_by": "worker-a",
         },
     )
-    assert missing_business_node.status_code == 422
-    assert "business_node_id" in missing_business_node.json()["detail"]
+    assert inferred_business_node.status_code == 201
+    assert inferred_business_node.json()["business_node_id"]
 
     valid = client.post(
         f"/api/projects/{project_id}/audit-findings",

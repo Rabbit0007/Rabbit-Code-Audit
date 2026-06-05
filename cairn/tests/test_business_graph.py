@@ -5,7 +5,9 @@ from fastapi.testclient import TestClient
 import yaml
 
 from cairn.dispatcher.contracts import validate_bootstrap_execute_payload, validate_explore_payload
+from cairn.server import product_db
 from cairn.server.routers import business_graph, export, projects
+from cairn.server.db import get_conn
 
 
 def _app(temp_db) -> FastAPI:
@@ -186,6 +188,188 @@ def test_business_node_conclusion_requires_project_node(temp_db):
     assert response.status_code == 404
 
 
+def test_business_node_conclusions_sync_node_coverage(temp_db):
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    rejected_node = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "feature",
+            "title": "退款流程",
+            "risk_level": "high",
+            "review_status": "unreviewed",
+            "created_by": "worker",
+        },
+    ).json()
+    blocked_node = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "external_system",
+            "title": "支付回调",
+            "risk_level": "unknown",
+            "review_status": "unreviewed",
+            "created_by": "worker",
+        },
+    ).json()
+    confirmed_node = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "endpoint",
+            "title": "POST /refund",
+            "risk_level": "critical",
+            "review_status": "unreviewed",
+            "created_by": "worker",
+        },
+    ).json()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO source_snapshots (
+                id, project_id, source_type, status, file_count, total_bytes,
+                detected_languages_json, created_at
+            )
+            VALUES ('snap_1', ?, 'zip', 'ready', 1, 10, '{}', '2026-01-01T00:00:00Z')
+            """,
+            (project_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_findings (
+                id, project_id, snapshot_id, title, category, severity, status,
+                file_path, line_start, entry_point, business_node_id, description,
+                impact, evidence, discovered_by, reviewed_by, created_at, reviewed_at
+            )
+            VALUES (
+                'finding_1', ?, 'snap_1', 'refund bypass', 'authorization',
+                'critical', 'confirmed', 'app/refund.py', 42, 'POST /refund',
+                ?, 'missing owner check', 'refund another user order',
+                'RefundService does not compare owner_id', 'worker-1', 'worker-2',
+                '2026-01-01T00:00:01Z', '2026-01-01T00:00:02Z'
+            )
+            """,
+            (project_id, confirmed_node["id"]),
+        )
+
+    assert client.post(
+        f"/api/projects/{project_id}/business-graph/conclusions",
+        json={
+            "business_node_id": rejected_node["id"],
+            "conclusion": "rejected",
+            "summary": "已确认退款流程不存在越权退款",
+            "evidence": "app/refund.py checks owner before state transition",
+            "created_by": "worker",
+        },
+    ).status_code == 201
+    assert client.post(
+        f"/api/projects/{project_id}/business-graph/conclusions",
+        json={
+            "business_node_id": blocked_node["id"],
+            "conclusion": "needs_more_evidence",
+            "summary": "源码有签名入口，但缺少网关配置证据",
+            "evidence": "payments/callback.py calls verify_signature; production secret source is absent",
+            "created_by": "worker",
+        },
+    ).status_code == 201
+    assert client.post(
+        f"/api/projects/{project_id}/business-graph/conclusions",
+        json={
+            "business_node_id": confirmed_node["id"],
+            "conclusion": "confirmed_finding",
+            "summary": "退款接口存在已确认越权漏洞",
+            "audit_finding_id": "finding_1",
+            "created_by": "worker",
+        },
+    ).status_code == 201
+
+    graph = client.get(f"/api/projects/{project_id}/business-graph").json()
+    nodes = {node["id"]: node for node in graph["nodes"]}
+    assert nodes[rejected_node["id"]]["review_status"] == "covered"
+    assert nodes[rejected_node["id"]]["coverage_note"] == "已确认退款流程不存在越权退款"
+    assert nodes[blocked_node["id"]]["review_status"] == "blocked"
+    assert "缺少网关配置证据" in nodes[blocked_node["id"]]["coverage_note"]
+    assert "production secret source is absent" in nodes[blocked_node["id"]]["coverage_note"]
+    assert nodes[confirmed_node["id"]]["review_status"] == "covered"
+    assert nodes[confirmed_node["id"]]["coverage_note"] == "退款接口存在已确认越权漏洞"
+
+
+def test_export_treats_valid_historical_business_conclusion_as_covered(temp_db):
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    node = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "feature",
+            "title": "订单退款",
+            "risk_level": "high",
+            "review_status": "unreviewed",
+            "created_by": "worker",
+        },
+    ).json()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO business_node_conclusions (
+                id, project_id, business_node_id, conclusion, summary, evidence,
+                created_by, created_at
+            )
+            VALUES (
+                'biz_conclusion_legacy', ?, ?, 'rejected',
+                '已检查退款状态流转，未发现重复退款',
+                'app/refund.py checks state before update',
+                'worker', '2026-01-01T00:00:00Z'
+            )
+            """,
+            (project_id, node["id"]),
+        )
+
+    exported = client.get(f"/projects/{project_id}/export?format=yaml")
+    assert exported.status_code == 200
+    data = yaml.safe_load(exported.text)
+    coverage = data["business_graph"]["coverage"]
+    assert coverage["covered"] == 1
+    assert coverage["unreviewed"] == 0
+    assert coverage["high_or_unknown_open"] == []
+    assert coverage["high_or_unknown_without_conclusion"] == []
+
+
+def test_product_db_backfills_historical_business_conclusion_coverage(temp_db):
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    node = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "feature",
+            "title": "订单退款",
+            "risk_level": "high",
+            "review_status": "unreviewed",
+            "created_by": "worker",
+        },
+    ).json()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO business_node_conclusions (
+                id, project_id, business_node_id, conclusion, summary, evidence,
+                created_by, created_at
+            )
+            VALUES (
+                'biz_conclusion_legacy', ?, ?, 'rejected',
+                '已检查退款状态流转，未发现重复退款',
+                'app/refund.py checks state before update',
+                'worker', '2026-01-01T00:00:00Z'
+            )
+            """,
+            (project_id, node["id"]),
+        )
+
+    product_db.configure_product_db()
+
+    graph = client.get(f"/api/projects/{project_id}/business-graph").json()
+    updated = next(item for item in graph["nodes"] if item["id"] == node["id"])
+    assert updated["review_status"] == "covered"
+    assert updated["coverage_note"] == "已检查退款状态流转，未发现重复退款"
+
+
 def test_confirmed_business_node_conclusion_requires_audit_finding(temp_db):
     client = _client(temp_db)
     project_id = _create_project(client)
@@ -272,6 +456,70 @@ def test_worker_contract_accepts_business_graph_objects():
     assert kind == "fact"
     assert bootstrap["business_nodes"][0]["node_type"] == "feature"
     assert bootstrap["business_nodes"][0]["risk_level"] == "unknown"
+
+
+def test_worker_contract_skips_business_conclusion_without_required_evidence():
+    _, result = validate_explore_payload(
+        {
+            "accepted": True,
+            "data": {
+                "description": "确认业务节点",
+                "business_node_conclusions": [
+                    {
+                        "business_node_id": "biz_existing",
+                        "conclusion": "confirmed_finding",
+                        "summary": "模型声称该业务节点存在漏洞",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert result["business_node_conclusions"] == []
+
+
+def test_worker_contract_downgrades_confirmed_business_conclusion_with_evidence_but_without_id():
+    _, result = validate_explore_payload(
+        {
+            "accepted": True,
+            "data": {
+                "description": "确认业务节点",
+                "business_node_conclusions": [
+                    {
+                        "business_node_id": "biz_existing",
+                        "conclusion": "confirmed_finding",
+                        "summary": "模型声称该业务节点存在漏洞",
+                        "evidence": "已阅读 app/refund.py:42，但未绑定已确认 finding id",
+                    }
+                ],
+            },
+        }
+    )
+
+    conclusion = result["business_node_conclusions"][0]
+    assert conclusion["conclusion"] == "needs_more_evidence"
+    assert conclusion["audit_finding_id"] is None
+    assert conclusion["evidence"] == "已阅读 app/refund.py:42，但未绑定已确认 finding id"
+
+
+def test_worker_contract_treats_generic_confirmed_business_conclusion_as_incomplete_without_id():
+    _, result = validate_explore_payload(
+        {
+            "accepted": True,
+            "data": {
+                "description": "确认业务节点",
+                "business_node_conclusions": [
+                    {
+                        "business_node_id": "biz_existing",
+                        "conclusion": "confirmed",
+                        "summary": "模型声称该业务节点存在漏洞",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert result["business_node_conclusions"] == []
 
 
 def test_worker_contract_normalizes_common_business_node_type_aliases():

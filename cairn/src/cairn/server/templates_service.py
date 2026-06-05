@@ -47,7 +47,7 @@ BUILTIN_TEMPLATES: list[dict] = [
         "hints": [
             _hint("先建立路由、认证、权限和数据访问层的代码索引"),
             _hint("结合静态扫描结果追踪外部输入到敏感操作的数据流"),
-            _hint("对高危和严重发现安排独立 Worker 复核"),
+            _hint("对高危和严重发现补充确认结论和证明材料"),
         ],
         "is_builtin": True,
         "user_id": None,

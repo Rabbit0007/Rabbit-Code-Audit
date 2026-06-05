@@ -22,6 +22,7 @@ from cairn.server.routers import (
     sources,
     templates,
     timeline,
+    tool_scans,
     vulnerabilities,
     workers,
 )
@@ -67,6 +68,7 @@ app.include_router(export.router, dependencies=_protected)
 app.include_router(findings.router, dependencies=_protected)
 app.include_router(vulnerabilities.router, dependencies=_protected)
 app.include_router(report_enrichments.router, dependencies=_protected)
+app.include_router(tool_scans.router, dependencies=_protected)
 app.include_router(workers.router, dependencies=_protected)
 app.include_router(templates.router, dependencies=_protected)
 app.include_router(timeline.router, dependencies=_protected)

@@ -18,6 +18,12 @@ tasks:
     conclude_timeout: 90
   report_enrichment:
     timeout: 120
+  tool_scan:
+    enabled: true
+    auto_enqueue: false
+    timeout_per_tool: 180
+    tools: []
+    max_running: 1
 container:
   image: rabbit-code-audit-worker:latest
   network_mode: bridge

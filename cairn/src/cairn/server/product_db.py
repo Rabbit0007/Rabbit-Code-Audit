@@ -369,6 +369,47 @@ CREATE INDEX IF NOT EXISTS idx_audit_candidates_project
 CREATE INDEX IF NOT EXISTS idx_audit_candidates_location
     ON audit_candidates(project_id, snapshot_id, file_path, line_start);
 
+CREATE TABLE IF NOT EXISTS tool_scan_tasks (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    snapshot_id TEXT NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+    created_by TEXT NOT NULL,
+    worker TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    last_heartbeat_at TEXT,
+    completed_at TEXT,
+    error_message TEXT,
+    tools_json TEXT NOT NULL DEFAULT '[]',
+    timeout_per_tool INTEGER NOT NULL DEFAULT 180,
+    summaries_json TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_scan_tasks_project
+    ON tool_scan_tasks(project_id, snapshot_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_tool_scan_tasks_status
+    ON tool_scan_tasks(status, created_at);
+
+CREATE TABLE IF NOT EXISTS dynamic_validation_plans (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    snapshot_id TEXT NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
+    status TEXT NOT NULL
+        CHECK(status IN ('static_only', 'ready', 'blocked')),
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    plan_json TEXT NOT NULL DEFAULT '{}',
+    warnings_json TEXT NOT NULL DEFAULT '[]',
+    UNIQUE(project_id, snapshot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dynamic_validation_project
+    ON dynamic_validation_plans(project_id, snapshot_id, status, updated_at);
+
 CREATE TABLE IF NOT EXISTS report_enrichment_tasks (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -484,3 +525,6 @@ def configure_product_db() -> None:
         _ensure_columns(conn, "business_nodes", BUSINESS_NODE_COLUMNS)
         _ensure_columns(conn, "worker_task_history", WORKER_TASK_HISTORY_COLUMNS)
         _ensure_columns(conn, "report_enrichment_tasks", REPORT_ENRICHMENT_COLUMNS)
+        from cairn.server.services import sync_business_node_coverage_from_latest_conclusions
+
+        sync_business_node_coverage_from_latest_conclusions(conn)

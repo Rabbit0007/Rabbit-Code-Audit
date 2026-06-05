@@ -215,7 +215,7 @@ def test_complete_rejects_pending_high_audit_findings(temp_db):
 
     assert complete.status_code == 409
     detail = complete.json()["detail"]
-    assert detail["message"] == "High or critical audit findings require independent review before completion"
+    assert detail["message"] == "High or critical audit findings require confirmation before completion"
     assert detail["audit_findings"][0]["id"] == "finding_1"
 
 
@@ -375,6 +375,46 @@ def test_complete_allows_rejected_high_risk_business_node_conclusion(temp_db):
     assert complete.json()["to"] == "goal"
 
 
+def test_complete_allows_historical_conclusion_for_stale_unreviewed_business_node(temp_db):
+    client = _client()
+    project_id = _create_project(client)
+
+    node = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "endpoint",
+            "title": "file upload",
+            "risk_level": "high",
+            "review_status": "unreviewed",
+            "created_by": "worker-1",
+        },
+    ).json()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO business_node_conclusions (
+                id, project_id, business_node_id, conclusion, summary, evidence,
+                created_by, created_at
+            )
+            VALUES (
+                'biz_conclusion_legacy', ?, ?, 'rejected',
+                '已确认上传路径没有文件执行入口',
+                'app/upload.py validates extension and stores outside web root',
+                'worker-1', '2026-01-01T00:00:00Z'
+            )
+            """,
+            (project_id, node["id"]),
+        )
+
+    complete = client.post(
+        f"/projects/{project_id}/complete",
+        json={"from": ["origin"], "description": "done", "worker": "worker-1"},
+    )
+
+    assert complete.status_code == 200
+    assert complete.json()["to"] == "goal"
+
+
 def test_complete_allows_blocked_node_with_needs_more_evidence_conclusion(temp_db):
     client = _client()
     project_id = _create_project(client)
@@ -460,7 +500,7 @@ def test_complete_allows_confirmed_finding_business_node_conclusion(temp_db):
         json={
             "business_node_id": node["id"],
             "conclusion": "confirmed_finding",
-            "summary": "退款接口存在已复核的越权退款漏洞",
+            "summary": "退款接口存在已确认的越权退款漏洞",
             "audit_finding_id": "finding_1",
             "created_by": "worker-2",
         },

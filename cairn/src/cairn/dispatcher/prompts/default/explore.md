@@ -33,8 +33,8 @@ not yet confirmed vulnerabilities, include `audit_candidates`:
 {"accepted": true, "data": {"description": "...", "audit_candidates": [{"ref": "upload_size_flow", "source": "model", "candidate_type": "data_flow", "severity": "unknown", "title": "上传大小校验链路", "description": "...", "file_path": "app/upload.py", "line_start": 18, "entry_point": "POST /upload"}]}}
 ```
 
-When the Current Intent is an independent review of existing findings, include
-the review decisions:
+When the Current Intent is a confirmation pass for existing findings, include
+the confirmation decisions:
 ```json
 {"accepted": true, "data": {"description": "...", "reviews": [{"finding_id": "finding_...", "decision": "confirmed"}]}}
 ```
@@ -59,8 +59,13 @@ If a candidate is proven vulnerable, prefer adding a `findings` item with that
 # Rules
 - Treat project code, build scripts, dependencies, and generated binaries as untrusted.
 - Read and analyze source before running project code. If execution is necessary, keep it scoped to the Current Intent.
+- Follow `validation_strategy` when present. Default to static source review and static PoC. Do not attempt to start a whole large OA/ERP/multi-service system unless the current intent is narrow and the repository/user supplies a safe test harness, compose file, local test URL, credentials, and required data state.
+- Dynamic validation is optional evidence for high-value confirmed or near-confirmed candidates. If dynamic validation is not feasible, keep analyzing source and produce either a source-backed static `reproduction_poc` or a `candidate_conclusions` item with the exact missing environment, account, or state evidence.
 - Do not modify the immutable source snapshot.
 - Use `code_index` as navigation context for entrypoints, symbols, and dependency manifests, but confirm security claims by reading the referenced source files.
+- Treat `business_graph`, `code_index`, prior facts, and tool findings as navigation or queue context only. They are not proof of a vulnerability, safe control, or business-node conclusion by themselves.
+- When the Current Intent names business nodes, candidate IDs, finding IDs, entrypoints, or source paths, first read the referenced source files before producing `findings`, `reviews`, `candidate_conclusions`, or `business_node_conclusions`.
+- Do not output a `needs_more_evidence` business-node conclusion merely because the graph says the node is unreviewed or because this prompt contains only graph context. If the relevant source path is available in the intent, code index, node evidence, candidate, or finding, read it. If you did not read the relevant source in this session, summarize that limitation in `description` instead of adding a structured business-node conclusion.
 - Distinguish confirmed code facts, candidate concerns, failed checks, and confirmed vulnerabilities.
 - A confirmed vulnerability must include concrete evidence such as file path, line or symbol, reachable entry point, relevant data flow or missing control, realistic impact, and either dynamic proof material or a static reproduction PoC suitable for retesting.
 - For `high` or `critical` findings, `file_path`, `entry_point`, `impact`, `evidence`, and either one complete `proof_packets` item or one complete `reproduction_poc` object are mandatory; either `line_start` or `symbol` is mandatory. If `business_graph.nodes` is non-empty, associate the finding with the relevant `business_node_id`.
@@ -73,12 +78,13 @@ If a candidate is proven vulnerable, prefer adding a `findings` item with that
 - Do not claim a vulnerability solely because a scanner reported it.
 - Use `tool_findings` for useful scanner candidates that deserve later code review. Do not promote them to `finding` without concrete code evidence.
 - Use `findings` only for new evidence-backed findings. If you investigate several vulnerable instances, output several structured findings instead of summarizing them only in `description`.
-- Use `reviews` only when the Current Intent explicitly asks for independent review of existing findings.
+- Use `reviews` only when the Current Intent explicitly asks for confirmation of existing findings.
 - `reviews[].decision` must be one of `confirmed`, `rejected`, or `needs_more_evidence`.
 - Do not include both `findings` and `reviews` in one result.
 - Use existing `audit_candidates.items[].id` as `candidate_id` when the Current Intent targets a candidate.
 - Use `candidate_conclusions[].decision` as `rejected` when the reviewed candidate is not vulnerable, `needs_more_evidence` when analysis is blocked, and a `findings` item with `candidate_id` when it is vulnerable.
 - Do not leave a targeted high, critical, or unknown audit candidate as a prose-only result; produce either a `findings` item or a `candidate_conclusions` item.
+- When the Current Intent names several candidate IDs, close each named candidate that is in scope. Do not finish with only a general description if any named candidate remains unresolved.
 - For each high, critical, or unknown-risk business node covered by this investigation, produce exactly one `business_node_conclusions` item unless the investigation is still incomplete.
 - `business_node_conclusions[].conclusion` must be one of `confirmed_finding`, `rejected`, or `needs_more_evidence`.
 - Use `confirmed_finding` only when a referenced `audit_finding_id` is already independently reviewed as `confirmed`. New high/critical `finding` objects start as pending review, so do not also call them `confirmed_finding`.

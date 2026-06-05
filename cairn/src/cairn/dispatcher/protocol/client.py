@@ -68,10 +68,13 @@ class CairnClient:
         response.raise_for_status()
         return RuntimeInfo.model_validate(response.json())
 
-    def export_project(self, project_id: str) -> str:
+    def export_project(self, project_id: str, *, profile: str = "full", intent_id: str | None = None) -> str:
+        params: dict[str, str] = {"format": "yaml", "profile": profile}
+        if intent_id:
+            params["intent_id"] = intent_id
         response = self._session().get(
             self._url(f"/projects/{project_id}/export"),
-            params={"format": "yaml"},
+            params=params,
             timeout=self._timeout,
         )
         response.raise_for_status()
@@ -140,6 +143,19 @@ class CairnClient:
             json=payload,
         )
 
+    def list_audit_findings(self, project_id: str, status: str | None = None) -> list[dict[str, Any]]:
+        params: dict[str, str] = {}
+        if status:
+            params["status"] = status
+        response = self._session().get(
+            self._url(f"/api/projects/{project_id}/audit-findings"),
+            params=params,
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
+
     def create_tool_finding(self, project_id: str, payload: dict[str, Any]) -> ApiResult:
         return self._request_json(
             "POST",
@@ -153,6 +169,15 @@ class CairnClient:
             f"/api/projects/{project_id}/audit-candidates",
             json=payload,
         )
+
+    def list_audit_candidates(self, project_id: str) -> list[dict[str, Any]]:
+        response = self._session().get(
+            self._url(f"/api/projects/{project_id}/audit-candidates"),
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
 
     def conclude_audit_candidate(
         self,
@@ -268,6 +293,120 @@ class CairnClient:
         if not isinstance(payload, dict):
             raise ProtocolError("report enrichment packet must be an object", response.status_code, response.text)
         return payload
+
+    def list_tool_scan_tasks(
+        self,
+        project_id: str,
+        *,
+        snapshot_id: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, str] = {}
+        if snapshot_id:
+            params["snapshot_id"] = snapshot_id
+        if status:
+            params["status"] = status
+        response = self._session().get(
+            self._url(f"/api/projects/{project_id}/tool-scan-tasks"),
+            params=params,
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
+
+    def create_tool_scan_task(
+        self,
+        project_id: str,
+        snapshot_id: str,
+        *,
+        created_by: str,
+        tools: list[str],
+        timeout_per_tool: int,
+    ) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/projects/{project_id}/sources/{snapshot_id}/tool-scan-tasks",
+            json={
+                "created_by": created_by,
+                "tools": tools,
+                "timeout_per_tool": timeout_per_tool,
+            },
+        )
+
+    def list_pending_tool_scans(self, limit: int = 10) -> list[dict[str, Any]]:
+        response = self._session().get(
+            self._url("/api/tool-scans/pending"),
+            params={"limit": limit},
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
+
+    def claim_tool_scan(self, task_id: str, worker: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/tool-scans/{task_id}/claim",
+            json={"worker": worker},
+        )
+
+    def tool_scan_heartbeat(self, task_id: str, worker: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/tool-scans/{task_id}/heartbeat",
+            json={"worker": worker},
+        )
+
+    def release_tool_scan(self, task_id: str, worker: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/tool-scans/{task_id}/release",
+            json={"worker": worker},
+        )
+
+    def complete_tool_scan(self, task_id: str, payload: dict[str, Any]) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/tool-scans/{task_id}/complete",
+            json=payload,
+        )
+
+    def fail_tool_scan(self, task_id: str, worker: str, error_message: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/tool-scans/{task_id}/fail",
+            json={"worker": worker, "error_message": error_message},
+        )
+
+    def get_tool_plan(self, project_id: str, snapshot_id: str) -> list[dict[str, Any]]:
+        response = self._session().get(
+            self._url(f"/api/projects/{project_id}/sources/{snapshot_id}/tool-plan"),
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
+
+    def run_tool_scan(
+        self,
+        project_id: str,
+        snapshot_id: str,
+        *,
+        timeout_per_tool: int,
+        tools: list[str],
+    ) -> list[dict[str, Any]]:
+        response = self._session().post(
+            self._url(f"/api/projects/{project_id}/sources/{snapshot_id}/tool-scan"),
+            params={
+                "timeout_per_tool": timeout_per_tool,
+                "tools": ",".join(tools),
+            },
+            timeout=max(self._timeout, timeout_per_tool + 30),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
 
     def _request_json(self, method: str, path: str, json: dict[str, Any]) -> ApiResult:
         try:

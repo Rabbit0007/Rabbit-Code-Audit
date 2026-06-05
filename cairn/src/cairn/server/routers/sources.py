@@ -6,7 +6,9 @@ from cairn.server.source_models import (
     CodeEntrypoint,
     CodeFile,
     CodeSymbol,
+    CreateDynamicValidationPlanRequest,
     DependencyManifest,
+    DynamicValidationPlan,
     GitSourceImportRequest,
     SourceIndexSummary,
     SourceSnapshot,
@@ -24,6 +26,8 @@ from cairn.server.source_service import (
     snapshot_container_path,
 )
 from cairn.server.audit_tools import build_tool_plan
+from cairn.server.audit_tool_runner import run_audit_tools_for_project
+from cairn.server.dynamic_validation import build_dynamic_validation_plan, persist_dynamic_validation_plan
 
 
 router = APIRouter(prefix="/api/projects/{project_id}/sources", tags=["sources"])
@@ -118,3 +122,51 @@ def get_tool_plan(project_id: str, snapshot_id: str):
         raise HTTPException(409, "Source snapshot is not ready")
     source_path = snapshot_container_path(snapshot_id)
     return [item.as_dict() for item in build_tool_plan(snapshot, files, source_path)]
+
+
+@router.post("/{snapshot_id}/tool-scan")
+def run_tool_scan(
+    project_id: str,
+    snapshot_id: str,
+    timeout_per_tool: int = 180,
+    tools: str | None = None,
+):
+    if timeout_per_tool < 10 or timeout_per_tool > 1800:
+        raise HTTPException(400, "timeout_per_tool must be between 10 and 1800")
+    selected = {item.strip() for item in tools.split(",") if item.strip()} if tools else None
+    try:
+        summaries = run_audit_tools_for_project(
+            project_id,
+            snapshot_id=snapshot_id,
+            timeout_per_tool=timeout_per_tool,
+            selected_tools=selected,
+        )
+    except ValueError as exc:
+        if "not ready" in str(exc).lower():
+            raise HTTPException(409, str(exc)) from exc
+        raise HTTPException(404, str(exc)) from exc
+    return [summary.__dict__ for summary in summaries]
+
+
+@router.get("/{snapshot_id}/dynamic-validation-plan", response_model=DynamicValidationPlan)
+def get_dynamic_validation_plan(project_id: str, snapshot_id: str):
+    try:
+        return build_dynamic_validation_plan(project_id, snapshot_id)
+    except ValueError as exc:
+        if "not ready" in str(exc).lower():
+            raise HTTPException(409, str(exc)) from exc
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/{snapshot_id}/dynamic-validation-plan", response_model=DynamicValidationPlan, status_code=201)
+def create_dynamic_validation_plan(
+    project_id: str,
+    snapshot_id: str,
+    body: CreateDynamicValidationPlanRequest,
+):
+    try:
+        return persist_dynamic_validation_plan(project_id, snapshot_id, created_by=body.created_by)
+    except ValueError as exc:
+        if "not ready" in str(exc).lower():
+            raise HTTPException(409, str(exc)) from exc
+        raise HTTPException(404, str(exc)) from exc

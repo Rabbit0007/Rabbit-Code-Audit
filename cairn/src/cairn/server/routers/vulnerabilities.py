@@ -367,6 +367,59 @@ def _load_report_enrichments(vulnerabilities: list[Vulnerability]) -> dict[str, 
     return latest
 
 
+def _load_audit_finding_report_details(vulnerabilities: list[Vulnerability]) -> dict[str, dict[str, object]]:
+    finding_ids = _unique(
+        [
+            finding_id
+            for vuln in vulnerabilities
+            for finding_id in [*(vuln.related_fact_ids or []), vuln.fact_id, vuln.id]
+        ]
+    )
+    if not finding_ids:
+        return {}
+    placeholders = ",".join("?" for _ in finding_ids)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, cwe, file_path, line_start, line_end, symbol,
+                   entry_point, remediation
+            FROM audit_findings
+            WHERE id IN ({placeholders})
+            """,
+            finding_ids,
+        ).fetchall()
+    return {
+        row["id"]: {
+            "id": row["id"],
+            "cwe": row["cwe"],
+            "file_path": row["file_path"],
+            "line_start": row["line_start"],
+            "line_end": row["line_end"],
+            "symbol": row["symbol"],
+            "entry_point": row["entry_point"],
+            "remediation": row["remediation"],
+        }
+        for row in rows
+    }
+
+
+def _audit_detail_for_vulnerability(
+    vuln: Vulnerability, details: dict[str, dict[str, object]]
+) -> dict[str, object]:
+    for finding_id in _unique([vuln.fact_id, vuln.id, *(vuln.related_fact_ids or [])]):
+        detail = details.get(finding_id)
+        if detail is not None:
+            return detail
+    return {}
+
+
+def _remediation_text(vuln: Vulnerability, detail: dict[str, object]) -> str:
+    remediation = str(detail.get("remediation") or "").strip()
+    if remediation:
+        return remediation
+    return "未记录明确修复建议；需结合该条发现的代码证据、入口点和影响面补充修复动作。"
+
+
 def _report_enrichments_for_vulnerability(
     vuln: Vulnerability, enrichments: dict[str, dict[str, object]]
 ) -> list[dict[str, object]]:
@@ -1206,15 +1259,23 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
     """
     counts = _summarize(vulnerabilities)
     report_enrichments = _load_report_enrichments(vulnerabilities)
+    audit_details = _load_audit_finding_report_details(vulnerabilities)
+    project_count = len(_unique([v.project_id for v in vulnerabilities]))
+    severity_scope = "、".join(
+        _SEVERITY_LABELS.get(level, level)
+        for level in _SUMMARY_ORDER
+        if counts[level] > 0
+    ) or "无漏洞"
     lines: list[str] = [
         f"# {_report_title(vulnerabilities)}",
         "",
-        "> Rabbit Code Audit 生成的代码审计报告。报告仅包含经过复核确认的发现，并保留关键证据与审计过程。",
+        "> Rabbit Code Audit 生成的代码审计报告。报告仅包含已确认的发现，并保留关键证据与审计过程。",
         "",
         "## 目录",
         "",
         "- [报告概览](#报告概览)",
         "- [漏洞清单](#漏洞清单)",
+        "- [修复建议汇总](#修复建议汇总)",
     ]
     for project_id, project_name, _items in _project_groups(vulnerabilities):
         anchor = f"项目{project_name}{project_id}".lower()
@@ -1226,13 +1287,18 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
             "",
         "## 报告概览",
         "",
+        "**摘要页**",
+        "",
         "| 指标 | 数量 |",
         "| --- | ---: |",
+        f"| 项目数 | {project_count} |",
         f"| 漏洞总数 | {len(vulnerabilities)} |",
         f"| 严重 | {counts['critical']} |",
         f"| 高危 | {counts['high']} |",
         f"| 中危 | {counts['medium']} |",
         f"| 低危 | {counts['low']} |",
+        "",
+        f"本次导出范围覆盖 {project_count} 个项目，风险级别范围为：{severity_scope}。",
         "",
         ]
     )
@@ -1259,10 +1325,30 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
         )
     lines.append("")
 
+    lines.extend(["---", "", "## 修复建议汇总", ""])
+    for index, vuln in enumerate(vulnerabilities, start=1):
+        detail = _audit_detail_for_vulnerability(vuln, audit_details)
+        location = str(detail.get("file_path") or "").strip()
+        if location and detail.get("line_start"):
+            location = f"{location}:{detail['line_start']}"
+        cwe = str(detail.get("cwe") or "").strip()
+        lines.extend(
+            [
+                f"{index}. **{vuln.title}**",
+                f"   - 严重程度：{_SEVERITY_LABELS.get(vuln.severity, vuln.severity)}",
+                f"   - 项目：{vuln.project_name}（`{vuln.project_id}`）",
+                f"   - 位置：{_md_escape(location or '未记录')}",
+                f"   - CWE：{_md_escape(cwe or '未记录')}",
+                f"   - 建议：{_md_escape(_remediation_text(vuln, detail))}",
+                "",
+            ]
+        )
+
     for project_id, project_name, items in _project_groups(vulnerabilities):
         lines.extend(["---", "", f"## 项目：{project_name}（`{project_id}`）", ""])
         for index, vuln in enumerate(items, start=1):
             vuln_report_enrichments = _report_enrichments_for_vulnerability(vuln, report_enrichments)
+            audit_detail = _audit_detail_for_vulnerability(vuln, audit_details)
             lines.extend(
                 [
                     f"### {index}. {vuln.title}",
@@ -1289,6 +1375,8 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
             for evidence in vuln.evidence or ["未记录"]:
                 lines.append(f"- {evidence}")
             lines.append("")
+
+            lines.extend(["#### 修复建议", "", _remediation_text(vuln, audit_detail), ""])
 
             lines.extend(["#### 漏洞证明数据包", ""])
             packets = vuln.proof_packets or []

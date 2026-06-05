@@ -542,9 +542,26 @@ def _write_explore_result(
             },
         )
 
+    candidate_business_node_by_id: dict[str, str] = {}
+    if findings:
+        try:
+            candidate_business_node_by_id = {
+                item["id"]: item["business_node_id"]
+                for item in client.list_audit_candidates(project_id)
+                if isinstance(item.get("id"), str) and isinstance(item.get("business_node_id"), str)
+            }
+        except Exception:
+            LOG.warning("failed to load audit candidate business links project=%s worker=%s", project_id, worker_name)
+
     for finding in findings:
         candidate_id = _resolve_candidate_ref(finding, candidate_ref_to_id)
         finding = _strip_internal_refs(_resolve_business_node_ref(finding, ref_to_id))
+        if (
+            candidate_id
+            and not finding.get("business_node_id")
+            and candidate_id in candidate_business_node_by_id
+        ):
+            finding = {**finding, "business_node_id": candidate_business_node_by_id[candidate_id]}
         response = client.create_audit_finding(
             project_id,
             {

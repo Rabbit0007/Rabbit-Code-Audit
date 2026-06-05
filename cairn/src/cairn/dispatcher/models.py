@@ -33,6 +33,7 @@ class RunningTask:
     fact_count: int | None = None
     hint_count: int | None = None
     open_intent_count: int | None = None
+    reason_trigger: str | None = None
     # Wall-clock start time, auto-populated at construction. Used only by the
     # optional read-only internal status API to compute task durations. This is
     # additive metadata and does not affect scheduling behavior.

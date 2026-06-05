@@ -4,7 +4,7 @@ import ast
 from dataclasses import dataclass, field
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import tomllib
 
@@ -12,6 +12,23 @@ from cairn.server.source_models import CodeFile
 
 
 MAX_TEXT_BYTES = 2 * 1024 * 1024
+GENERIC_WEB_SCRIPT_SUFFIXES = {".php", ".jsp", ".jspx", ".asp", ".aspx", ".ashx"}
+GENERIC_WEB_SCRIPT_EXCLUDED_PARTS = {
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "spec",
+    "target",
+    "test",
+    "tests",
+    "vendor",
+    "venv",
+}
 
 
 @dataclass(frozen=True)
@@ -65,6 +82,7 @@ def extract_code_index(snapshot_id: str, root: Path, files: list[CodeFile]) -> C
     symbols: list[CodeSymbolRecord] = []
     entrypoints: list[CodeEntrypointRecord] = []
     manifests: list[DependencyManifestRecord] = []
+    readable: list[tuple[CodeFile, str]] = []
     for file in files:
         if file.is_binary:
             continue
@@ -72,8 +90,14 @@ def extract_code_index(snapshot_id: str, root: Path, files: list[CodeFile]) -> C
         text = _read_text(path)
         if text is None:
             continue
+        readable.append((file, text))
+
+    js_constants = _collect_js_string_constants(
+        text for file, text in readable if file.language in {"JavaScript", "TypeScript", "Vue"}
+    )
+    for file, text in readable:
         symbols.extend(_extract_symbols(snapshot_id, file, text))
-        entrypoints.extend(_extract_entrypoints(snapshot_id, file, text))
+        entrypoints.extend(_extract_entrypoints(snapshot_id, file, text, string_constants=js_constants))
         manifest = _extract_manifest(snapshot_id, file, text)
         if manifest is not None:
             manifests.append(manifest)
@@ -195,13 +219,20 @@ def _regex_symbols(snapshot_id: str, file: CodeFile, text: str) -> list[CodeSymb
     return symbols
 
 
-def _extract_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
+def _extract_entrypoints(
+    snapshot_id: str,
+    file: CodeFile,
+    text: str,
+    *,
+    string_constants: dict[str, str] | None = None,
+) -> list[CodeEntrypointRecord]:
     records: list[CodeEntrypointRecord] = []
     records.extend(_python_entrypoints(snapshot_id, file, text))
-    records.extend(_js_entrypoints(snapshot_id, file, text))
+    records.extend(_js_entrypoints(snapshot_id, file, text, string_constants=string_constants))
     records.extend(_php_entrypoints(snapshot_id, file, text))
     records.extend(_java_entrypoints(snapshot_id, file, text))
     records.extend(_go_entrypoints(snapshot_id, file, text))
+    records.extend(_generic_web_script_entrypoints(snapshot_id, file, text))
     return records
 
 
@@ -238,10 +269,18 @@ def _python_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[Cod
     return records
 
 
-def _js_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
+def _js_entrypoints(
+    snapshot_id: str,
+    file: CodeFile,
+    text: str,
+    *,
+    string_constants: dict[str, str] | None = None,
+) -> list[CodeEntrypointRecord]:
     if file.language not in {"JavaScript", "TypeScript", "Vue"}:
         return []
     records: list[CodeEntrypointRecord] = []
+    constants = dict(string_constants or {})
+    constants.update(_collect_js_string_constants([text]))
     express = re.compile(r"\b(?:app|router)\.(get|post|put|delete|patch|options|head|all)\(\s*['\"]([^'\"]+)['\"]\s*(?:,\s*([A-Za-z_$][\w$\.]*))?", re.IGNORECASE)
     for match in express.finditer(text):
         method = match.group(1).upper()
@@ -258,12 +297,71 @@ def _js_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEnt
                 _line_at(text, _line_no(text, match.start())).strip(),
             )
         )
+    satrda = re.compile(
+        r"\bsatrda\.Router\.(get|post|put|delete|patch|options|head|all)\(\s*([^,\n]+?)\s*(?:,\s*([A-Za-z_$][\w$\.]*))?(?:,|\))",
+        re.IGNORECASE,
+    )
+    for match in satrda.finditer(text):
+        route = _resolve_js_string_expression(match.group(2), constants)
+        if not route:
+            continue
+        method = match.group(1).upper()
+        records.append(
+            _entrypoint(
+                snapshot_id,
+                file,
+                "http_route",
+                "satrda",
+                None if method == "ALL" else method,
+                route,
+                match.group(3),
+                _line_no(text, match.start()),
+                _line_at(text, _line_no(text, match.start())).strip(),
+            )
+        )
     decorators = re.compile(r"@(Get|Post|Put|Delete|Patch|Options|Head)\(\s*['\"]?([^'\")]+)?['\"]?\s*\)\s*\n\s*(?:async\s+)?([A-Za-z_$][\w$]*)\s*\(", re.IGNORECASE)
     for match in decorators.finditer(text):
         method = match.group(1).upper()
         route = match.group(2) or "/"
         records.append(_entrypoint(snapshot_id, file, "http_route", "nestjs", method, route, match.group(3), _line_no(text, match.start()), match.group(0).splitlines()[0].strip()))
     return records
+
+
+JS_STRING_ASSIGNMENT = re.compile(
+    r"^\s*(?:(?:const|let|var)\s+)?(?:globalThis\.|global\.|window\.|root\.)?([A-Za-z_$][\w$]*)\s*=\s*(['\"])(.*?)\2\s*;?",
+    re.MULTILINE,
+)
+
+
+def _collect_js_string_constants(texts: object) -> dict[str, str]:
+    values: dict[str, set[str]] = {}
+    for text in texts:
+        if not isinstance(text, str):
+            continue
+        for match in JS_STRING_ASSIGNMENT.finditer(text):
+            values.setdefault(match.group(1), set()).add(match.group(3))
+    return {key: next(iter(items)) for key, items in values.items() if len(items) == 1}
+
+
+def _resolve_js_string_expression(expr: str, constants: dict[str, str]) -> str | None:
+    parts = [part.strip() for part in expr.strip().split("+")]
+    if not parts:
+        return None
+    resolved: list[str] = []
+    for part in parts:
+        if not part:
+            return None
+        string_match = re.fullmatch(r"['\"]([^'\"]*)['\"]", part)
+        if string_match:
+            resolved.append(string_match.group(1))
+            continue
+        ident_match = re.fullmatch(r"(?:globalThis\.|global\.|window\.|root\.)?([A-Za-z_$][\w$]*)", part)
+        if ident_match and ident_match.group(1) in constants:
+            resolved.append(constants[ident_match.group(1)])
+            continue
+        return None
+    route = "".join(resolved).strip()
+    return route or None
 
 
 def _php_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
@@ -318,6 +416,27 @@ def _go_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEnt
             line_start = _line_no(text, match.start())
             records.append(_entrypoint(snapshot_id, file, "http_route", framework, method, route, handler, line_start, _line_at(text, line_start).strip()))
     return records
+
+
+def _generic_web_script_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
+    path = PurePosixPath(file.path)
+    if path.suffix.lower() not in GENERIC_WEB_SCRIPT_SUFFIXES:
+        return []
+    if any(part in GENERIC_WEB_SCRIPT_EXCLUDED_PARTS for part in path.parts):
+        return []
+    return [
+        _entrypoint(
+            snapshot_id,
+            file,
+            "http_route",
+            "web_script",
+            None,
+            f"/{file.path}",
+            path.name,
+            1,
+            f"{file.path} is a web-executable script file",
+        )
+    ]
 
 
 def _entrypoint(

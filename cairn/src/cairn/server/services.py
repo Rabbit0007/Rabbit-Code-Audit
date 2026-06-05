@@ -9,8 +9,129 @@ from fastapi import HTTPException
 
 from cairn.server.models import Intent, ProjectMeta, ProjectReason
 
+BUSINESS_NODE_COVERAGE_NOTE_LIMIT = 1000
+
+
 def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def business_node_coverage_status_for_conclusion(conclusion: str) -> str | None:
+    if conclusion in ("confirmed_finding", "rejected"):
+        return "covered"
+    if conclusion == "needs_more_evidence":
+        return "blocked"
+    return None
+
+
+def business_node_coverage_note_for_conclusion(
+    conclusion: str,
+    summary: str,
+    evidence: str | None,
+) -> str:
+    parts = [summary.strip()]
+    if conclusion == "needs_more_evidence" and evidence and evidence.strip():
+        parts.append(f"阻塞证据: {evidence.strip()}")
+    note = "\n".join(part for part in parts if part)
+    return note[:BUSINESS_NODE_COVERAGE_NOTE_LIMIT]
+
+
+def sync_business_node_coverage_from_conclusion(
+    conn: sqlite3.Connection,
+    project_id: str,
+    business_node_id: str,
+    conclusion: str,
+    summary: str,
+    evidence: str | None,
+    *,
+    now: str,
+) -> None:
+    status = business_node_coverage_status_for_conclusion(conclusion)
+    if status is None:
+        return
+    conn.execute(
+        """
+        UPDATE business_nodes
+        SET review_status = ?,
+            coverage_note = ?,
+            updated_at = ?
+        WHERE id = ? AND project_id = ?
+        """,
+        (
+            status,
+            business_node_coverage_note_for_conclusion(conclusion, summary, evidence),
+            now,
+            business_node_id,
+            project_id,
+        ),
+    )
+
+
+def sync_business_node_coverage_from_latest_conclusions(
+    conn: sqlite3.Connection,
+    project_id: str | None = None,
+    *,
+    now: str | None = None,
+) -> int:
+    clauses = []
+    params: list[object] = []
+    if project_id is not None:
+        clauses.append("c.project_id = ?")
+        params.append(project_id)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = conn.execute(
+        f"""
+        SELECT c.*, af.status AS audit_finding_status,
+               af.business_node_id AS audit_finding_business_node_id
+        FROM business_node_conclusions c
+        LEFT JOIN audit_findings af
+          ON af.id = c.audit_finding_id
+         AND af.project_id = c.project_id
+        {where_sql}
+        ORDER BY c.project_id, c.business_node_id, c.created_at DESC, c.rowid DESC
+        """,
+        params,
+    ).fetchall()
+    seen: set[tuple[str, str]] = set()
+    updated_count = 0
+    update_time = now or utcnow()
+    for row in rows:
+        key = (row["project_id"], row["business_node_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        if not _business_node_conclusion_provides_coverage(row, row["business_node_id"]):
+            continue
+        status = business_node_coverage_status_for_conclusion(row["conclusion"])
+        assert status is not None
+        result = conn.execute(
+            """
+            UPDATE business_nodes
+            SET review_status = ?,
+                coverage_note = ?,
+                updated_at = ?
+            WHERE id = ? AND project_id = ?
+              AND (
+                  review_status != ?
+                  OR coverage_note IS NULL
+                  OR TRIM(coverage_note) = ''
+              )
+            """,
+            (
+                status,
+                business_node_coverage_note_for_conclusion(
+                    row["conclusion"],
+                    row["summary"],
+                    row["evidence"],
+                ),
+                update_time,
+                row["business_node_id"],
+                row["project_id"],
+                status,
+            ),
+        )
+        updated_count += result.rowcount
+    return updated_count
 
 
 def next_project_id(conn: sqlite3.Connection) -> str:
@@ -204,6 +325,38 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
             },
         )
 
+    missing_business_seed = conn.execute(
+        """
+        SELECT s.id AS snapshot_id,
+               (SELECT COUNT(*) FROM code_entrypoints ce WHERE ce.snapshot_id = s.id) AS entrypoint_count,
+               (SELECT COUNT(*) FROM audit_candidates ac WHERE ac.snapshot_id = s.id) AS candidate_count,
+               (SELECT COUNT(*) FROM business_nodes bn WHERE bn.project_id = s.project_id) AS business_node_count
+        FROM source_snapshots s
+        WHERE s.project_id = ?
+          AND s.status = 'ready'
+        ORDER BY s.created_at DESC
+        LIMIT 1
+        """,
+        (project_id,),
+    ).fetchone()
+    if (
+        missing_business_seed is not None
+        and missing_business_seed["business_node_count"] == 0
+        and (
+            missing_business_seed["entrypoint_count"] > 0
+            or missing_business_seed["candidate_count"] > 0
+        )
+    ):
+        raise HTTPException(
+            409,
+            {
+                "message": "Ready source index requires business graph seed before completion",
+                "snapshot_id": missing_business_seed["snapshot_id"],
+                "entrypoint_count": missing_business_seed["entrypoint_count"],
+                "candidate_count": missing_business_seed["candidate_count"],
+            },
+        )
+
     pending_high_findings = conn.execute(
         """
         SELECT id, title, severity, status, file_path, line_start, entry_point,
@@ -221,7 +374,7 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
         raise HTTPException(
             409,
             {
-                "message": "High or critical audit findings require independent review before completion",
+                "message": "High or critical audit findings require confirmation before completion",
                 "audit_findings": [
                     {
                         "id": row["id"],
@@ -293,8 +446,14 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
         """,
         (project_id,),
     ).fetchall()
+    latest_conclusions_by_node = _load_latest_business_node_conclusions(conn, project_id)
     coverage_blockers = [
-        row for row in business_nodes if not _business_node_has_coverage(row)
+        row
+        for row in business_nodes
+        if not _business_node_has_effective_coverage(
+            row,
+            latest_conclusions_by_node.get(row["id"]),
+        )
     ][:20]
     if coverage_blockers:
         raise HTTPException(
@@ -319,20 +478,7 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
 
     conclusion_blockers = []
     for row in business_nodes:
-        conclusion = conn.execute(
-            """
-            SELECT c.*, af.status AS audit_finding_status,
-                   af.business_node_id AS audit_finding_business_node_id
-            FROM business_node_conclusions c
-            LEFT JOIN audit_findings af
-              ON af.id = c.audit_finding_id
-             AND af.project_id = c.project_id
-            WHERE c.project_id = ? AND c.business_node_id = ?
-            ORDER BY c.created_at DESC, c.rowid DESC
-            LIMIT 1
-            """,
-            (project_id, row["id"]),
-        ).fetchone()
+        conclusion = latest_conclusions_by_node.get(row["id"])
         reason = _business_node_conclusion_blocker_reason(conclusion, row["id"])
         if reason is not None:
             conclusion_blockers.append(
@@ -373,6 +519,50 @@ def _business_node_has_coverage(row: sqlite3.Row) -> bool:
         and row["coverage_note"] is not None
         and row["coverage_note"].strip() != ""
     )
+
+
+def _business_node_has_effective_coverage(
+    row: sqlite3.Row,
+    conclusion: sqlite3.Row | None,
+) -> bool:
+    if _business_node_has_coverage(row):
+        return True
+    return _business_node_conclusion_provides_coverage(conclusion, row["id"])
+
+
+def _business_node_conclusion_provides_coverage(
+    conclusion: sqlite3.Row | None,
+    business_node_id: str,
+) -> bool:
+    if _business_node_conclusion_blocker_reason(conclusion, business_node_id) is not None:
+        return False
+    return (
+        conclusion is not None
+        and business_node_coverage_status_for_conclusion(conclusion["conclusion"]) is not None
+    )
+
+
+def _load_latest_business_node_conclusions(
+    conn: sqlite3.Connection,
+    project_id: str,
+) -> dict[str, sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT c.*, af.status AS audit_finding_status,
+               af.business_node_id AS audit_finding_business_node_id
+        FROM business_node_conclusions c
+        LEFT JOIN audit_findings af
+          ON af.id = c.audit_finding_id
+         AND af.project_id = c.project_id
+        WHERE c.project_id = ?
+        ORDER BY c.business_node_id, c.created_at DESC, c.rowid DESC
+        """,
+        (project_id,),
+    ).fetchall()
+    latest: dict[str, sqlite3.Row] = {}
+    for row in rows:
+        latest.setdefault(row["business_node_id"], row)
+    return latest
 
 
 _PROOF_PLACEHOLDER_RE = re.compile(

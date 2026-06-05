@@ -67,6 +67,20 @@ def create_report_enrichment(project_id: str, body: CreateReportEnrichmentReques
             raise HTTPException(404, "Audit finding not found")
         if finding["status"] != "confirmed":
             raise HTTPException(409, "Report enrichment only accepts confirmed findings")
+        existing = conn.execute(
+            """
+            SELECT *
+            FROM report_enrichment_tasks
+            WHERE project_id = ?
+              AND finding_id = ?
+              AND status IN ('pending', 'running')
+            ORDER BY created_at
+            LIMIT 1
+            """,
+            (project_id, body.finding_id),
+        ).fetchone()
+        if existing is not None:
+            return _task_from_row(existing)
         conn.execute(
             """
             INSERT INTO report_enrichment_tasks (
@@ -104,6 +118,57 @@ def list_pending_report_enrichments(project_id: str | None = None, limit: int = 
             params,
         ).fetchall()
     return [_task_from_row(row) for row in rows]
+
+
+@router.get("/api/report-enrichment-tasks")
+def list_report_enrichment_task_queue(
+    project_id: str | None = None,
+    finding_id: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+):
+    if limit < 1 or limit > 500:
+        raise HTTPException(400, "limit must be between 1 and 500")
+    if status and status not in ("pending", "running", "completed", "failed"):
+        raise HTTPException(400, "Unsupported report enrichment task status")
+    clauses: list[str] = []
+    params: list[object] = []
+    if project_id:
+        clauses.append("t.project_id = ?")
+        params.append(project_id)
+    if finding_id:
+        clauses.append("t.finding_id = ?")
+        params.append(finding_id)
+    if status:
+        clauses.append("t.status = ?")
+        params.append(status)
+    params.append(limit)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT t.*, p.title AS project_title, f.title AS finding_title,
+                   f.severity AS finding_severity
+            FROM report_enrichment_tasks t
+            JOIN projects p ON p.id = t.project_id
+            LEFT JOIN audit_findings f
+              ON f.id = t.finding_id
+             AND f.project_id = t.project_id
+            {where_sql}
+            ORDER BY
+                CASE t.status
+                    WHEN 'running' THEN 0
+                    WHEN 'pending' THEN 1
+                    WHEN 'failed' THEN 2
+                    ELSE 3
+                END,
+                datetime(t.created_at) DESC,
+                t.id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    return [_queue_task_from_row(row) for row in rows]
 
 
 @router.post("/api/report-enrichments/{task_id}/claim", response_model=ReportEnrichmentTask)
@@ -225,6 +290,67 @@ def fail_report_enrichment(task_id: str, body: FailReportEnrichmentRequest):
             WHERE id = ?
             """,
             (now, now, body.error_message[:2000], task_id),
+        )
+        updated = conn.execute("SELECT * FROM report_enrichment_tasks WHERE id = ?", (task_id,)).fetchone()
+    assert updated is not None
+    return _task_from_row(updated)
+
+
+@router.post("/api/report-enrichments/{task_id}/cancel", response_model=ReportEnrichmentTask)
+def cancel_report_enrichment(task_id: str, body: ClaimReportEnrichmentRequest):
+    now = utcnow()
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM report_enrichment_tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "Report enrichment task not found")
+        if row["status"] not in ("pending", "running"):
+            return _task_from_row(row)
+        conn.execute(
+            """
+            UPDATE report_enrichment_tasks
+            SET status = 'failed',
+                completed_at = ?,
+                last_heartbeat_at = ?,
+                error_message = ?
+            WHERE id = ?
+            """,
+            (now, now, f"Cancelled by {body.worker}", task_id),
+        )
+        updated = conn.execute("SELECT * FROM report_enrichment_tasks WHERE id = ?", (task_id,)).fetchone()
+    assert updated is not None
+    return _task_from_row(updated)
+
+
+@router.post("/api/report-enrichments/{task_id}/retry", response_model=ReportEnrichmentTask)
+def retry_report_enrichment(task_id: str, body: ClaimReportEnrichmentRequest):
+    now = utcnow()
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM report_enrichment_tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "Report enrichment task not found")
+        check_project_active(conn, row["project_id"])
+        _validate_confirmed_finding(conn, row["project_id"], row["finding_id"])
+        if row["status"] != "failed":
+            raise HTTPException(409, f"Only failed report enrichment tasks can be retried; current status is {row['status']}")
+        conn.execute(
+            """
+            UPDATE report_enrichment_tasks
+            SET status = 'pending',
+                worker = NULL,
+                started_at = NULL,
+                last_heartbeat_at = NULL,
+                completed_at = NULL,
+                error_message = NULL,
+                created_by = ?,
+                created_at = ?,
+                packet_templates_json = '[]',
+                reproduction_poc_json = '{}',
+                evidence_chain_json = '[]',
+                report_sections_json = '{}',
+                delivery_notes_json = '[]'
+            WHERE id = ?
+            """,
+            (body.worker, now, task_id),
         )
         updated = conn.execute("SELECT * FROM report_enrichment_tasks WHERE id = ?", (task_id,)).fetchone()
     assert updated is not None
@@ -387,6 +513,21 @@ def _running_task_for_worker(conn, task_id: str, worker: str):
     return row
 
 
+def _validate_confirmed_finding(conn, project_id: str, finding_id: str) -> None:
+    row = conn.execute(
+        """
+        SELECT status
+        FROM audit_findings
+        WHERE id = ? AND project_id = ?
+        """,
+        (finding_id, project_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "Audit finding not found")
+    if row["status"] != "confirmed":
+        raise HTTPException(409, "Report enrichment only accepts confirmed findings")
+
+
 def _validate_enrichment_result(body: CompleteReportEnrichmentRequest) -> None:
     if not body.packet_templates and not _has_complete_reproduction_poc(body.reproduction_poc):
         raise HTTPException(422, "Report enrichment requires packet_templates or complete reproduction_poc")
@@ -435,6 +576,14 @@ def _task_from_row(row) -> ReportEnrichmentTask:
     data["report_sections"] = _decode_json_dict(data.pop("report_sections_json", None))
     data["delivery_notes"] = _decode_json_string_list(data.pop("delivery_notes_json", None))
     return ReportEnrichmentTask(**data)
+
+
+def _queue_task_from_row(row) -> dict:
+    data = _task_from_row(row).model_dump()
+    data["project_title"] = row["project_title"]
+    data["finding_title"] = row["finding_title"]
+    data["finding_severity"] = row["finding_severity"]
+    return data
 
 
 def _decode_json_list(raw: str | None) -> list:

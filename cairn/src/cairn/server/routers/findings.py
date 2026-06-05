@@ -106,6 +106,9 @@ def create_audit_finding(project_id: str, body: CreateAuditFindingRequest):
     with get_conn() as conn:
         get_project_or_404(conn, project_id)
         _validate_snapshot(conn, project_id, body.snapshot_id)
+        inferred_business_node_id = _infer_business_node_for_finding(conn, project_id, body)
+        if inferred_business_node_id and not body.business_node_id:
+            body = body.model_copy(update={"business_node_id": inferred_business_node_id})
         _validate_audit_finding_quality(conn, project_id, body)
         conn.execute(
             """
@@ -455,6 +458,43 @@ def _validate_candidate_links(conn, project_id: str, body: CreateAuditCandidateR
         ).fetchone()
         if row is None:
             raise HTTPException(404, "Tool finding not found")
+
+
+def _infer_business_node_for_finding(
+    conn,
+    project_id: str,
+    body: CreateAuditFindingRequest,
+) -> str | None:
+    if body.business_node_id:
+        return body.business_node_id
+    if not body.file_path:
+        return None
+    rows = conn.execute(
+        """
+        SELECT id, candidate_type, line_start, entry_point, business_node_id
+        FROM audit_candidates
+        WHERE project_id = ?
+          AND snapshot_id = ?
+          AND file_path = ?
+          AND business_node_id IS NOT NULL
+        """,
+        (project_id, body.snapshot_id, body.file_path),
+    ).fetchall()
+    if not rows:
+        return None
+
+    def score(row) -> tuple[int, int, int]:
+        exact_line = body.line_start is not None and row["line_start"] == body.line_start
+        same_entry = bool(body.entry_point and row["entry_point"] and row["entry_point"] in body.entry_point)
+        data_flow = row["candidate_type"] == "data_flow"
+        return (
+            0 if exact_line else 1,
+            0 if same_entry else 1,
+            0 if data_flow else 1,
+        )
+
+    best = sorted(rows, key=score)[0]
+    return best["business_node_id"]
 
 
 def _validate_candidate_conclusion(

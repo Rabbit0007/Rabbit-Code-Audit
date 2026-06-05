@@ -16,6 +16,8 @@ session:
 - Do not turn scanner output or speculation into a confirmed vulnerability.
 - Include exact code locations and evidence when already known.
 - State inconclusive or non-exploitable results accurately.
+- The graph and code index are navigation context, not proof. In conclude fallback, do not create `business_node_conclusions` for nodes whose relevant source code was not actually read during the execute session; summarize the limitation in `description` instead.
+- Do not emit repeated `needs_more_evidence` business-node conclusions solely because a graph node is unreviewed or because source was not read.
 - If multiple vulnerabilities were already proven in this session, include every one in `findings`; do not leave them only in prose.
 - Any high or critical `findings` item must include either one complete `proof_packets` item with concrete `payload`, complete HTTP `request` including `Host` or exact command, and observed HTTP status line plus response body, or one complete `reproduction_poc` object with concrete `payload`, `request_template` or `command`, `steps`, `expected_result`, and `verification`.
 - Do not use placeholders in proof packets: no `<target>`, `<项目事实未记录目标主机>`, `id=...`, `待补充`, `需复测`, or similar incomplete material.

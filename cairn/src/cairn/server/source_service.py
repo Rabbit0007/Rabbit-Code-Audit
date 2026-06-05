@@ -4,6 +4,8 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import shutil
 import socket
@@ -33,6 +35,7 @@ MAX_EXTRACTED_BYTES = 5 * 1024 * 1024 * 1024
 MAX_FILE_BYTES = 100 * 1024 * 1024
 MAX_FILE_COUNT = 200_000
 COPY_CHUNK_BYTES = 1024 * 1024
+MAX_CANDIDATE_TEXT_BYTES = 2 * 1024 * 1024
 
 LANGUAGE_BY_SUFFIX: dict[str, str] = {
     ".c": "C",
@@ -71,6 +74,118 @@ WEB_SCRIPT_EXCLUDED_PARTS = {
     "venv",
 }
 MAX_SOURCE_INDEX_CANDIDATES = 2000
+MAX_DATA_FLOW_CANDIDATES_PER_FILE = 8
+MAX_INPUT_TO_SINK_LINE_DISTANCE = 80
+
+InputVariableMap = dict[str, list[int]]
+
+
+@dataclass(frozen=True)
+class RiskSignal:
+    category: str
+    title: str
+    line_start: int
+    line_end: int | None
+    evidence: str
+    source_summary: str
+    symbol: str | None = None
+
+
+@dataclass(frozen=True)
+class SinkPattern:
+    category: str
+    title: str
+    pattern: re.Pattern[str]
+
+
+INPUT_SOURCE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("HTTP 参数/请求体", re.compile(r"\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\b|php://input")),
+    ("HTTP 请求对象", re.compile(r"\b(?:req|request|ctx)\.(?:query|body|params|headers|cookies)\b")),
+    ("SatRDA 请求对象", re.compile(r"\br\.(?:jsonBody|body|formValue|url\.query\.get|url\.rawQuery)\b|\bUrlUtils\.queryParams\s*\(\s*r\.url\.rawQuery\s*\)")),
+    ("Python Web 请求", re.compile(r"\brequest\.(?:args|form|json|data|cookies|headers|GET|POST)\b")),
+    ("Java Web 参数", re.compile(r"\b(?:getParameter|getHeader|getCookies)\s*\(|@(RequestParam|PathVariable|RequestBody)\b")),
+    ("Go Web 参数", re.compile(r"\b(?:URL\.Query|FormValue|PostFormValue|Param)\s*\(")),
+)
+INPUT_VARIABLE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\$([A-Za-z_][\w]*)\s*=\s*.*(?:\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\b|php://input)"),
+    re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*.*\b(?:req|request|ctx)\.(?:query|body|params|headers|cookies)\b"),
+    re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*.*(?:\br\.(?:jsonBody|body|formValue|url\.query\.get|url\.rawQuery)\b|\bUrlUtils\.queryParams\s*\(\s*r\.url\.rawQuery\s*\))"),
+    re.compile(r"\b([A-Za-z_][\w]*)\s*=\s*request\.(?:args|form|json|data|cookies|headers|GET|POST)\b"),
+    re.compile(r"\b(?:String|var)\s+([A-Za-z_][\w]*)\s*=\s*[^;]*\b(?:getParameter|getHeader)\s*\("),
+    re.compile(r"\b([A-Za-z_][\w]*)\s*:=\s*[^;\n]*\b(?:URL\.Query|FormValue|PostFormValue|Param)\s*\("),
+)
+JS_DESTRUCTURING_PATTERN = re.compile(r"\b(?:const|let|var)\s*\{([^}]+)\}\s*=\s*([A-Za-z_$][\w$]*)")
+JS_DERIVED_VARIABLE_PATTERN = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(.+)")
+PHP_DERIVED_VARIABLE_PATTERN = re.compile(r"\$([A-Za-z_][\w]*)\s*=\s*(.+)")
+SINK_PATTERNS: tuple[SinkPattern, ...] = (
+    SinkPattern(
+        "SQL 注入面",
+        "SQL 查询执行",
+        re.compile(
+            r"\b(?:mysql_query|mysqli_query|mysqli_multi_query|pg_query|sqlite_query)\s*\("
+            r"|->query\s*\("
+            r"|\$[A-Za-z_][\w]*\s*=\s*[^;\n]*(?:SELECT|INSERT|UPDATE|DELETE|REPLACE)\b"
+            r"|\b(?:query|execute|executeQuery|executeUpdate|cursor\.execute)\s*\([^;\n]*(?:SELECT|INSERT|UPDATE|DELETE|REPLACE)\b"
+            r"|\b[A-Za-z_$][\w$]*\.(?:query|execute|queryLong|queryString|syntaxFromSQL)\s*\(",
+            re.IGNORECASE,
+        ),
+    ),
+    SinkPattern(
+        "命令执行面",
+        "系统命令执行",
+        re.compile(
+            r"\b(?:system|exec|shell_exec|passthru|popen|proc_open)\s*\("
+            r"|\bchild_process\.(?:exec|execFile|spawn)\s*\("
+            r"|\bsubprocess\.(?:Popen|run|call|check_output)\s*\("
+            r"|\bos\.system\s*\("
+            r"|\bRuntime\.getRuntime\(\)\.exec\s*\("
+            r"|\bProcessBuilder\s*\(",
+            re.IGNORECASE,
+        ),
+    ),
+    SinkPattern(
+        "文件/包含操作面",
+        "文件读取写入或动态包含",
+        re.compile(
+            r"\b(?:include|require|include_once|require_once)\s*\(?"
+            r"|\b(?:file_get_contents|readfile|fopen|unlink|copy|move_uploaded_file)\s*\("
+            r"|\bfs\.(?:readFile|writeFile|unlink|createReadStream)\s*\("
+            r"|\b(?:satrda\.(?:writeFile|fileOpen)|ctx\.(?:serveContent|saveMultipartFile))\s*\("
+            r"|\bopen\s*\([^;\n]*(?:request\.|req\.|\$_)",
+            re.IGNORECASE,
+        ),
+    ),
+    SinkPattern(
+        "SSRF/外联请求面",
+        "服务端外联请求",
+        re.compile(
+            r"\bcurl_exec\s*\("
+            r"|\bcurl_setopt\s*\([^;\n]*CURLOPT_URL"
+            r"|\brequests\.(?:get|post|put|delete|request)\s*\("
+            r"|\burllib\.request\."
+            r"|\bhttp\.Get\s*\("
+            r"|\b(?:fetch|axios\.(?:get|post|request))\s*\(",
+            re.IGNORECASE,
+        ),
+    ),
+    SinkPattern(
+        "反序列化面",
+        "不可信数据反序列化",
+        re.compile(
+            r"\bunserialize\s*\("
+            r"|\bpickle\.loads\s*\("
+            r"|\byaml\.load\s*\("
+            r"|\bObjectInputStream\b"
+            r"|\breadObject\s*\(",
+            re.IGNORECASE,
+        ),
+    ),
+    SinkPattern(
+        "响应输出面",
+        "未确认编码的响应输出",
+        re.compile(r"\b(?:echo|print|printf)\b|\bres\.(?:send|write|end)\s*\(|\.innerHTML\s*=", re.IGNORECASE),
+    ),
+)
 
 
 def artifact_root() -> Path:
@@ -282,6 +397,23 @@ def list_dependency_manifests(project_id: str, snapshot_id: str, limit: int = 10
     ]
 
 
+def rebuild_source_index(snapshot_id: str) -> None:
+    root = snapshot_path(snapshot_id)
+    if not root.exists():
+        raise ValueError("Source snapshot files not found")
+    with db.get_conn() as conn:
+        snapshot_row = conn.execute("SELECT * FROM source_snapshots WHERE id = ?", (snapshot_id,)).fetchone()
+        if snapshot_row is None:
+            raise ValueError("Source snapshot not found")
+        if snapshot_row["status"] != "ready":
+            raise ValueError("Source snapshot is not ready")
+        files = _load_code_files(conn, snapshot_id)
+        code_index = extract_code_index(snapshot_id, root, files)
+        _insert_code_index(conn, code_index)
+        _insert_audit_candidates_from_index(conn, snapshot_id, files, code_index, root=root)
+        _ensure_business_graph_seed(conn, snapshot_id)
+
+
 def _validate_public_git_url(repository_url: str) -> None:
     parsed = urlparse(repository_url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
@@ -432,7 +564,8 @@ def _finalize_snapshot(
             ],
         )
         _insert_code_index(conn, code_index)
-        _insert_audit_candidates_from_index(conn, snapshot_id, files, code_index)
+        _insert_audit_candidates_from_index(conn, snapshot_id, files, code_index, root=snapshot_path(snapshot_id))
+        _ensure_business_graph_seed(conn, snapshot_id)
         conn.execute(
             """
             UPDATE source_snapshots
@@ -464,7 +597,7 @@ def _finalize_snapshot(
 def _insert_code_index(conn, code_index) -> None:
     conn.executemany(
         """
-        INSERT INTO code_symbols (
+        INSERT OR IGNORE INTO code_symbols (
             id, snapshot_id, path, language, kind, name, container,
             signature, line_start, line_end
         )
@@ -488,7 +621,7 @@ def _insert_code_index(conn, code_index) -> None:
     )
     conn.executemany(
         """
-        INSERT INTO code_entrypoints (
+        INSERT OR IGNORE INTO code_entrypoints (
             id, snapshot_id, path, language, kind, framework, method,
             route, handler, line_start, evidence
         )
@@ -513,7 +646,7 @@ def _insert_code_index(conn, code_index) -> None:
     )
     conn.executemany(
         """
-        INSERT INTO dependency_manifests (
+        INSERT OR IGNORE INTO dependency_manifests (
             id, snapshot_id, path, manifest_type, package_name,
             dependencies_json, dev_dependencies_json
         )
@@ -534,14 +667,27 @@ def _insert_code_index(conn, code_index) -> None:
     )
 
 
-def _insert_audit_candidates_from_index(conn, snapshot_id: str, files: list[CodeFile], code_index) -> None:
+def _insert_audit_candidates_from_index(
+    conn,
+    snapshot_id: str,
+    files: list[CodeFile],
+    code_index,
+    *,
+    root: Path | None = None,
+) -> None:
     row = conn.execute(
-        "SELECT project_id FROM source_snapshots WHERE id = ?",
+        """
+        SELECT s.project_id, p.status AS project_status
+        FROM source_snapshots s
+        JOIN projects p ON p.id = s.project_id
+        WHERE s.id = ?
+        """,
         (snapshot_id,),
     ).fetchone()
     if row is None:
         return
     project_id = row["project_id"]
+    project_completed = row["project_status"] == "completed"
     created_at = utcnow()
     candidates: list[tuple[object, ...]] = []
     seen: set[tuple[str, str | None, int | None, str | None]] = set()
@@ -565,6 +711,19 @@ def _insert_audit_candidates_from_index(conn, snapshot_id: str, files: list[Code
             return
         seen.add(key)
         candidate_id = _stable_candidate_id(snapshot_id, source, candidate_type, file_path, line_start, entry_point, title)
+        status = "needs_more_evidence" if project_completed else "candidate"
+        conclusion_summary = None
+        evidence = None
+        concluded_by = None
+        concluded_at = None
+        if project_completed:
+            conclusion_summary = (
+                "项目完成后由源码索引回填该待审计面，未重新判定漏洞，"
+                "仅作为后续确认覆盖线索保留。"
+            )
+            evidence = _candidate_backfill_evidence(file_path, line_start, description)
+            concluded_by = "source_index_backfill"
+            concluded_at = created_at
         candidates.append(
             (
                 candidate_id,
@@ -580,19 +739,26 @@ def _insert_audit_candidates_from_index(conn, snapshot_id: str, files: list[Code
                 line_end,
                 entry_point,
                 symbol,
-                "candidate",
+                status,
+                conclusion_summary,
+                evidence,
                 "source_index",
                 created_at,
                 created_at,
+                concluded_by,
+                concluded_at,
             )
         )
 
+    source_root = root or snapshot_path(snapshot_id)
     indexed_entrypoint_paths: set[str] = set()
+    entrypoint_by_path: dict[str, str] = {}
     for entrypoint in code_index.entrypoints:
         if not _is_candidate_source_path(entrypoint.path):
             continue
         indexed_entrypoint_paths.add(entrypoint.path)
         label = _entrypoint_label(entrypoint.method, entrypoint.route)
+        entrypoint_by_path.setdefault(entrypoint.path, label)
         add_candidate(
             source="index",
             candidate_type="entrypoint",
@@ -626,6 +792,34 @@ def _insert_audit_candidates_from_index(conn, snapshot_id: str, files: list[Code
             entry_point=route,
         )
 
+    for file in files:
+        if file.is_binary or not _is_candidate_source_path(file.path):
+            continue
+        text = _read_candidate_text(source_root / file.path)
+        if text is None:
+            continue
+        entry_point = entrypoint_by_path.get(file.path)
+        if entry_point is None and _is_web_script_candidate_path(file.path):
+            entry_point = f"/{file.path}"
+        for signal in _extract_risk_signals(text):
+            add_candidate(
+                source="index",
+                candidate_type="data_flow",
+                title=f"审计数据流: {signal.category} {file.path}:{signal.line_start}",
+                description=(
+                    f"源码索引发现 {file.path}:{signal.line_start} 存在 {signal.title}，"
+                    f"同时在同一文件识别到 {signal.source_summary}。"
+                    "该候选只表示需要审计，不代表已确认漏洞；请检查输入可达性、净化/参数化、"
+                    "权限控制和真实影响，并输出结构化 findings 或 candidate_conclusions。"
+                    f" 代码证据：{signal.evidence}"
+                ),
+                file_path=file.path,
+                line_start=signal.line_start,
+                line_end=signal.line_end,
+                entry_point=entry_point,
+                symbol=signal.symbol,
+            )
+
     if not candidates:
         return
     conn.executemany(
@@ -633,12 +827,241 @@ def _insert_audit_candidates_from_index(conn, snapshot_id: str, files: list[Code
         INSERT OR IGNORE INTO audit_candidates (
             id, project_id, snapshot_id, source, candidate_type, severity,
             title, description, file_path, line_start, line_end, entry_point,
-            symbol, status, created_by, created_at, updated_at
+            symbol, status, conclusion_summary, evidence, created_by,
+            created_at, updated_at, concluded_by, concluded_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         candidates,
     )
+
+
+def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
+    row = conn.execute(
+        "SELECT project_id FROM source_snapshots WHERE id = ?",
+        (snapshot_id,),
+    ).fetchone()
+    if row is None:
+        return
+    project_id = row["project_id"]
+    now = utcnow()
+    endpoint_by_path: dict[str, str] = {}
+    endpoint_by_label: dict[str, str] = {}
+
+    entrypoints = conn.execute(
+        """
+        SELECT path, method, route, handler, line_start, evidence
+        FROM code_entrypoints
+        WHERE snapshot_id = ?
+        ORDER BY path, COALESCE(line_start, 0), route, COALESCE(method, '')
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    for entrypoint in entrypoints:
+        if not _is_candidate_source_path(entrypoint["path"]):
+            continue
+        label = _entrypoint_label(entrypoint["method"], entrypoint["route"])
+        node_id = _stable_business_id(
+            "biz",
+            snapshot_id,
+            "endpoint",
+            entrypoint["path"],
+            label,
+            entrypoint["handler"],
+            entrypoint["line_start"],
+        )
+        endpoint_by_path.setdefault(entrypoint["path"], node_id)
+        endpoint_by_label[label] = node_id
+        evidence = _business_evidence(entrypoint["path"], entrypoint["line_start"], entrypoint["evidence"])
+        _insert_business_node_seed(
+            conn,
+            project_id,
+            node_id=node_id,
+            node_type="endpoint",
+            title=f"入口 {label}",
+            description=(
+                f"源码索引识别到入口 {label}，处理器为 {entrypoint['handler'] or '未命名'}。"
+                "该节点用于业务图导航和覆盖跟踪，不代表漏洞结论。"
+            ),
+            risk_level="medium",
+            review_status="unreviewed",
+            coverage_note="索引自动生成的入口节点，供审计调度和可视化使用。",
+            risk_tags=["入口"],
+            evidence=evidence,
+            created_by="source_index",
+            now=now,
+        )
+        conn.execute(
+            """
+            UPDATE audit_candidates
+            SET business_node_id = ?, updated_at = ?
+            WHERE snapshot_id = ?
+              AND business_node_id IS NULL
+              AND candidate_type IN ('entrypoint', 'web_entrypoint')
+              AND file_path = ?
+              AND entry_point = ?
+            """,
+            (node_id, now, snapshot_id, entrypoint["path"], label),
+        )
+
+    candidates = conn.execute(
+        """
+        SELECT id, candidate_type, title, description, file_path, line_start,
+               line_end, entry_point, symbol, business_node_id
+        FROM audit_candidates
+        WHERE snapshot_id = ?
+          AND source = 'index'
+          AND candidate_type = 'data_flow'
+        ORDER BY created_at, id
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    for candidate in candidates:
+        node_id = _stable_business_id("biz", snapshot_id, "risk", candidate["id"])
+        evidence = _business_evidence(candidate["file_path"], candidate["line_start"], candidate["description"])
+        risk_tag = _candidate_risk_tag(candidate["title"])
+        _insert_business_node_seed(
+            conn,
+            project_id,
+            node_id=node_id,
+            node_type="risk",
+            title=f"待审计风险面 {candidate['title']}",
+            description=(
+                f"{candidate['description']} "
+                "该节点由源码索引生成，只表示需要 worker 读取源码确认，不代表已确认漏洞。"
+            ),
+            risk_level="unknown",
+            review_status="unreviewed",
+            coverage_note="索引自动生成的高价值待审计风险面，需要源码证据闭环。",
+            risk_tags=[risk_tag] if risk_tag else ["待审计风险面"],
+            evidence=evidence,
+            created_by="source_index",
+            now=now,
+        )
+        conn.execute(
+            """
+            UPDATE audit_candidates
+            SET business_node_id = ?, updated_at = ?
+            WHERE id = ? AND snapshot_id = ? AND business_node_id IS NULL
+            """,
+            (node_id, now, candidate["id"], snapshot_id),
+        )
+        endpoint_id = endpoint_by_label.get(candidate["entry_point"] or "") or endpoint_by_path.get(candidate["file_path"] or "")
+        if endpoint_id:
+            _insert_business_edge_seed(
+                conn,
+                project_id,
+                from_node_id=endpoint_id,
+                to_node_id=node_id,
+                relation="risk_of",
+                description="入口关联到索引发现的待审计风险面。",
+                created_by="source_index",
+                now=now,
+            )
+
+
+def _insert_business_node_seed(
+    conn,
+    project_id: str,
+    *,
+    node_id: str,
+    node_type: str,
+    title: str,
+    description: str,
+    risk_level: str,
+    review_status: str,
+    coverage_note: str,
+    risk_tags: list[str],
+    evidence: list[str],
+    created_by: str,
+    now: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO business_nodes (
+            id, project_id, node_type, title, description, risk_level,
+            review_status, coverage_note, last_intent_id, risk_tags_json,
+            evidence_json, created_by, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+        """,
+        (
+            node_id,
+            project_id,
+            node_type,
+            title[:200],
+            description[:2000],
+            risk_level,
+            review_status,
+            coverage_note[:1000],
+            json.dumps(risk_tags, ensure_ascii=False),
+            json.dumps(evidence[:5], ensure_ascii=False),
+            created_by,
+            now,
+            now,
+        ),
+    )
+
+
+def _insert_business_edge_seed(
+    conn,
+    project_id: str,
+    *,
+    from_node_id: str,
+    to_node_id: str,
+    relation: str,
+    description: str,
+    created_by: str,
+    now: str,
+) -> None:
+    edge_id = _stable_business_id("bedge", project_id, from_node_id, to_node_id, relation)
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO business_edges (
+            id, project_id, from_node_id, to_node_id, relation,
+            description, created_by, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            edge_id,
+            project_id,
+            from_node_id,
+            to_node_id,
+            relation,
+            description,
+            created_by,
+            now,
+        ),
+    )
+
+
+def _business_evidence(path: str | None, line_start: int | None, detail: str | None) -> list[str]:
+    if not path:
+        return []
+    location = f"{path}:{line_start}" if line_start else path
+    if detail:
+        return [f"{location} {detail[:220]}"]
+    return [location]
+
+
+def _candidate_backfill_evidence(file_path: str | None, line_start: int | None, description: str) -> str:
+    location = f"{file_path}:{line_start}" if file_path and line_start else file_path or "source index"
+    return f"{location} {description[:500]}"
+
+
+def _candidate_risk_tag(title: str | None) -> str | None:
+    if not title:
+        return None
+    match = re.search(r"审计数据流:\s*([^\s]+)", title)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _stable_business_id(prefix: str, *parts: object) -> str:
+    digest = hashlib.sha1("\0".join("" if part is None else str(part) for part in parts).encode("utf-8")).hexdigest()
+    return f"{prefix}_{digest[:16]}"
 
 
 def _stable_candidate_id(*parts: object) -> str:
@@ -662,6 +1085,171 @@ def _is_web_script_candidate_path(path: str) -> bool:
     return _is_candidate_source_path(path)
 
 
+def _read_candidate_text(path: Path) -> str | None:
+    try:
+        if path.stat().st_size > MAX_CANDIDATE_TEXT_BYTES:
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _extract_risk_signals(text: str) -> list[RiskSignal]:
+    sources = _collect_input_sources(text)
+    if not sources:
+        return []
+    input_variables = _collect_input_variables(text)
+    signals: list[RiskSignal] = []
+    seen: set[tuple[str, int]] = set()
+    for lineno, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith(("//", "#")):
+            continue
+        for sink in SINK_PATTERNS:
+            if not sink.pattern.search(line):
+                continue
+            if not _sink_line_is_tied_to_input(line, lineno, input_variables):
+                continue
+            key = (sink.category, lineno)
+            if key in seen:
+                continue
+            nearby_sources = _nearby_input_sources(sources, lineno)
+            seen.add(key)
+            signals.append(
+                RiskSignal(
+                    category=sink.category,
+                    title=sink.title,
+                    line_start=lineno,
+                    line_end=lineno,
+                    evidence=line[:260],
+                    source_summary=_source_summary(nearby_sources or sources[:3]),
+                    symbol=_best_input_symbol(line, lineno, input_variables),
+                )
+            )
+            if len(signals) >= MAX_DATA_FLOW_CANDIDATES_PER_FILE:
+                return signals
+    return signals
+
+
+def _collect_input_sources(text: str) -> list[tuple[int, str]]:
+    sources: list[tuple[int, str]] = []
+    for lineno, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith(("//", "#")):
+            continue
+        if any(pattern.search(line) for _label, pattern in INPUT_SOURCE_PATTERNS):
+            sources.append((lineno, line[:180]))
+            if len(sources) >= 12:
+                break
+    return sources
+
+
+def _collect_input_variables(text: str) -> InputVariableMap:
+    variables: InputVariableMap = {}
+    lines = text.splitlines()
+    for lineno, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        for pattern in INPUT_VARIABLE_PATTERNS:
+            match = pattern.search(stripped)
+            if match:
+                _add_input_variable(variables, match.group(1), lineno)
+    changed = True
+    while changed:
+        changed = False
+        for lineno, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            destructured = JS_DESTRUCTURING_PATTERN.search(stripped)
+            if destructured and _has_nearby_input_variable(destructured.group(2), lineno, variables):
+                for name in re.findall(r"\b([A-Za-z_$][\w$]*)\b", destructured.group(1)):
+                    if _add_input_variable(variables, name, lineno):
+                        changed = True
+            derived = JS_DERIVED_VARIABLE_PATTERN.search(stripped)
+            if derived and _expression_uses_nearby_input(derived.group(2), lineno, variables, php=False):
+                if _add_input_variable(variables, derived.group(1), lineno):
+                    changed = True
+                continue
+            php_derived = PHP_DERIVED_VARIABLE_PATTERN.search(stripped)
+            if (
+                php_derived
+                and not any(sink.pattern.search(stripped) for sink in SINK_PATTERNS)
+                and _expression_uses_nearby_input(php_derived.group(2), lineno, variables, php=True)
+            ):
+                if _add_input_variable(variables, php_derived.group(1), lineno):
+                    changed = True
+    return variables
+
+
+def _add_input_variable(variables: InputVariableMap, name: str, lineno: int) -> bool:
+    if not name:
+        return False
+    locations = variables.setdefault(name, [])
+    if lineno in locations:
+        return False
+    locations.append(lineno)
+    locations.sort()
+    return True
+
+
+def _has_nearby_input_variable(name: str, lineno: int, variables: InputVariableMap) -> bool:
+    return any(
+        0 <= lineno - source_lineno <= MAX_INPUT_TO_SINK_LINE_DISTANCE
+        for source_lineno in variables.get(name, [])
+    )
+
+
+def _expression_uses_nearby_input(
+    expression: str,
+    lineno: int,
+    variables: InputVariableMap,
+    *,
+    php: bool,
+) -> bool:
+    for variable in variables:
+        if php:
+            pattern = rf"\${re.escape(variable)}\b"
+        else:
+            pattern = rf"\b{re.escape(variable)}\b"
+        if re.search(pattern, expression) and _has_nearby_input_variable(variable, lineno, variables):
+            return True
+    return False
+
+
+def _nearby_input_sources(sources: list[tuple[int, str]], sink_lineno: int) -> list[tuple[int, str]]:
+    nearby = [
+        (lineno, line)
+        for lineno, line in sources
+        if 0 <= sink_lineno - lineno <= MAX_INPUT_TO_SINK_LINE_DISTANCE
+    ]
+    return nearby[:3]
+
+
+def _source_summary(sources: list[tuple[int, str]]) -> str:
+    first_items = [f"第 {lineno} 行 `{line}`" for lineno, line in sources[:3]]
+    if len(sources) > 3:
+        first_items.append(f"另有 {len(sources) - 3} 处输入读取")
+    return "、".join(first_items)
+
+
+def _sink_line_is_tied_to_input(line: str, lineno: int, input_variables: InputVariableMap) -> bool:
+    if any(pattern.search(line) for _label, pattern in INPUT_SOURCE_PATTERNS):
+        return True
+    for variable in input_variables:
+        if not _has_nearby_input_variable(variable, lineno, input_variables):
+            continue
+        if re.search(rf"(?:\${re.escape(variable)}\b|\b{re.escape(variable)}\b)", line):
+            return True
+    return False
+
+
+def _best_input_symbol(line: str, lineno: int, input_variables: InputVariableMap) -> str | None:
+    for variable in sorted(input_variables):
+        if not _has_nearby_input_variable(variable, lineno, input_variables):
+            continue
+        if re.search(rf"(?:\${re.escape(variable)}\b|\b{re.escape(variable)}\b)", line):
+            return variable
+    return None
+
+
 def _ensure_code_index(snapshot: SourceSnapshot) -> None:
     if snapshot.status != "ready":
         return
@@ -680,30 +1268,13 @@ def _ensure_code_index(snapshot: SourceSnapshot) -> None:
         ).fetchone()["count"]
         if existing:
             _ensure_snapshot_audit_candidates(conn, snapshot, root)
+            _ensure_business_graph_seed(conn, snapshot.id)
             return
-        rows = conn.execute(
-            """
-            SELECT snapshot_id, path, size_bytes, sha256, language, is_binary
-            FROM code_files
-            WHERE snapshot_id = ?
-            ORDER BY path
-            """,
-            (snapshot.id,),
-        ).fetchall()
-        files = [
-            CodeFile(
-                snapshot_id=row["snapshot_id"],
-                path=row["path"],
-                size_bytes=row["size_bytes"],
-                sha256=row["sha256"],
-                language=row["language"],
-                is_binary=bool(row["is_binary"]),
-            )
-            for row in rows
-        ]
+        files = _load_code_files(conn, snapshot.id)
         code_index = extract_code_index(snapshot.id, root, files)
         _insert_code_index(conn, code_index)
-        _insert_audit_candidates_from_index(conn, snapshot.id, files, code_index)
+        _insert_audit_candidates_from_index(conn, snapshot.id, files, code_index, root=root)
+        _ensure_business_graph_seed(conn, snapshot.id)
 
 
 def _ensure_snapshot_audit_candidates(conn, snapshot: SourceSnapshot, root: Path) -> None:
@@ -713,6 +1284,13 @@ def _ensure_snapshot_audit_candidates(conn, snapshot: SourceSnapshot, root: Path
     ).fetchone()["count"]
     if existing:
         return
+    files = _load_code_files(conn, snapshot.id)
+    code_index = extract_code_index(snapshot.id, root, files)
+    _insert_audit_candidates_from_index(conn, snapshot.id, files, code_index, root=root)
+    _ensure_business_graph_seed(conn, snapshot.id)
+
+
+def _load_code_files(conn, snapshot_id: str) -> list[CodeFile]:
     rows = conn.execute(
         """
         SELECT snapshot_id, path, size_bytes, sha256, language, is_binary
@@ -720,7 +1298,7 @@ def _ensure_snapshot_audit_candidates(conn, snapshot: SourceSnapshot, root: Path
         WHERE snapshot_id = ?
         ORDER BY path
         """,
-        (snapshot.id,),
+        (snapshot_id,),
     ).fetchall()
     files = [
         CodeFile(
@@ -733,8 +1311,7 @@ def _ensure_snapshot_audit_candidates(conn, snapshot: SourceSnapshot, root: Path
         )
         for row in rows
     ]
-    code_index = extract_code_index(snapshot.id, root, files)
-    _insert_audit_candidates_from_index(conn, snapshot.id, files, code_index)
+    return files
 
 
 def _index_snapshot(snapshot_id: str):

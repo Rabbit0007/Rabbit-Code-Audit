@@ -16,7 +16,11 @@ from cairn.server.business_models import (
     UpdateBusinessNodeRequest,
 )
 from cairn.server.db import get_conn
-from cairn.server.services import get_project_or_404, utcnow
+from cairn.server.services import (
+    get_project_or_404,
+    sync_business_node_coverage_from_conclusion,
+    utcnow,
+)
 
 
 router = APIRouter(prefix="/api/projects/{project_id}/business-graph", tags=["business-graph"])
@@ -112,6 +116,15 @@ def create_business_node_conclusion(
                 body.created_by,
                 now,
             ),
+        )
+        sync_business_node_coverage_from_conclusion(
+            conn,
+            project_id,
+            body.business_node_id,
+            body.conclusion,
+            body.summary,
+            body.evidence,
+            now=now,
         )
         row = conn.execute(
             "SELECT * FROM business_node_conclusions WHERE id = ?",

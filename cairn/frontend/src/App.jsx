@@ -76,11 +76,135 @@ function formatFindingStatus(status) {
   return {
     candidate: "候选",
     investigating: "调查中",
-    pending_review: "待独立复核",
+    pending_review: "待确认",
     confirmed: "已确认",
     rejected: "已拒绝",
     needs_more_evidence: "需更多证据",
   }[status] || status;
+}
+
+function findingStatusTone(status) {
+  return {
+    candidate: "muted",
+    investigating: "info",
+    pending_review: "warning",
+    confirmed: "success",
+    rejected: "muted",
+    needs_more_evidence: "warning",
+  }[status] || "muted";
+}
+
+function formatCandidateStatus(status) {
+  return {
+    candidate: "候选",
+    investigating: "调查中",
+    confirmed: "已确认",
+    rejected: "已驳回",
+    needs_more_evidence: "证据不足",
+  }[status] || status;
+}
+
+function candidateStatusTone(status) {
+  return {
+    candidate: "warning",
+    investigating: "info",
+    confirmed: "success",
+    rejected: "muted",
+    needs_more_evidence: "warning",
+  }[status] || "muted";
+}
+
+function formatSourceStatus(status) {
+  return {
+    importing: "导入中",
+    ready: "可用",
+    failed: "失败",
+  }[status] || status;
+}
+
+function sourceStatusTone(status) {
+  return {
+    importing: "info",
+    ready: "success",
+    failed: "danger",
+  }[status] || "muted";
+}
+
+function formatToolScanStatus(status) {
+  return {
+    pending: "等待中",
+    running: "扫描中",
+    completed: "已完成",
+    failed: "失败",
+  }[status] || status;
+}
+
+function toolScanStatusTone(status) {
+  return {
+    pending: "warning",
+    running: "info",
+    completed: "success",
+    failed: "danger",
+  }[status] || "muted";
+}
+
+function formatReportEnrichmentStatus(status) {
+  return {
+    pending: "等待写作",
+    running: "生成中",
+    completed: "已完成",
+    failed: "失败",
+  }[status] || status;
+}
+
+function reportEnrichmentStatusTone(status) {
+  return {
+    pending: "warning",
+    running: "info",
+    completed: "success",
+    failed: "danger",
+  }[status] || "muted";
+}
+
+function reportTaskFindingIds(item) {
+  return [item?.id, item?.fact_id].filter(Boolean);
+}
+
+function hasCompletedReportMaterial(tasks, item) {
+  const ids = new Set(reportTaskFindingIds(item));
+  return (tasks || []).some((task) => ids.has(task.finding_id) && task.status === "completed");
+}
+
+function latestReportTaskForItem(tasks, item) {
+  const ids = new Set(reportTaskFindingIds(item));
+  return (tasks || []).find((task) => ids.has(task.finding_id)) || null;
+}
+
+function reportTaskMaterialSummary(task) {
+  if (!task) return "尚未生成报告材料";
+  const parts = [];
+  if ((task.packet_templates || []).length) parts.push(`${task.packet_templates.length} 个请求模板`);
+  if (Object.keys(task.reproduction_poc || {}).length) parts.push("静态 PoC");
+  if ((task.evidence_chain || []).length) parts.push(`${task.evidence_chain.length} 条证据链`);
+  if (Object.keys(task.report_sections || {}).length) parts.push(`${Object.keys(task.report_sections || {}).length} 个报告段落`);
+  if ((task.delivery_notes || []).length) parts.push(`${task.delivery_notes.length} 条交付备注`);
+  return parts.length ? parts.join(" / ") : "暂无可导出的补充材料";
+}
+
+function dynamicValidationStatusLabel(status) {
+  return {
+    static_only: "静态优先",
+    ready: "可计划验证",
+    blocked: "建议阻塞",
+  }[status] || status;
+}
+
+function dynamicValidationTone(status) {
+  return {
+    static_only: "muted",
+    ready: "info",
+    blocked: "warning",
+  }[status] || "muted";
 }
 
 const BUSINESS_NODE_META = {
@@ -1163,7 +1287,7 @@ function AuthPage({ onAuthed, setToast }) {
               <br />
               让证据<span>清晰可核验</span>
             </h2>
-            <p>Rabbit Code Audit 帮助安全团队导入源码、建立事实图、执行多语言审计并复核关键发现。</p>
+            <p>Rabbit Code Audit 帮助安全团队导入源码、建立事实图、执行多语言审计并确认关键发现。</p>
           </div>
           <div className="auth-capabilities">
             <span>
@@ -1172,7 +1296,7 @@ function AuthPage({ onAuthed, setToast }) {
             </span>
             <span>
               <CheckCircle2 size={16} />
-              独立复核
+              发现确认
             </span>
             <span>
               <Network size={16} />
@@ -1448,7 +1572,7 @@ function DashboardPage({ runAction, setToast }) {
 
   const quickActions = [
     { key: "new", label: "新建项目", desc: "导入源码并定义审计目标", icon: Plus, onClick: () => setNewOpen(true) },
-    { key: "vulns", label: "审计报告", desc: "查看已复核的安全发现", icon: AlertTriangle, onClick: () => go("#/vulnerabilities") },
+    { key: "vulns", label: "审计报告", desc: "查看已确认的安全发现", icon: AlertTriangle, onClick: () => go("#/vulnerabilities") },
     { key: "workers", label: "工作节点", desc: "状态与模型配置", icon: Monitor, onClick: () => go("#/workers") },
     { key: "audit", label: "审计日志", desc: "查看系统审计操作", icon: History, onClick: () => go("#/audit") },
   ];
@@ -1636,7 +1760,7 @@ function ProjectsPage({ runAction, setToast, confirmAction }) {
       <PageHeader
         icon={Network}
         title="代码审计项目"
-        subtitle="源码快照、审计事实、调查方向与复核过程"
+        subtitle="源码快照、审计事实、调查方向与确认过程"
         actions={
           <>
             <div className="status-pill">
@@ -1949,12 +2073,17 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
   const [detail, setDetail] = useState(null);
   const [timeline, setTimeline] = useState([]);
   const [toolPlan, setToolPlan] = useState([]);
+  const [toolScanTasks, setToolScanTasks] = useState([]);
+  const [reportEnrichmentTasks, setReportEnrichmentTasks] = useState([]);
   const [toolFindings, setToolFindings] = useState([]);
+  const [auditCandidates, setAuditCandidates] = useState([]);
   const [auditFindings, setAuditFindings] = useState([]);
   const [businessGraph, setBusinessGraph] = useState({ nodes: [], edges: [], conclusions: [] });
   const [sourceIndexSummary, setSourceIndexSummary] = useState(null);
+  const [dynamicValidationPlan, setDynamicValidationPlan] = useState(null);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState(null);
+  const [selectedSourceId, setSelectedSourceId] = useState("");
   const [tab, setTab] = useState("details");
   const [modal, setModal] = useState(null);
   const [editingBusinessNode, setEditingBusinessNode] = useState(null);
@@ -1963,27 +2092,49 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
 
   const load = useCallback(async () => {
     try {
-      const [project, events, projectToolFindings, projectAuditFindings, graph, conclusions] = await Promise.all([
+      const [
+        project,
+        events,
+        projectToolFindings,
+        projectAuditCandidates,
+        projectAuditFindings,
+        graph,
+        conclusions,
+        projectReportEnrichments,
+      ] = await Promise.all([
         apiRequest(`/projects/${projectId}`),
         apiRequest(`/api/projects/${projectId}/timeline`).catch(() => []),
         apiRequest(`/api/projects/${projectId}/tool-findings`).catch(() => []),
+        apiRequest(`/api/projects/${projectId}/audit-candidates`).catch(() => []),
         apiRequest(`/api/projects/${projectId}/audit-findings`).catch(() => []),
         apiRequest(`/api/projects/${projectId}/business-graph`).catch(() => ({ nodes: [], edges: [] })),
         apiRequest(`/api/projects/${projectId}/business-graph/conclusions`).catch(() => []),
+        apiRequest(`/api/projects/${projectId}/report-enrichments`).catch(() => []),
       ]);
-      const readySource = (project.sources || []).find((source) => source.status === "ready");
-      const plan = readySource
-        ? await apiRequest(`/api/projects/${projectId}/sources/${readySource.id}/tool-plan`).catch(() => [])
-        : [];
-      const indexSummary = readySource
-        ? await apiRequest(`/api/projects/${projectId}/sources/${readySource.id}/index-summary`).catch(() => null)
-        : null;
+      const projectSources = project.sources || [];
+      const selectedSource =
+        projectSources.find((source) => source.id === selectedSourceId) ||
+        projectSources.find((source) => source.status === "ready") ||
+        projectSources[0] ||
+        null;
+      const [plan, indexSummary, scanTasks, validationPlan] = selectedSource?.status === "ready"
+        ? await Promise.all([
+            apiRequest(`/api/projects/${projectId}/sources/${selectedSource.id}/tool-plan`).catch(() => []),
+            apiRequest(`/api/projects/${projectId}/sources/${selectedSource.id}/index-summary`).catch(() => null),
+            apiRequest(`/api/projects/${projectId}/tool-scan-tasks?snapshot_id=${encodeURIComponent(selectedSource.id)}`).catch(() => []),
+            apiRequest(`/api/projects/${projectId}/sources/${selectedSource.id}/dynamic-validation-plan`).catch(() => null),
+          ])
+        : [[], null, [], null];
       setDetail(project);
       setTimeline(events);
       setToolPlan(plan);
+      setToolScanTasks(Array.isArray(scanTasks) ? scanTasks : []);
+      setReportEnrichmentTasks(Array.isArray(projectReportEnrichments) ? projectReportEnrichments : []);
       setToolFindings(projectToolFindings);
+      setAuditCandidates(projectAuditCandidates);
       setAuditFindings(projectAuditFindings);
       setSourceIndexSummary(indexSummary);
+      setDynamicValidationPlan(validationPlan);
       setBusinessGraph({
         nodes: Array.isArray(graph?.nodes) ? graph.nodes : [],
         edges: Array.isArray(graph?.edges) ? graph.edges : [],
@@ -1994,7 +2145,7 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
     } finally {
       setLoading(false);
     }
-  }, [projectId, setToast]);
+  }, [projectId, selectedSourceId, setToast]);
 
   useEffect(() => {
     setLoading(true);
@@ -2012,7 +2163,11 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
   const facts = detail?.facts || [];
   const intents = detail?.intents || [];
   const sources = detail?.sources || [];
-  const currentSource = sources.find((source) => source.status === "ready") || sources[0] || null;
+  const currentSource =
+    sources.find((source) => source.id === selectedSourceId) ||
+    sources.find((source) => source.status === "ready") ||
+    sources[0] ||
+    null;
   const selectedFactIds = selected?.type === "fact" ? [selected.id] : facts.length ? ["origin"] : [];
   const selectedIntent = selected?.type === "intent" ? intents.find((intent) => intent.id === selected.id) : null;
 
@@ -2106,6 +2261,149 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
 
   const exportProject = async (format) => {
     await runAction(null, () => downloadFromApi(`/projects/${project.id}/export?format=${format}`, `${project.id}.${format}`));
+  };
+
+  const importSource = async (payload) => {
+    if (payload.sourceType === "git") {
+      await runAction("Git 源码已导入", () =>
+        apiRequest(`/api/projects/${project.id}/sources/git`, {
+          method: "POST",
+          body: {
+            repository_url: payload.repositoryUrl,
+            ref: payload.ref || null,
+          },
+        }),
+      );
+    } else {
+      const upload = new FormData();
+      upload.append("archive", payload.archive);
+      await runAction("ZIP 源码已导入", () =>
+        apiRequest(`/api/projects/${project.id}/sources/zip`, {
+          method: "POST",
+          body: upload,
+        }),
+      );
+    }
+    setModal(null);
+    await load();
+  };
+
+  const retrySourceImport = async (source) => {
+    if (source.source_type !== "git" || !source.repository_url) {
+      setToast({ type: "warning", message: "ZIP 快照需要重新上传文件，不能直接重试" });
+      setModal("source-import");
+      return;
+    }
+    await importSource({
+      sourceType: "git",
+      repositoryUrl: source.repository_url,
+      ref: source.requested_ref || "",
+    });
+  };
+
+  const createToolScanTask = async ({ tools = [], timeout_per_tool = 180 } = {}) => {
+    if (!currentSource || currentSource.status !== "ready") {
+      setToast({ type: "warning", message: "源码快照尚未准备完成，暂不能创建工具扫描任务" });
+      return;
+    }
+    await runAction("工具扫描任务已创建", () =>
+      apiRequest(`/api/projects/${project.id}/sources/${currentSource.id}/tool-scan-tasks`, {
+        method: "POST",
+        body: { created_by: HUMAN_WORKER, tools, timeout_per_tool },
+      }),
+    );
+    setTab("tools");
+    await load();
+  };
+
+  const cancelToolScanTask = async (task) => {
+    await runAction("工具扫描任务已取消", () =>
+      apiRequest(`/api/tool-scans/${task.id}/cancel`, { method: "POST", body: { worker: HUMAN_WORKER } }),
+    );
+    await load();
+  };
+
+  const retryToolScanTask = async (task) => {
+    await runAction("工具扫描任务已重试", () =>
+      apiRequest(`/api/tool-scans/${task.id}/retry`, { method: "POST", body: { worker: HUMAN_WORKER } }),
+    );
+    setTab("tools");
+    await load();
+  };
+
+  const createReportEnrichmentTask = async (finding) => {
+    if (finding.status !== "confirmed") {
+      setToast({ type: "warning", message: "只有已确认发现可以生成报告材料" });
+      return;
+    }
+    await runAction("报告材料任务已创建", () =>
+      apiRequest(`/api/projects/${project.id}/report-enrichments`, {
+        method: "POST",
+        body: { finding_id: finding.id, created_by: HUMAN_WORKER },
+      }),
+    );
+    setTab("findings");
+    await load();
+  };
+
+  const cancelReportEnrichmentTask = async (task) => {
+    await runAction("报告材料任务已取消", () =>
+      apiRequest(`/api/report-enrichments/${task.id}/cancel`, { method: "POST", body: { worker: HUMAN_WORKER } }),
+    );
+    await load();
+  };
+
+  const retryReportEnrichmentTask = async (task) => {
+    await runAction("报告材料任务已重试", () =>
+      apiRequest(`/api/report-enrichments/${task.id}/retry`, { method: "POST", body: { worker: HUMAN_WORKER } }),
+    );
+    setTab("findings");
+    await load();
+  };
+
+  const persistDynamicValidationPlan = async () => {
+    if (!currentSource || currentSource.status !== "ready") {
+      setToast({ type: "warning", message: "源码快照尚未准备完成，暂不能保存动态验证计划" });
+      return;
+    }
+    await runAction("动态验证计划已保存", () =>
+      apiRequest(`/api/projects/${project.id}/sources/${currentSource.id}/dynamic-validation-plan`, {
+        method: "POST",
+        body: { created_by: HUMAN_WORKER },
+      }),
+    );
+    setTab("tools");
+    await load();
+  };
+
+  const submitAuditFinding = async (payload) => {
+    if (!currentSource || currentSource.status !== "ready") {
+      setToast({ type: "warning", message: "源码快照尚未准备完成，暂不能录入发现" });
+      return;
+    }
+    await runAction("审计发现已保存", () =>
+      apiRequest(`/api/projects/${project.id}/audit-findings`, {
+        method: "POST",
+        body: {
+          ...payload,
+          snapshot_id: currentSource.id,
+          discovered_by: HUMAN_WORKER,
+        },
+      }),
+    );
+    setModal(null);
+    await load();
+  };
+
+  const concludeAuditCandidate = async (candidate, payload) => {
+    await runAction("候选结论已保存", () =>
+      apiRequest(`/api/projects/${project.id}/audit-candidates/${candidate.id}/conclude`, {
+        method: "POST",
+        body: payload,
+      }),
+    );
+    setModal(null);
+    await load();
   };
 
   if (loading) {
@@ -2252,11 +2550,30 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
           setTab={setTab}
           timeline={timeline}
           toolPlan={toolPlan}
+          toolScanTasks={toolScanTasks}
+          reportEnrichmentTasks={reportEnrichmentTasks}
           toolFindings={toolFindings}
+          auditCandidates={auditCandidates}
           auditFindings={auditFindings}
           businessGraph={businessGraph}
+          sources={sources}
+          currentSource={currentSource}
+          selectedSourceId={currentSource?.id || ""}
+          dynamicValidationPlan={dynamicValidationPlan}
           onRefresh={load}
           runAction={runAction}
+          onCreateToolScan={createToolScanTask}
+          onCancelToolScan={cancelToolScanTask}
+          onRetryToolScan={retryToolScanTask}
+          onCreateReportEnrichment={createReportEnrichmentTask}
+          onCancelReportEnrichment={cancelReportEnrichmentTask}
+          onRetryReportEnrichment={retryReportEnrichmentTask}
+          onPersistDynamicValidationPlan={persistDynamicValidationPlan}
+          onSelectSource={(sourceId) => setSelectedSourceId(sourceId)}
+          onImportSource={() => setModal("source-import")}
+          onRetrySource={retrySourceImport}
+          onCreateAuditFinding={() => setModal("audit-finding")}
+          onConcludeAuditCandidate={(candidate) => setModal({ type: "candidate-conclusion", candidate })}
           onAddBusinessNode={() => setModal("business-node")}
           onAddBusinessEdge={() => setModal("business-edge")}
           onEditBusinessNode={setEditingBusinessNode}
@@ -2381,6 +2698,25 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
           findings={auditFindings}
           onClose={() => setConcludingBusinessNode(null)}
           onSubmit={submitBusinessConclusion}
+        />
+      )}
+      {modal === "source-import" && (
+        <SourceImportModal onClose={() => setModal(null)} onSubmit={importSource} />
+      )}
+      {modal === "audit-finding" && (
+        <AuditFindingModal
+          businessNodes={businessGraph.nodes}
+          toolFindings={toolFindings}
+          onClose={() => setModal(null)}
+          onSubmit={submitAuditFinding}
+        />
+      )}
+      {modal?.type === "candidate-conclusion" && (
+        <AuditCandidateConclusionModal
+          candidate={modal.candidate}
+          auditFindings={auditFindings}
+          onClose={() => setModal(null)}
+          onSubmit={(payload) => concludeAuditCandidate(modal.candidate, payload)}
         />
       )}
     </>
@@ -2581,11 +2917,30 @@ function Inspector({
   setTab,
   timeline,
   toolPlan,
+  toolScanTasks,
+  reportEnrichmentTasks,
   toolFindings,
+  auditCandidates,
   auditFindings,
   businessGraph,
+  sources,
+  currentSource,
+  selectedSourceId,
+  dynamicValidationPlan,
   onRefresh,
   runAction,
+  onCreateToolScan,
+  onCancelToolScan,
+  onRetryToolScan,
+  onCreateReportEnrichment,
+  onCancelReportEnrichment,
+  onRetryReportEnrichment,
+  onPersistDynamicValidationPlan,
+  onSelectSource,
+  onImportSource,
+  onRetrySource,
+  onCreateAuditFinding,
+  onConcludeAuditCandidate,
   onAddBusinessNode,
   onAddBusinessEdge,
   onEditBusinessNode,
@@ -2599,10 +2954,11 @@ function Inspector({
   const intent = selected?.type === "intent" ? intents.find((item) => item.id === selected.id) : null;
   const tabs = [
     ["details", "详情", null],
+    ["sources", "源码", sources.length],
     ["business", "业务", businessGraph.nodes.length],
     ["hints", "提示", detail.hints.length],
-    ["tools", "工具", toolPlan.length],
-    ["findings", "发现", auditFindings.length],
+    ["tools", "工具", toolPlan.length + toolScanTasks.length],
+    ["findings", "发现", auditFindings.length + auditCandidates.length],
     ["logs", "日志", intents.length],
     ["timeline", "时间线", timeline.length],
   ];
@@ -2688,7 +3044,26 @@ function Inspector({
                 )}
               </div>
             )}
+            <MaturityChecklist
+              sources={sources}
+              currentSource={currentSource}
+              toolScanTasks={toolScanTasks}
+              reportEnrichmentTasks={reportEnrichmentTasks}
+              auditCandidates={auditCandidates}
+              auditFindings={auditFindings}
+              businessGraph={businessGraph}
+            />
           </>
+        )}
+        {tab === "sources" && (
+          <SourceSnapshotPanel
+            sources={sources}
+            currentSource={currentSource}
+            selectedSourceId={selectedSourceId}
+            onSelectSource={onSelectSource}
+            onImportSource={onImportSource}
+            onRetrySource={onRetrySource}
+          />
         )}
         {tab === "hints" && (
           <div className="timeline-list">
@@ -2720,53 +3095,33 @@ function Inspector({
           />
         )}
         {tab === "tools" && (
-          <div className="timeline-list">
-            {toolPlan.length === 0 ? (
-              <EmptyState title="暂无工具计划" subtitle="源码快照准备完成后会生成多语言工具计划。" />
-            ) : (
-              toolPlan.map((tool) => (
-                <article className="timeline-item" key={`${tool.category}-${tool.name}`}>
-                  <span>{tool.category}</span>
-                  <p>{tool.name}</p>
-                  <small>{tool.reason}</small>
-                  <code>{tool.command.join(" ")}</code>
-                </article>
-              ))
-            )}
-            {toolFindings.length > 0 && (
-              <div className="detail-card">
-                <span>工具候选</span>
-                <h3>{toolFindings.length}</h3>
-                <p>扫描器结果仅用于导航，必须经过代码证据验证后才能形成审计发现。</p>
-              </div>
-            )}
-          </div>
+          <ToolExperiencePanel
+            currentSource={currentSource}
+            toolPlan={toolPlan}
+            toolScanTasks={toolScanTasks}
+            toolFindings={toolFindings}
+            dynamicValidationPlan={dynamicValidationPlan}
+            onCreateToolScan={onCreateToolScan}
+            onCancelToolScan={onCancelToolScan}
+            onRetryToolScan={onRetryToolScan}
+            onPersistDynamicValidationPlan={onPersistDynamicValidationPlan}
+            onRefresh={onRefresh}
+          />
         )}
         {tab === "findings" && (
-          <div className="timeline-list">
-            {auditFindings.length === 0 ? (
-              <EmptyState title="暂无审计发现" subtitle="Worker 验证代码证据后会在这里记录候选与复核状态。" />
-            ) : (
-              auditFindings.map((finding) => {
-                const severity = SEVERITY_META[finding.severity] || SEVERITY_META.info;
-                return (
-                  <article className="timeline-item" key={finding.id}>
-                    <span>{finding.id}</span>
-                    <p>{finding.title}</p>
-                    <div className="button-row">
-                      <Badge tone={severity.tone}>{severity.label}</Badge>
-                      <Badge tone={finding.status === "confirmed" ? "success" : finding.status === "rejected" ? "muted" : "warning"}>
-                        {formatFindingStatus(finding.status)}
-                      </Badge>
-                    </div>
-                    <small>
-                      {finding.file_path || finding.category} · {finding.discovered_by}
-                    </small>
-                  </article>
-                );
-              })
-            )}
-          </div>
+          <FindingGovernancePanel
+            currentSource={currentSource}
+            auditFindings={auditFindings}
+            auditCandidates={auditCandidates}
+            reportEnrichmentTasks={reportEnrichmentTasks}
+            toolFindings={toolFindings}
+            businessGraph={businessGraph}
+            onCreateAuditFinding={onCreateAuditFinding}
+            onConcludeAuditCandidate={onConcludeAuditCandidate}
+            onCreateReportEnrichment={onCreateReportEnrichment}
+            onCancelReportEnrichment={onCancelReportEnrichment}
+            onRetryReportEnrichment={onRetryReportEnrichment}
+          />
         )}
         {tab === "logs" && (
           <div className="timeline-list">
@@ -2814,6 +3169,544 @@ function Inspector({
   );
 }
 
+function MaturityChecklist({ sources, currentSource, toolScanTasks, reportEnrichmentTasks, auditCandidates, auditFindings, businessGraph }) {
+  const sourceReady = currentSource?.status === "ready";
+  const completedScan = toolScanTasks.some((task) => task.status === "completed");
+  const activeScan = toolScanTasks.some((task) => task.status === "pending" || task.status === "running");
+  const openCandidates = auditCandidates.filter((item) => ["candidate", "investigating"].includes(item.status || "candidate"));
+  const nodes = businessGraph.nodes || [];
+  const highRiskNodes = nodes.filter(isHighRiskBusinessNode);
+  const openHighRisk = highRiskNodes.filter((node) => !hasBusinessCoverage(node));
+  const reportableFindings = auditFindings.filter((finding) => finding.status === "confirmed" && finding.severity !== "info");
+  const missingReportMaterials = reportableFindings.filter((finding) => !hasCompletedReportMaterial(reportEnrichmentTasks, finding));
+  const activeReportTasks = (reportEnrichmentTasks || []).filter((task) => task.status === "pending" || task.status === "running");
+  const items = [
+    {
+      key: "source",
+      label: "源码快照",
+      value: sourceReady ? currentSource.id : sources.length ? "等待 ready" : "未导入",
+      ok: sourceReady,
+      tone: sourceReady ? "success" : sources.length ? "warning" : "muted",
+    },
+    {
+      key: "scan",
+      label: "工具扫描",
+      value: completedScan ? "已完成" : activeScan ? "运行中" : "未扫描",
+      ok: completedScan,
+      tone: completedScan ? "success" : activeScan ? "info" : "muted",
+    },
+    {
+      key: "candidates",
+      label: "候选闭环",
+      value: openCandidates.length ? `${openCandidates.length} 条待处理` : "无待处理候选",
+      ok: openCandidates.length === 0,
+      tone: openCandidates.length ? "warning" : "success",
+    },
+    {
+      key: "business",
+      label: "业务覆盖",
+      value: !highRiskNodes.length ? "未记录高风险节点" : openHighRisk.length ? `${openHighRisk.length} 个高风险节点待覆盖` : "高风险节点已覆盖",
+      ok: highRiskNodes.length > 0 && openHighRisk.length === 0,
+      tone: !highRiskNodes.length ? "muted" : openHighRisk.length ? "warning" : "success",
+    },
+    {
+      key: "report",
+      label: "MD 报告",
+      value: !reportableFindings.length
+        ? "暂无可导出发现"
+        : missingReportMaterials.length
+          ? `${reportableFindings.length - missingReportMaterials.length}/${reportableFindings.length} 条材料完成${activeReportTasks.length ? `，${activeReportTasks.length} 个任务处理中` : ""}`
+          : `${reportableFindings.length} 条材料完成`,
+      ok: reportableFindings.length > 0 && missingReportMaterials.length === 0,
+      tone: !reportableFindings.length ? "muted" : missingReportMaterials.length ? "warning" : "success",
+    },
+  ];
+  return (
+    <div className="maturity-panel">
+      <header>
+        <span>项目成熟度</span>
+        <strong>{items.filter((item) => item.ok).length}/{items.length}</strong>
+      </header>
+      <div className="maturity-list">
+        {items.map((item) => (
+          <div className="maturity-item" key={item.key}>
+            <Badge tone={item.tone}>{item.ok ? "完成" : "待处理"}</Badge>
+            <div>
+              <strong>{item.label}</strong>
+              <small>{item.value}</small>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SourceSnapshotPanel({ sources, currentSource, selectedSourceId, onSelectSource, onImportSource, onRetrySource }) {
+  return (
+    <div className="source-panel">
+      <div className="panel-toolbar">
+        <button className="primary-outline compact" type="button" onClick={onImportSource}>
+          <Plus size={16} />
+          导入新快照
+        </button>
+      </div>
+      {sources.length === 0 ? (
+        <EmptyState icon={Folder} title="暂无源码快照" subtitle="导入 Git 仓库或 ZIP 源码后会在这里生成不可变快照。" />
+      ) : (
+        <div className="source-snapshot-list">
+          {sources.map((source) => {
+            const active = source.id === selectedSourceId || source.id === currentSource?.id;
+            const label = source.resolved_commit || source.snapshot_sha256 || source.original_name || source.id;
+            return (
+              <article className={cn("source-snapshot-card", active && "active")} key={source.id}>
+                <header>
+                  <div>
+                    <span>{source.source_type.toUpperCase()}</span>
+                    <strong>{clampText(label, 42)}</strong>
+                  </div>
+                  <Badge tone={sourceStatusTone(source.status)}>{formatSourceStatus(source.status)}</Badge>
+                </header>
+                <div className="source-meta-grid">
+                  <MiniStat label="文件" value={source.file_count || 0} />
+                  <MiniStat label="大小" value={formatBytes(source.total_bytes)} />
+                </div>
+                <div className="source-kv">
+                  {source.repository_url && <span>{source.repository_url}</span>}
+                  {source.requested_ref && <span>ref: {source.requested_ref}</span>}
+                  <span>snapshot: {source.id}</span>
+                </div>
+                {source.error_message && <p className="source-error">{source.error_message}</p>}
+                <div className="button-row">
+                  <button className="ghost-button compact" type="button" onClick={() => onSelectSource(source.id)}>
+                    <Eye size={16} />
+                    使用此快照
+                  </button>
+                  {source.status === "failed" && (
+                    <button className="ghost-button compact warning" type="button" onClick={() => onRetrySource(source)}>
+                      <RefreshCw size={16} />
+                      重试
+                    </button>
+                  )}
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FindingGovernancePanel({
+  currentSource,
+  auditFindings,
+  auditCandidates,
+  reportEnrichmentTasks = [],
+  toolFindings,
+  businessGraph,
+  onCreateAuditFinding,
+  onConcludeAuditCandidate,
+  onCreateReportEnrichment,
+  onCancelReportEnrichment,
+  onRetryReportEnrichment,
+}) {
+  const openCandidates = auditCandidates.filter((item) => ["candidate", "investigating"].includes(item.status || "candidate"));
+  const confirmedFindings = auditFindings.filter((item) => item.status === "confirmed");
+  const completedReportMaterials = confirmedFindings.filter((finding) => hasCompletedReportMaterial(reportEnrichmentTasks, finding));
+  const activeReportTasks = reportEnrichmentTasks.filter((task) => task.status === "pending" || task.status === "running");
+  return (
+    <div className="finding-governance-panel">
+      <div className="finding-toolbar">
+        <button className="primary-outline compact" type="button" disabled={currentSource?.status !== "ready"} onClick={onCreateAuditFinding}>
+          <Plus size={16} />
+          录入发现
+        </button>
+        <Badge tone={currentSource?.status === "ready" ? "success" : "warning"}>
+          {currentSource?.status === "ready" ? currentSource.id : "等待源码 ready"}
+        </Badge>
+      </div>
+      <div className="metric-grid mini">
+        <MetricCard label="正式发现" value={auditFindings.length} tone="info" />
+        <MetricCard label="已确认" value={confirmedFindings.length} tone="success" />
+        <MetricCard label="候选待处理" value={openCandidates.length} tone={openCandidates.length ? "warning" : "success"} />
+        <MetricCard
+          label="报告材料"
+          value={confirmedFindings.length ? `${completedReportMaterials.length}/${confirmedFindings.length}` : 0}
+          tone={!confirmedFindings.length ? "muted" : completedReportMaterials.length < confirmedFindings.length ? "warning" : "success"}
+        />
+        <MetricCard label="工具候选" value={toolFindings.length} tone="muted" />
+      </div>
+      <div className="business-section">
+        <span>审计候选</span>
+        {auditCandidates.length === 0 ? (
+          <div className="soft-box compact">暂无候选发现。工具扫描或 Worker 推理出的候选会出现在这里。</div>
+        ) : (
+          <div className="finding-list">
+            {auditCandidates.map((candidate) => {
+              const severity = SEVERITY_META[candidate.severity] || { label: "未知", tone: "warning" };
+              const node = (businessGraph.nodes || []).find((item) => item.id === candidate.business_node_id);
+              const canConclude = !["confirmed", "rejected"].includes(candidate.status);
+              return (
+                <article className="finding-card" key={candidate.id}>
+                  <header>
+                    <div>
+                      <span>{candidate.id}</span>
+                      <strong>{candidate.title}</strong>
+                    </div>
+                    <div className="business-badge-row">
+                      <Badge tone={severity.tone}>{severity.label}</Badge>
+                      <Badge tone={candidateStatusTone(candidate.status)}>{formatCandidateStatus(candidate.status)}</Badge>
+                    </div>
+                  </header>
+                  <p>{candidate.description}</p>
+                  <small>
+                    {candidate.file_path || candidate.entry_point || candidate.candidate_type} · {candidate.created_by}
+                    {node ? ` · ${node.title}` : ""}
+                  </small>
+                  {candidate.conclusion_summary && <p className="finding-note">{candidate.conclusion_summary}</p>}
+                  <div className="button-row">
+                    <button className="ghost-button compact" type="button" disabled={!canConclude} onClick={() => onConcludeAuditCandidate(candidate)}>
+                      <CheckCircle2 size={16} />
+                      记录结论
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </div>
+      <div className="business-section">
+        <span>正式发现</span>
+        {auditFindings.length === 0 ? (
+          <EmptyState title="暂无审计发现" subtitle="Worker 验证代码证据后会在这里记录正式发现。" />
+        ) : (
+          <div className="finding-list">
+            {auditFindings.map((finding) => {
+              const severity = SEVERITY_META[finding.severity] || SEVERITY_META.info;
+              const node = (businessGraph.nodes || []).find((item) => item.id === finding.business_node_id);
+              const reportTask = latestReportTaskForItem(reportEnrichmentTasks, finding);
+              const reportComplete = hasCompletedReportMaterial(reportEnrichmentTasks, finding);
+              const reportActive = reportTask && (reportTask.status === "pending" || reportTask.status === "running");
+              const reportFailed = reportTask?.status === "failed";
+              const canRequestReport = finding.status === "confirmed" && !reportActive && !reportFailed;
+              return (
+                <article className="finding-card" key={finding.id}>
+                  <header>
+                    <div>
+                      <span>{finding.id}</span>
+                      <strong>{finding.title}</strong>
+                    </div>
+                    <div className="business-badge-row">
+                      <Badge tone={severity.tone}>{severity.label}</Badge>
+                      <Badge tone={findingStatusTone(finding.status)}>{formatFindingStatus(finding.status)}</Badge>
+                    </div>
+                  </header>
+                  <p>{finding.description}</p>
+                  <small>
+                    {finding.file_path || finding.category} · {finding.discovered_by}
+                    {node ? ` · ${node.title}` : ""}
+                  </small>
+                  {finding.remediation && <p className="finding-note">{finding.remediation}</p>}
+                  <div className="report-material-box">
+                    <div className="report-material-head">
+                      <span>报告材料</span>
+                      <Badge tone={reportTask ? reportEnrichmentStatusTone(reportTask.status) : "muted"}>
+                        {reportTask ? formatReportEnrichmentStatus(reportTask.status) : "未生成"}
+                      </Badge>
+                    </div>
+                    <p>{reportTask ? reportTaskMaterialSummary(reportTask) : "尚未提交写报告 Worker 生成补充材料。"}</p>
+                    {reportTask && (
+                      <small>
+                        {reportTask.id} · {reportTask.worker || reportTask.created_by} · {formatTime(reportTask.created_at)}
+                      </small>
+                    )}
+                    {reportTask?.error_message && <p className="finding-note">{reportTask.error_message}</p>}
+                    <div className="button-row">
+                      {canRequestReport && (
+                        <button className="ghost-button compact" type="button" onClick={() => onCreateReportEnrichment(finding)}>
+                          <FileText size={16} />
+                          {reportComplete ? "重新生成材料" : "生成材料"}
+                        </button>
+                      )}
+                      {reportActive && (
+                        <button className="ghost-button compact warning" type="button" onClick={() => onCancelReportEnrichment(reportTask)}>
+                          <Square size={16} />
+                          取消任务
+                        </button>
+                      )}
+                      {reportFailed && (
+                        <button className="ghost-button compact" type="button" onClick={() => onRetryReportEnrichment(reportTask)}>
+                          <RefreshCw size={16} />
+                          重试任务
+                        </button>
+                      )}
+                      {activeReportTasks.length > 0 && reportTask?.status === "completed" && (
+                        <Badge tone="info">{activeReportTasks.length} 个材料任务处理中</Badge>
+                      )}
+                    </div>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ToolExperiencePanel({
+  currentSource,
+  toolPlan = [],
+  toolScanTasks = [],
+  toolFindings = [],
+  dynamicValidationPlan,
+  onCreateToolScan,
+  onCancelToolScan,
+  onRetryToolScan,
+  onPersistDynamicValidationPlan,
+  onRefresh,
+}) {
+  const [selectedTools, setSelectedTools] = useState([]);
+  const [timeoutPerTool, setTimeoutPerTool] = useState(180);
+  const latestScan = toolScanTasks[0] || null;
+  const runningScan = toolScanTasks.find((task) => task.status === "running" || task.status === "pending");
+  const sourceReady = currentSource?.status === "ready";
+  const canCreateScan = sourceReady && !runningScan;
+  const scanSummary = latestScan?.summaries || [];
+  const validationIndicators = dynamicValidationPlan?.launch_indicators || [];
+  const validationWarnings = dynamicValidationPlan?.warnings || [];
+  const scanDisabledReason = !currentSource
+    ? "等待源码导入完成后才能创建扫描任务"
+    : !sourceReady
+      ? "源码快照还没有 ready，暂不能创建扫描任务"
+      : runningScan
+        ? "已有扫描任务在等待或运行，完成后才能创建新任务"
+        : "";
+  const scanBadgeTone = runningScan || latestScan ? toolScanStatusTone(runningScan?.status || latestScan?.status) : "muted";
+  const validationDisabledReason = !currentSource
+    ? "等待源码导入完成后才能保存动态验证计划"
+    : !sourceReady
+      ? "源码快照还没有 ready，计划只会在 ready 后生成"
+      : "";
+  const plannedToolNames = useMemo(() => toolPlan.map((tool) => tool.name).filter(Boolean), [toolPlan]);
+  const toggleTool = (toolName) => {
+    setSelectedTools((prev) => (prev.includes(toolName) ? prev.filter((item) => item !== toolName) : [...prev, toolName]));
+  };
+
+  return (
+    <div className="tool-experience-panel">
+      <section className="tool-control-card">
+        <header>
+          <div>
+            <span>后台工具扫描</span>
+            <h3>{runningScan ? formatToolScanStatus(runningScan.status) : latestScan ? formatToolScanStatus(latestScan.status) : "未创建任务"}</h3>
+          </div>
+          <Badge tone={scanBadgeTone}>{toolScanTasks.length} 个任务</Badge>
+        </header>
+        <p>
+          工具扫描只生成工具候选和审计候选；模型仍需回到源码证据中验证，不能直接确认漏洞。
+        </p>
+        {plannedToolNames.length > 0 && (
+          <div className="tool-picker">
+            <span>扫描工具</span>
+            <div>
+              <button className="ghost-button compact" type="button" onClick={() => setSelectedTools([])}>
+                全部
+              </button>
+              {plannedToolNames.map((toolName) => (
+                <button
+                  className={cn("tool-chip", selectedTools.includes(toolName) && "active")}
+                  type="button"
+                  key={toolName}
+                  onClick={() => toggleTool(toolName)}
+                >
+                  {toolName}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        <label className="inline-control">
+          <span>单工具超时</span>
+          <input
+            type="number"
+            min="10"
+            max="1800"
+            value={timeoutPerTool}
+            onChange={(event) => setTimeoutPerTool(Number(event.target.value) || 180)}
+          />
+          <small>秒</small>
+        </label>
+        <div className="tool-action-row">
+          <button
+            className="primary-outline compact"
+            type="button"
+            onClick={() => onCreateToolScan({ tools: selectedTools, timeout_per_tool: timeoutPerTool })}
+            disabled={!canCreateScan}
+          >
+            {runningScan ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
+            {runningScan ? "已有任务" : "创建扫描任务"}
+          </button>
+          {runningScan && (
+            <button className="ghost-button compact warning" type="button" onClick={() => onCancelToolScan(runningScan)}>
+              <Square size={16} />
+              取消任务
+            </button>
+          )}
+          <button className="ghost-button compact" type="button" onClick={onRefresh}>
+            <RefreshCw size={16} />
+            刷新状态
+          </button>
+        </div>
+        {scanDisabledReason && <small className="control-note">{scanDisabledReason}</small>}
+        {!currentSource && (
+          <div className="soft-box compact warning-box">
+            尚未发现 ready 源码快照。源码导入完成后才能创建工具扫描任务。
+          </div>
+        )}
+        {runningScan && (
+          <div className="soft-box compact warning-box">
+            当前已有 {formatToolScanStatus(runningScan.status)} 任务：{runningScan.id}。后台每轮只跑一个工具扫描任务，避免影响模型 worker。
+          </div>
+        )}
+        {toolScanTasks.length > 0 && (
+          <div className="tool-task-list">
+            {toolScanTasks.slice(0, 5).map((task) => (
+              <article className="tool-task-item" key={task.id}>
+                <div>
+                  <strong>{task.id}</strong>
+                  <small>
+                    {task.worker || task.created_by} · {formatTime(task.created_at)}
+                  </small>
+                </div>
+                <Badge tone={toolScanStatusTone(task.status)}>{formatToolScanStatus(task.status)}</Badge>
+                {task.error_message && <p>{task.error_message}</p>}
+                <div className="tool-task-actions">
+                  {task.status === "failed" && (
+                    <button className="ghost-button compact" type="button" onClick={() => onRetryToolScan(task)}>
+                      <RefreshCw size={15} />
+                      重试
+                    </button>
+                  )}
+                  {(task.status === "pending" || task.status === "running") && (
+                    <button className="ghost-button compact warning" type="button" onClick={() => onCancelToolScan(task)}>
+                      <Square size={15} />
+                      取消
+                    </button>
+                  )}
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+        {scanSummary.length > 0 && (
+          <div className="tool-summary-grid">
+            {scanSummary.slice(0, 6).map((item, index) => (
+              <div className="tool-summary-item" key={`${item.tool_name || "tool"}-${index}`}>
+                <strong>{item.tool_name || "tool"}</strong>
+                <span>{item.status || "-"}</span>
+                <small>{Number(item.finding_count || 0)} 条候选</small>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="tool-control-card validation-card">
+        <header>
+          <div>
+            <span>动态验证计划</span>
+            <h3>{dynamicValidationPlan ? dynamicValidationStatusLabel(dynamicValidationPlan.status) : "未生成"}</h3>
+          </div>
+          <Badge tone={dynamicValidationTone(dynamicValidationPlan?.status)}>
+            {dynamicValidationPlan?.execution_default === "disabled" ? "默认关闭" : "未知"}
+          </Badge>
+        </header>
+        <p>
+          这里仅识别后续沙箱验证的可行性，不会执行 install、build、start 或 compose up。
+        </p>
+        <div className="tool-action-row">
+          <button className="ghost-button compact" type="button" onClick={onPersistDynamicValidationPlan} disabled={!currentSource}>
+            <Save size={16} />
+            保存计划
+          </button>
+        </div>
+        {validationDisabledReason && <small className="control-note">{validationDisabledReason}</small>}
+        {dynamicValidationPlan?.summary && (
+          <div className="soft-box compact">{dynamicValidationPlan.summary}</div>
+        )}
+        {validationIndicators.length > 0 && (
+          <div className="validation-indicator-list">
+            {validationIndicators.slice(0, 5).map((item, index) => (
+              <article key={`${item.type}-${item.path || index}`}>
+                <span>{item.type}</span>
+                <strong>{item.path || item.script || item.command || "-"}</strong>
+                {(item.command || item.preflight_command || item.execution_command) && (
+                  <code>{item.command || item.preflight_command || item.execution_command}</code>
+                )}
+              </article>
+            ))}
+          </div>
+        )}
+        {validationWarnings.length > 0 && (
+          <div className="validation-warning-list">
+            {validationWarnings.slice(0, 4).map((warning) => (
+              <p key={warning}>
+                <AlertTriangle size={14} />
+                {warning}
+              </p>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="tool-control-card">
+        <header>
+          <div>
+            <span>工具计划</span>
+            <h3>{toolPlan.length} 个可用计划</h3>
+          </div>
+          <Badge tone="info">{toolFindings.length} 条工具候选</Badge>
+        </header>
+        {toolPlan.length === 0 ? (
+          <EmptyState title="暂无工具计划" subtitle="源码快照准备完成后会生成多语言工具计划。" />
+        ) : (
+          <div className="timeline-list compact-list">
+            {toolPlan.map((tool) => (
+              <article className="timeline-item" key={`${tool.category}-${tool.name}`}>
+                <span>{tool.category}</span>
+                <p>{tool.name}</p>
+                <small>{tool.reason}</small>
+                <code>{Array.isArray(tool.command) ? tool.command.join(" ") : String(tool.command || "")}</code>
+              </article>
+            ))}
+          </div>
+        )}
+        {toolFindings.length > 0 && (
+          <div className="tool-finding-list">
+            <span>工具候选</span>
+            {toolFindings.slice(0, 8).map((finding) => {
+              const severity = SEVERITY_META[finding.severity] || SEVERITY_META.info;
+              return (
+                <article key={finding.id}>
+                  <div>
+                    <strong>{finding.title}</strong>
+                    <small>{finding.tool_name} · {finding.file_path || finding.rule_id || finding.id}</small>
+                  </div>
+                  <Badge tone={severity.tone}>{severity.label}</Badge>
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function isHighRiskBusinessNode(node) {
   return ["critical", "high", "unknown"].includes(node.risk_level || "unknown");
 }
@@ -2830,7 +3723,7 @@ function getBusinessConclusionIssue(node, conclusion, auditFindingById) {
   if (conclusion.conclusion === "confirmed_finding") {
     const finding = auditFindingById.get(conclusion.audit_finding_id);
     if (!finding) return "漏洞记录缺失";
-    if (finding.status !== "confirmed") return "漏洞待复核";
+    if (finding.status !== "confirmed") return "漏洞未确认";
   }
   return null;
 }
@@ -3407,7 +4300,7 @@ function BusinessConclusionModal({ node, findings, onClose, onSubmit }) {
           </label>
         </div>
         {requiresFinding && confirmedFindings.length === 0 && (
-          <div className="soft-box compact">当前业务节点没有已确认漏洞；先完成 finding 的独立复核，再记录确认漏洞结论。</div>
+          <div className="soft-box compact">当前业务节点没有已确认漏洞；先让 finding 进入已确认状态，再记录确认漏洞结论。</div>
         )}
         <label>
           <span>结论摘要</span>
@@ -3443,6 +4336,389 @@ function BusinessConclusionModal({ node, findings, onClose, onSubmit }) {
   );
 }
 
+function SourceImportModal({ onClose, onSubmit }) {
+  const [form, setForm] = useState({
+    sourceType: "git",
+    repositoryUrl: "",
+    ref: "",
+    archive: null,
+  });
+  const [saving, setSaving] = useState(false);
+  const submit = async (event) => {
+    event.preventDefault();
+    setSaving(true);
+    try {
+      await onSubmit(form);
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <Modal title="导入源码快照" subtitle="新增快照不会修改已有快照和审计事实。" onClose={onClose} wide>
+      <form className="stack-form modal-body" onSubmit={submit}>
+        <fieldset className="source-import-panel">
+          <legend>源码来源</legend>
+          <div className="source-type-switch" role="tablist" aria-label="源码来源">
+            <button className={cn(form.sourceType === "git" && "active")} type="button" onClick={() => setForm({ ...form, sourceType: "git" })}>
+              Git 仓库
+            </button>
+            <button className={cn(form.sourceType === "zip" && "active")} type="button" onClick={() => setForm({ ...form, sourceType: "zip" })}>
+              ZIP 上传
+            </button>
+          </div>
+          {form.sourceType === "git" ? (
+            <div className="two-col tight">
+              <label>
+                <span>公共仓库 URL</span>
+                <input
+                  type="url"
+                  value={form.repositoryUrl}
+                  onChange={(event) => setForm({ ...form, repositoryUrl: event.target.value })}
+                  placeholder="https://github.com/example/project.git"
+                  required
+                />
+              </label>
+              <label>
+                <span>Branch、Tag 或 Commit</span>
+                <input value={form.ref} onChange={(event) => setForm({ ...form, ref: event.target.value })} placeholder="main" />
+              </label>
+            </div>
+          ) : (
+            <label className="source-file-input">
+              <span>ZIP 压缩包</span>
+              <input
+                type="file"
+                accept=".zip,application/zip"
+                onChange={(event) => setForm({ ...form, archive: event.target.files?.[0] || null })}
+                required
+              />
+              <small>ZIP 重新导入必须重新选择文件；旧快照保持不可变。</small>
+            </label>
+          )}
+        </fieldset>
+        <div className="modal-footer">
+          <button className="ghost-button" type="button" onClick={onClose}>
+            取消
+          </button>
+          <button className="primary-button compact" type="submit" disabled={saving || (form.sourceType === "zip" && !form.archive)}>
+            {saving ? <Loader2 className="spin" size={18} /> : <Plus size={18} />}
+            导入快照
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function AuditFindingModal({ businessNodes, toolFindings, onClose, onSubmit }) {
+  const [form, setForm] = useState({
+    toolFindingId: "",
+    title: "",
+    category: "业务逻辑",
+    severity: "medium",
+    cwe: "",
+    file_path: "",
+    line_start: "",
+    line_end: "",
+    symbol: "",
+    entry_point: "",
+    business_node_id: "",
+    description: "",
+    impact: "",
+    evidence: "",
+    remediation: "",
+    proof_title: "",
+    proof_payload: "",
+    proof_request: "",
+    proof_response: "",
+    poc_payload: "",
+    poc_request_template: "",
+    poc_expected_result: "",
+    poc_steps: "",
+    poc_verification: "",
+  });
+  const [saving, setSaving] = useState(false);
+  const applyToolFinding = (id) => {
+    const finding = toolFindings.find((item) => item.id === id);
+    if (!finding) {
+      setForm({ ...form, toolFindingId: id });
+      return;
+    }
+    setForm({
+      ...form,
+      toolFindingId: id,
+      title: form.title || finding.title || "",
+      severity: finding.severity === "info" ? form.severity : finding.severity || form.severity,
+      category: form.category || finding.tool_name || "工具候选",
+      file_path: form.file_path || finding.file_path || "",
+      line_start: form.line_start || finding.line_start || "",
+      line_end: form.line_end || finding.line_end || "",
+      description: form.description || finding.description || "",
+      evidence: form.evidence || `${finding.tool_name}${finding.rule_id ? ` / ${finding.rule_id}` : ""}`,
+    });
+  };
+  const submit = async (event) => {
+    event.preventDefault();
+    setSaving(true);
+    try {
+      const proofPacket =
+        form.proof_title || form.proof_payload || form.proof_request || form.proof_response
+          ? {
+              title: form.proof_title || "漏洞证明",
+              payload: form.proof_payload,
+              request: form.proof_request,
+              response: form.proof_response,
+            }
+          : null;
+      const reproduction_poc = {};
+      if (form.poc_payload) reproduction_poc.payload = form.poc_payload;
+      if (form.poc_request_template) reproduction_poc.request_template = form.poc_request_template;
+      if (form.poc_expected_result) reproduction_poc.expected_result = form.poc_expected_result;
+      if (form.poc_steps) reproduction_poc.steps = splitLines(form.poc_steps);
+      if (form.poc_verification) reproduction_poc.verification = form.poc_verification;
+      await onSubmit({
+        title: form.title,
+        category: form.category,
+        severity: form.severity,
+        cwe: form.cwe || null,
+        file_path: form.file_path || null,
+        line_start: form.line_start ? Number(form.line_start) : null,
+        line_end: form.line_end ? Number(form.line_end) : null,
+        symbol: form.symbol || null,
+        entry_point: form.entry_point || null,
+        business_node_id: form.business_node_id || null,
+        description: form.description,
+        impact: form.impact || null,
+        evidence: form.evidence || null,
+        proof_packets: proofPacket ? [proofPacket] : [],
+        reproduction_poc,
+        remediation: form.remediation || null,
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <Modal title="录入审计发现" subtitle="用于把已验证的源码证据记录成正式发现；不会自动改动候选或报告状态。" onClose={onClose} wide>
+      <form className="stack-form modal-body" onSubmit={submit}>
+        {toolFindings.length > 0 && (
+          <label>
+            <span>从工具候选填充</span>
+            <select value={form.toolFindingId} onChange={(event) => applyToolFinding(event.target.value)}>
+              <option value="">不使用工具候选</option>
+              {toolFindings.map((finding) => (
+                <option key={finding.id} value={finding.id}>
+                  {finding.tool_name} · {finding.title}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+        <div className="two-col">
+          <label>
+            <span>标题</span>
+            <input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} required />
+          </label>
+          <label>
+            <span>类别</span>
+            <input value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })} required />
+          </label>
+        </div>
+        <div className="three-col">
+          <label>
+            <span>严重程度</span>
+            <select value={form.severity} onChange={(event) => setForm({ ...form, severity: event.target.value })}>
+              {Object.entries(SEVERITY_META).map(([key, meta]) => (
+                <option key={key} value={key}>{meta.label}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>CWE</span>
+            <input value={form.cwe} onChange={(event) => setForm({ ...form, cwe: event.target.value })} placeholder="CWE-639" />
+          </label>
+          <label>
+            <span>业务节点</span>
+            <select value={form.business_node_id} onChange={(event) => setForm({ ...form, business_node_id: event.target.value })}>
+              <option value="">不关联</option>
+              {businessNodes.map((node) => (
+                <option key={node.id} value={node.id}>{node.title}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <div className="three-col">
+          <label>
+            <span>文件路径</span>
+            <input value={form.file_path} onChange={(event) => setForm({ ...form, file_path: event.target.value })} />
+          </label>
+          <label>
+            <span>起始行</span>
+            <input type="number" min="1" value={form.line_start} onChange={(event) => setForm({ ...form, line_start: event.target.value })} />
+          </label>
+          <label>
+            <span>结束行</span>
+            <input type="number" min="1" value={form.line_end} onChange={(event) => setForm({ ...form, line_end: event.target.value })} />
+          </label>
+        </div>
+        <div className="two-col">
+          <label>
+            <span>符号</span>
+            <input value={form.symbol} onChange={(event) => setForm({ ...form, symbol: event.target.value })} />
+          </label>
+          <label>
+            <span>入口点</span>
+            <input value={form.entry_point} onChange={(event) => setForm({ ...form, entry_point: event.target.value })} />
+          </label>
+        </div>
+        <label>
+          <span>描述</span>
+          <textarea rows={5} value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} required />
+        </label>
+        <div className="two-col">
+          <label>
+            <span>影响</span>
+            <textarea rows={4} value={form.impact} onChange={(event) => setForm({ ...form, impact: event.target.value })} />
+          </label>
+          <label>
+            <span>代码证据</span>
+            <textarea rows={4} value={form.evidence} onChange={(event) => setForm({ ...form, evidence: event.target.value })} />
+          </label>
+        </div>
+        <label>
+          <span>修复建议</span>
+          <textarea rows={4} value={form.remediation} onChange={(event) => setForm({ ...form, remediation: event.target.value })} />
+        </label>
+        <details className="form-details">
+          <summary>证明数据包 / 静态 PoC</summary>
+          <div className="two-col">
+            <label>
+              <span>证明标题</span>
+              <input value={form.proof_title} onChange={(event) => setForm({ ...form, proof_title: event.target.value })} />
+            </label>
+            <label>
+              <span>Payload</span>
+              <input value={form.proof_payload} onChange={(event) => setForm({ ...form, proof_payload: event.target.value })} />
+            </label>
+          </div>
+          <div className="two-col">
+            <label>
+              <span>请求数据包</span>
+              <textarea rows={6} value={form.proof_request} onChange={(event) => setForm({ ...form, proof_request: event.target.value })} />
+            </label>
+            <label>
+              <span>响应/回显</span>
+              <textarea rows={6} value={form.proof_response} onChange={(event) => setForm({ ...form, proof_response: event.target.value })} />
+            </label>
+          </div>
+          <div className="two-col">
+            <label>
+              <span>PoC 请求/命令模板</span>
+              <textarea rows={4} value={form.poc_request_template} onChange={(event) => setForm({ ...form, poc_request_template: event.target.value })} />
+            </label>
+            <label>
+              <span>PoC 预期结果</span>
+              <textarea rows={4} value={form.poc_expected_result} onChange={(event) => setForm({ ...form, poc_expected_result: event.target.value })} />
+            </label>
+          </div>
+          <div className="two-col">
+            <label>
+              <span>PoC Payload</span>
+              <textarea rows={3} value={form.poc_payload} onChange={(event) => setForm({ ...form, poc_payload: event.target.value })} />
+            </label>
+            <label>
+              <span>PoC 步骤</span>
+              <textarea rows={3} value={form.poc_steps} onChange={(event) => setForm({ ...form, poc_steps: event.target.value })} />
+            </label>
+          </div>
+          <label>
+            <span>PoC 判断标准</span>
+            <textarea rows={3} value={form.poc_verification} onChange={(event) => setForm({ ...form, poc_verification: event.target.value })} />
+          </label>
+        </details>
+        <div className="modal-footer">
+          <button className="ghost-button" type="button" onClick={onClose}>取消</button>
+          <button className="primary-button compact" type="submit" disabled={saving}>
+            {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
+            保存发现
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function AuditCandidateConclusionModal({ candidate, auditFindings, onClose, onSubmit }) {
+  const [form, setForm] = useState({
+    decision: "rejected",
+    summary: "",
+    evidence: "",
+    audit_finding_id: "",
+  });
+  const [saving, setSaving] = useState(false);
+  const requiresFinding = form.decision === "confirmed";
+  const submit = async (event) => {
+    event.preventDefault();
+    setSaving(true);
+    try {
+      await onSubmit({
+        reviewer: HUMAN_WORKER,
+        decision: form.decision,
+        summary: form.summary,
+        evidence: form.evidence || null,
+        audit_finding_id: requiresFinding ? form.audit_finding_id : null,
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <Modal title="记录候选结论" subtitle={candidate.title} onClose={onClose} wide>
+      <form className="stack-form modal-body" onSubmit={submit}>
+        <div className="two-col">
+          <label>
+            <span>结论</span>
+            <select value={form.decision} onChange={(event) => setForm({ ...form, decision: event.target.value, audit_finding_id: "" })}>
+              <option value="rejected">驳回候选</option>
+              <option value="needs_more_evidence">证据不足</option>
+              <option value="confirmed">确认并关联正式发现</option>
+            </select>
+          </label>
+          <label>
+            <span>关联正式发现</span>
+            <select
+              value={form.audit_finding_id}
+              onChange={(event) => setForm({ ...form, audit_finding_id: event.target.value })}
+              disabled={!requiresFinding}
+              required={requiresFinding}
+            >
+              <option value="">{requiresFinding ? "选择正式发现" : "无需关联"}</option>
+              {auditFindings.map((finding) => (
+                <option key={finding.id} value={finding.id}>{finding.id} · {finding.title}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <label>
+          <span>结论摘要</span>
+          <textarea rows={4} value={form.summary} onChange={(event) => setForm({ ...form, summary: event.target.value })} required />
+        </label>
+        <label>
+          <span>证据 / 阻塞原因</span>
+          <textarea rows={5} value={form.evidence} onChange={(event) => setForm({ ...form, evidence: event.target.value })} required={!requiresFinding} />
+        </label>
+        <div className="modal-footer">
+          <button className="ghost-button" type="button" onClick={onClose}>取消</button>
+          <button className="primary-button compact" type="submit" disabled={saving || (requiresFinding && !form.audit_finding_id)}>
+            {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
+            保存结论
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
 function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
   const view = route?.view || "overview";
   const severityViews = { critical: "严重漏洞", high: "高危漏洞", medium: "中危漏洞", low: "低危漏洞" };
@@ -3453,6 +4729,7 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
       : severityViews[view] || statusViews[view] || "报告总览";
 
   const [vulnerabilities, setVulnerabilities] = useState([]);
+  const [reportEnrichmentTasks, setReportEnrichmentTasks] = useState([]);
   const [projects, setProjects] = useState([]);
   const [filters, setFilters] = useState({ severity: "", project_id: "", status: "", search: route?.search || "", date_from: "", date_to: "" });
   const [expandedVulns, setExpandedVulns] = useState({});
@@ -3460,6 +4737,7 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
+  const [exportOpen, setExportOpen] = useState(false);
 
   // The left sub-nav drives a severity or status filter via the URL view. The
   // in-page filter selects (project/search) still compose on top of it.
@@ -3480,11 +4758,13 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
   const load = useCallback(async ({ silent = false } = {}) => {
     if (!silent) setLoading(true);
     try {
-      const [list, projectList] = await Promise.all([
+      const [list, projectList, reportTasks] = await Promise.all([
         apiRequest(`/api/vulnerabilities${query}`),
         apiRequest("/projects"),
+        apiRequest("/api/report-enrichment-tasks?limit=500").catch(() => []),
       ]);
       setVulnerabilities(list);
+      setReportEnrichmentTasks(Array.isArray(reportTasks) ? reportTasks : []);
       setProjects(projectList);
     } catch (error) {
       if (!silent) setToast({ type: "danger", message: error.message || "审计报告加载失败" });
@@ -3517,14 +4797,40 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
     await load();
   };
 
-  const exportMd = async ({ selected = [], title = "vulnerabilities" }) => {
-    if (!selected.length) {
-      setToast({ type: "warning", message: "请先选择要导出的漏洞" });
+  const exportMd = async ({ selected = [], title = "vulnerabilities", scopeFilters = {} }) => {
+    const params = new URLSearchParams({ format: "md" });
+    if (selected.length) params.set("vulnerability_ids", selected.join(","));
+    if (!selected.length && scopeFilters.project_id) params.set("project_id", scopeFilters.project_id);
+    if (!selected.length && scopeFilters.severity) params.set("severity", scopeFilters.severity);
+    if (!selected.length && scopeFilters.status) params.set("status", scopeFilters.status);
+    await runAction("MD 报告已生成", () => downloadFromApi(`/api/vulnerabilities/export?${params}`, `${title}.md`));
+  };
+
+  const enqueueReportMaterials = async (items) => {
+    const targets = [];
+    const seen = new Set();
+    for (const item of items) {
+      const findingId = item.fact_id || item.id;
+      const key = `${item.project_id}:${findingId}`;
+      if (!item.project_id || !findingId || item.status !== "confirmed" || seen.has(key)) continue;
+      seen.add(key);
+      targets.push({ project_id: item.project_id, finding_id: findingId });
+    }
+    if (!targets.length) {
+      setToast({ type: "warning", message: "当前范围没有可提交的已确认漏洞" });
       return;
     }
-    const params = new URLSearchParams({ format: "md" });
-    params.set("vulnerability_ids", selected.join(","));
-    await runAction("MD 报告已生成", () => downloadFromApi(`/api/vulnerabilities/export?${params}`, `${title}.md`));
+    await runAction(`已提交 ${targets.length} 个报告材料任务`, () =>
+      Promise.all(
+        targets.map((target) =>
+          apiRequest(`/api/projects/${target.project_id}/report-enrichments`, {
+            method: "POST",
+            body: { finding_id: target.finding_id, created_by: HUMAN_WORKER },
+          }),
+        ),
+      ),
+    );
+    await load({ silent: true });
   };
 
   const updateVulnerabilityStatus = async (vuln, status) => {
@@ -3608,16 +4914,15 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
       <PageHeader
         compact
         title={`审计报告 / ${viewTitle}`}
-        subtitle="仅展示经过复核确认的代码审计发现"
+        subtitle="仅展示已确认的代码审计发现"
         actions={
           <button
             className="ghost-button report-export-button"
             type="button"
-            disabled={!selectedIds.length}
-            onClick={() => exportMd({ selected: selectedIds, title: "rabbit-vulnerabilities" })}
+            onClick={() => setExportOpen(true)}
           >
             <Download size={18} />
-            导出报告
+            MD 导出
           </button>
         }
       />
@@ -3797,7 +5102,167 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
           </div>
         )}
       </section>
+      {exportOpen && (
+        <ReportExportModal
+          projects={projects}
+          filters={{ ...filters, severity: viewSeverity || filters.severity, status: viewStatus || filters.status }}
+          vulnerabilities={visibleVulnerabilities}
+          selectedIds={selectedIds}
+          reportEnrichmentTasks={reportEnrichmentTasks}
+          selectedCount={selectedIds.length}
+          visibleCount={filteredVulnCount}
+          onClose={() => setExportOpen(false)}
+          onEnqueueReportMaterials={enqueueReportMaterials}
+          onSubmit={async ({ mode, scopeFilters }) => {
+            await exportMd({
+              selected: mode === "selected" ? selectedIds : [],
+              title: mode === "selected" ? "rabbit-selected-vulnerabilities" : "rabbit-vulnerabilities",
+              scopeFilters,
+            });
+            setExportOpen(false);
+          }}
+        />
+      )}
     </>
+  );
+}
+
+function ReportExportModal({
+  projects,
+  filters,
+  vulnerabilities = [],
+  selectedIds = [],
+  reportEnrichmentTasks = [],
+  selectedCount,
+  visibleCount,
+  onClose,
+  onSubmit,
+  onEnqueueReportMaterials,
+}) {
+  const [form, setForm] = useState({
+    mode: selectedCount ? "selected" : "filtered",
+    project_id: filters.project_id || "",
+    severity: filters.severity || "",
+    status: filters.status || "",
+  });
+  const [saving, setSaving] = useState(false);
+  const [materialBusy, setMaterialBusy] = useState(false);
+  const scopedVulnerabilities = useMemo(() => {
+    const selected = new Set(selectedIds);
+    if (form.mode === "selected") {
+      return vulnerabilities.filter((item) => selected.has(item.id));
+    }
+    return vulnerabilities.filter((item) => {
+      if (form.project_id && item.project_id !== form.project_id) return false;
+      if (form.severity && item.severity !== form.severity) return false;
+      if (form.status && item.status !== form.status) return false;
+      return true;
+    });
+  }, [form.mode, form.project_id, form.severity, form.status, selectedIds, vulnerabilities]);
+  const missingReportMaterials = useMemo(
+    () =>
+      scopedVulnerabilities.filter(
+        (item) => item.status === "confirmed" && !hasCompletedReportMaterial(reportEnrichmentTasks, item),
+      ),
+    [reportEnrichmentTasks, scopedVulnerabilities],
+  );
+  const activeReportMaterials = useMemo(
+    () =>
+      reportEnrichmentTasks.filter(
+        (task) =>
+          (task.status === "pending" || task.status === "running") &&
+          scopedVulnerabilities.some((item) => reportTaskFindingIds(item).includes(task.finding_id)),
+      ),
+    [reportEnrichmentTasks, scopedVulnerabilities],
+  );
+  const submit = async (event) => {
+    event.preventDefault();
+    setSaving(true);
+    try {
+      await onSubmit({
+        mode: form.mode,
+        scopeFilters: {
+          project_id: form.project_id,
+          severity: form.severity,
+          status: form.status,
+        },
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+  const enqueueMaterials = async () => {
+    setMaterialBusy(true);
+    try {
+      await onEnqueueReportMaterials(missingReportMaterials);
+    } finally {
+      setMaterialBusy(false);
+    }
+  };
+  return (
+    <Modal title="MD 报告导出" subtitle="导出的 Markdown 会包含摘要页、漏洞清单、修复建议汇总和逐项证据。" onClose={onClose}>
+      <form className="stack-form modal-body" onSubmit={submit}>
+        <label>
+          <span>导出范围</span>
+          <select value={form.mode} onChange={(event) => setForm({ ...form, mode: event.target.value })}>
+            <option value="filtered">当前筛选范围（{visibleCount} 条）</option>
+            <option value="selected" disabled={!selectedCount}>已选漏洞（{selectedCount} 条）</option>
+          </select>
+        </label>
+        {form.mode === "filtered" && (
+          <>
+            <label>
+              <span>项目</span>
+              <select value={form.project_id} onChange={(event) => setForm({ ...form, project_id: event.target.value })}>
+                <option value="">全部项目</option>
+                {projects.map((project) => (
+                  <option key={project.id} value={project.id}>{project.title}</option>
+                ))}
+              </select>
+            </label>
+            <div className="two-col">
+              <label>
+                <span>严重程度</span>
+                <select value={form.severity} onChange={(event) => setForm({ ...form, severity: event.target.value })}>
+                  <option value="">全部</option>
+                  {["critical", "high", "medium", "low"].map((level) => (
+                    <option key={level} value={level}>{SEVERITY_META[level].label}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>状态</span>
+                <select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value })}>
+                  <option value="">全部状态</option>
+                  <option value="confirmed">已确认</option>
+                  <option value="ignored">已忽略</option>
+                </select>
+              </label>
+            </div>
+          </>
+        )}
+        <div className="soft-box compact">
+          当前导出范围预估 {scopedVulnerabilities.length} 条；其中 {missingReportMaterials.length} 条已确认漏洞缺少已完成的报告材料。
+          {activeReportMaterials.length ? ` ${activeReportMaterials.length} 个报告材料任务正在等待或生成。` : " "}
+          导出不会自动触发扫描或动态验证。
+          {missingReportMaterials.length > 0 && (
+            <div className="button-row">
+              <button className="ghost-button compact" type="button" disabled={materialBusy} onClick={enqueueMaterials}>
+                {materialBusy ? <Loader2 className="spin" size={15} /> : <FileText size={15} />}
+                提交写报告 Worker
+              </button>
+            </div>
+          )}
+        </div>
+        <div className="modal-footer">
+          <button className="ghost-button" type="button" onClick={onClose}>取消</button>
+          <button className="primary-button compact" type="submit" disabled={saving || (form.mode === "selected" && !selectedCount)}>
+            {saving ? <Loader2 className="spin" size={18} /> : <Download size={18} />}
+            导出 MD
+          </button>
+        </div>
+      </form>
+    </Modal>
   );
 }
 
@@ -4522,10 +5987,13 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
   const [editor, setEditor] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [toolTaskQueue, setToolTaskQueue] = useState([]);
+  const [reportTaskQueue, setReportTaskQueue] = useState([]);
+  const [taskBusyId, setTaskBusyId] = useState(null);
 
   const load = useCallback(async () => {
     try {
-      const [statusList, configPayload] = await Promise.all([
+      const [statusList, configPayload, toolQueuePayload, reportQueuePayload] = await Promise.all([
         apiRequest("/api/workers").catch((error) => {
           setToast({ type: "warning", message: error.message || "工作节点状态暂不可用" });
           return [];
@@ -4534,9 +6002,13 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
           setToast({ type: "warning", message: error.message || "Worker 配置暂不可用" });
           return null;
         }),
+        apiRequest("/api/tool-scan-tasks?limit=80").catch(() => []),
+        apiRequest("/api/report-enrichment-tasks?limit=80").catch(() => []),
       ]);
       setWorkers(statusList);
       setConfig(configPayload);
+      setToolTaskQueue(Array.isArray(toolQueuePayload) ? toolQueuePayload : []);
+      setReportTaskQueue(Array.isArray(reportQueuePayload) ? reportQueuePayload : []);
       setLastUpdated(new Date());
     } finally {
       setLoading(false);
@@ -4630,6 +6102,54 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
     if (!ok) return;
     await saveWorkers(config.workers.filter((item) => item.name !== worker.name), "Worker 已删除");
     setEditor(null);
+  };
+
+  const cancelQueueTask = async (task) => {
+    setTaskBusyId(task.id);
+    try {
+      await runAction("任务已取消", () =>
+        apiRequest(`/api/tool-scans/${task.id}/cancel`, { method: "POST", body: { worker: HUMAN_WORKER } }),
+      );
+      await load();
+    } finally {
+      setTaskBusyId(null);
+    }
+  };
+
+  const retryQueueTask = async (task) => {
+    setTaskBusyId(task.id);
+    try {
+      await runAction("任务已重试", () =>
+        apiRequest(`/api/tool-scans/${task.id}/retry`, { method: "POST", body: { worker: HUMAN_WORKER } }),
+      );
+      await load();
+    } finally {
+      setTaskBusyId(null);
+    }
+  };
+
+  const cancelReportQueueTask = async (task) => {
+    setTaskBusyId(task.id);
+    try {
+      await runAction("报告材料任务已取消", () =>
+        apiRequest(`/api/report-enrichments/${task.id}/cancel`, { method: "POST", body: { worker: HUMAN_WORKER } }),
+      );
+      await load();
+    } finally {
+      setTaskBusyId(null);
+    }
+  };
+
+  const retryReportQueueTask = async (task) => {
+    setTaskBusyId(task.id);
+    try {
+      await runAction("报告材料任务已重试", () =>
+        apiRequest(`/api/report-enrichments/${task.id}/retry`, { method: "POST", body: { worker: HUMAN_WORKER } }),
+      );
+      await load();
+    } finally {
+      setTaskBusyId(null);
+    }
   };
 
   return (
@@ -4744,6 +6264,25 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
               );
             })}
           </div>
+            <TaskOperationsPanel
+              title="工具扫描队列"
+              emptyText="暂无工具扫描任务。"
+              tasks={toolTaskQueue}
+              busyId={taskBusyId}
+              onCancel={cancelQueueTask}
+              onRetry={retryQueueTask}
+              onRefresh={load}
+            />
+            <TaskOperationsPanel
+              title="报告材料队列"
+              emptyText="暂无报告材料任务。"
+              kind="report"
+              tasks={reportTaskQueue}
+              busyId={taskBusyId}
+              onCancel={cancelReportQueueTask}
+              onRetry={retryReportQueueTask}
+              onRefresh={load}
+            />
           </>
         )}
       </section>
@@ -4756,6 +6295,78 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
         />
       )}
     </>
+  );
+}
+
+function TaskOperationsPanel({ title, emptyText, kind = "tool", tasks, busyId, onCancel, onRetry, onRefresh }) {
+  const counts = useMemo(
+    () =>
+      tasks.reduce(
+        (acc, task) => {
+          acc[task.status] = (acc[task.status] || 0) + 1;
+          acc.total += 1;
+          return acc;
+        },
+        { total: 0, pending: 0, running: 0, completed: 0, failed: 0 },
+      ),
+    [tasks],
+  );
+  const formatStatus = kind === "report" ? formatReportEnrichmentStatus : formatToolScanStatus;
+  const statusTone = kind === "report" ? reportEnrichmentStatusTone : toolScanStatusTone;
+  return (
+    <section className="task-ops-panel">
+      <header>
+        <div>
+          <span>任务运维</span>
+          <h2>{title}</h2>
+        </div>
+        <div className="button-row">
+          <Badge tone="info">{counts.running} 运行中</Badge>
+          <Badge tone="warning">{counts.pending} 等待中</Badge>
+          <Badge tone="danger">{counts.failed} 失败</Badge>
+          <button className="ghost-button compact" type="button" onClick={onRefresh}>
+            <RefreshCw size={15} />
+            刷新
+          </button>
+        </div>
+      </header>
+      {tasks.length === 0 ? (
+        <div className="soft-box compact">{emptyText}</div>
+      ) : (
+        <div className="task-ops-list">
+          {tasks.map((task) => (
+            <article className="task-ops-row" key={task.id}>
+              <div>
+                <strong>{task.id}</strong>
+                <span>{task.project_title || task.project_id}</span>
+                <small>
+                  {kind === "report"
+                    ? `${task.finding_title || task.finding_id} · ${task.finding_id} · ${task.worker || task.created_by} · ${formatTime(task.created_at)}`
+                    : `${task.source_label || task.snapshot_id} · ${task.worker || task.created_by} · ${formatTime(task.created_at)}`}
+                </small>
+                {kind === "report" && task.status === "completed" && <small>{reportTaskMaterialSummary(task)}</small>}
+                {task.error_message && <p>{task.error_message}</p>}
+              </div>
+              <Badge tone={statusTone(task.status)}>{formatStatus(task.status)}</Badge>
+              <div className="button-row">
+                {(task.status === "pending" || task.status === "running") && (
+                  <button className="ghost-button compact warning" type="button" disabled={busyId === task.id} onClick={() => onCancel(task)}>
+                    {busyId === task.id ? <Loader2 className="spin" size={15} /> : <Square size={15} />}
+                    取消
+                  </button>
+                )}
+                {task.status === "failed" && (
+                  <button className="ghost-button compact" type="button" disabled={busyId === task.id} onClick={() => onRetry(task)}>
+                    {busyId === task.id ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
+                    重试
+                  </button>
+                )}
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 

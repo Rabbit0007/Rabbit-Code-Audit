@@ -136,7 +136,7 @@ def test_report_enrichment_lifecycle_stores_report_only_material(client, temp_db
                 "verification": "源码证据显示参数未绑定",
                 "limitations": ["静态推导，不包含真实响应包"],
             },
-            "evidence_chain": ["finding_1 已确认", "审计日志记录 reviewer-b 复核"],
+            "evidence_chain": ["finding_1 已确认", "审计日志记录 reviewer-b 确认"],
             "report_sections": {"影响说明": "攻击者可绕过查询条件。"},
             "delivery_notes": ["需在测试环境补充真实响应包。"],
         },
@@ -153,6 +153,43 @@ def test_report_enrichment_lifecycle_stores_report_only_material(client, temp_db
         ).fetchone()
         assert finding["proof_packets_json"] == "[]"
         assert finding["reproduction_poc_json"] == "{}"
+
+
+def test_report_enrichment_queue_cancel_retry_and_dedupes_active_task(client, temp_db):
+    _setup_confirmed_finding()
+
+    created = client.post(
+        "/api/projects/p1/report-enrichments",
+        json={"finding_id": "finding_1", "created_by": "tester"},
+    )
+    assert created.status_code == 201
+    task = created.json()
+
+    duplicate = client.post(
+        "/api/projects/p1/report-enrichments",
+        json={"finding_id": "finding_1", "created_by": "tester-2"},
+    )
+    assert duplicate.status_code == 201
+    assert duplicate.json()["id"] == task["id"]
+    assert duplicate.json()["created_by"] == "tester"
+
+    queue = client.get("/api/report-enrichment-tasks").json()
+    assert queue[0]["id"] == task["id"]
+    assert queue[0]["project_title"] == "Audit Project"
+    assert queue[0]["finding_title"] == "SQL injection"
+    assert queue[0]["finding_severity"] == "high"
+
+    cancelled = client.post(f"/api/report-enrichments/{task['id']}/cancel", json={"worker": "Human"})
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "failed"
+    assert "Cancelled by Human" in cancelled.json()["error_message"]
+
+    retried = client.post(f"/api/report-enrichments/{task['id']}/retry", json={"worker": "Human"})
+    assert retried.status_code == 200
+    assert retried.json()["status"] == "pending"
+    assert retried.json()["worker"] is None
+    assert retried.json()["packet_templates"] == []
+    assert retried.json()["reproduction_poc"] == {}
 
 
 def test_complete_rejects_observed_response_in_packet_template(client, temp_db):

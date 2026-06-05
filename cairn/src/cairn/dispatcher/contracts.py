@@ -105,11 +105,6 @@ BUSINESS_NODE_RISK_LEVELS = {"critical", "high", "medium", "low", "unknown"}
 BUSINESS_NODE_REVIEW_STATUSES = {"unreviewed", "investigating", "covered", "blocked"}
 BUSINESS_NODE_CONCLUSIONS = {"confirmed_finding", "rejected", "needs_more_evidence"}
 BUSINESS_NODE_CONCLUSION_ALIASES = {
-    "confirmed": "confirmed_finding",
-    "finding": "confirmed_finding",
-    "vulnerable": "confirmed_finding",
-    "vulnerability": "confirmed_finding",
-    "confirmed_vulnerability": "confirmed_finding",
     "no_finding": "rejected",
     "not_vulnerable": "rejected",
     "no_vulnerability": "rejected",
@@ -119,6 +114,13 @@ BUSINESS_NODE_CONCLUSION_ALIASES = {
     "unknown": "needs_more_evidence",
     "needs_evidence": "needs_more_evidence",
     "insufficient_evidence": "needs_more_evidence",
+}
+BUSINESS_NODE_CONFIRMED_ALIASES = {
+    "confirmed",
+    "finding",
+    "vulnerable",
+    "vulnerability",
+    "confirmed_vulnerability",
 }
 SEVERITIES = {"critical", "high", "medium", "low", "info"}
 AUDIT_CANDIDATE_SEVERITIES = {"critical", "high", "medium", "low", "info", "unknown"}
@@ -250,12 +252,14 @@ def _normalize_business_edge_relation(value: Any) -> str:
     return BUSINESS_EDGE_RELATION_ALIASES.get(text, "relates_to")
 
 
-def _normalize_business_node_conclusion(value: Any) -> str | None:
+def _normalize_business_node_conclusion(value: Any, *, has_audit_finding_id: bool = False) -> str | None:
     if not isinstance(value, str):
         return None
     text = value.strip().lower().replace("-", "_").replace(" ", "_")
     if text in BUSINESS_NODE_CONCLUSIONS:
         return text
+    if text in BUSINESS_NODE_CONFIRMED_ALIASES:
+        return "confirmed_finding" if has_audit_finding_id else "needs_more_evidence"
     return BUSINESS_NODE_CONCLUSION_ALIASES.get(text)
 
 
@@ -366,7 +370,17 @@ def _validate_business_node_conclusions(value: Any) -> list[dict[str, Any]]:
             raise ValueError(
                 f"business node conclusion at index {index} requires business_node_id or business_node_ref"
             )
-        conclusion = _normalize_business_node_conclusion(item.get("conclusion", item.get("decision")))
+        audit_finding_id = item.get("audit_finding_id", item.get("finding_id"))
+        if audit_finding_id is not None and (
+            not isinstance(audit_finding_id, str) or not audit_finding_id.strip()
+        ):
+            raise ValueError(
+                f"business node conclusion at index {index} audit_finding_id must be a non-empty string"
+            )
+        conclusion = _normalize_business_node_conclusion(
+            item.get("conclusion", item.get("decision")),
+            has_audit_finding_id=isinstance(audit_finding_id, str) and bool(audit_finding_id.strip()),
+        )
         if conclusion not in BUSINESS_NODE_CONCLUSIONS:
             raise ValueError(f"business node conclusion at index {index} has invalid conclusion")
         summary = item.get("summary")
@@ -375,21 +389,12 @@ def _validate_business_node_conclusions(value: Any) -> list[dict[str, Any]]:
         evidence = item.get("evidence")
         if evidence is not None and not isinstance(evidence, str):
             raise ValueError(f"business node conclusion at index {index} evidence must be a string")
-        audit_finding_id = item.get("audit_finding_id", item.get("finding_id"))
-        if audit_finding_id is not None and (
-            not isinstance(audit_finding_id, str) or not audit_finding_id.strip()
-        ):
-            raise ValueError(
-                f"business node conclusion at index {index} audit_finding_id must be a non-empty string"
-            )
         if conclusion == "confirmed_finding" and not audit_finding_id:
-            raise ValueError(
-                f"business node conclusion at index {index} confirmed_finding requires audit_finding_id"
-            )
+            conclusion = "needs_more_evidence"
         if conclusion in ("rejected", "needs_more_evidence") and (
             not isinstance(evidence, str) or not evidence.strip()
         ):
-            raise ValueError(f"business node conclusion at index {index} {conclusion} requires evidence")
+            continue
         conclusion_item = {
             "conclusion": conclusion,
             "summary": summary.strip(),
@@ -677,7 +682,9 @@ def _validate_candidate_conclusions(value: Any) -> list[dict[str, Any]]:
         ):
             raise ValueError(f"candidate conclusion at index {index} audit_finding_id must be a non-empty string")
         if decision == "confirmed" and not audit_finding_id:
-            raise ValueError(f"candidate conclusion at index {index} confirmed requires audit_finding_id")
+            if not isinstance(evidence, str) or not evidence.strip():
+                continue
+            decision = "needs_more_evidence"
         if decision in ("rejected", "needs_more_evidence") and (
             not isinstance(evidence, str) or not evidence.strip()
         ):

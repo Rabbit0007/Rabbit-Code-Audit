@@ -158,6 +158,27 @@ class ReportEnrichmentTaskConfig(BaseModel):
     timeout: int = Field(gt=0, default=120)
 
 
+class ToolScanTaskConfig(BaseModel):
+    enabled: bool = False
+    auto_enqueue: bool = False
+    timeout_per_tool: int = Field(default=180, ge=10, le=1800)
+    tools: list[str] = Field(default_factory=list)
+    max_running: int = Field(default=1, gt=0)
+
+    @field_validator("tools")
+    @classmethod
+    def normalize_tools(cls, value: list[str]) -> list[str]:
+        seen: set[str] = set()
+        tools: list[str] = []
+        for item in value or []:
+            text = str(item).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            tools.append(text)
+        return tools
+
+
 class BootstrapTaskConfig(BaseModel):
     timeout: int = Field(gt=0)
     conclude_timeout: int = Field(gt=0)
@@ -168,6 +189,7 @@ class TasksConfig(BaseModel):
     reason: ReasonTaskConfig
     explore: ExploreTaskConfig
     report_enrichment: ReportEnrichmentTaskConfig = Field(default_factory=ReportEnrichmentTaskConfig)
+    tool_scan: ToolScanTaskConfig = Field(default_factory=ToolScanTaskConfig)
 
 
 class ContainerConfig(BaseModel):

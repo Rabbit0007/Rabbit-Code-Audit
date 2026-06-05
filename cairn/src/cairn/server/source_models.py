@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -203,6 +203,117 @@ class AuditCandidate(BaseModel):
     updated_at: str
     concluded_by: str | None = None
     concluded_at: str | None = None
+
+
+ToolScanTaskStatus = Literal["pending", "running", "completed", "failed"]
+
+
+class ToolScanTask(BaseModel):
+    id: str
+    project_id: str
+    snapshot_id: str
+    status: ToolScanTaskStatus
+    created_by: str
+    worker: str | None = None
+    created_at: str
+    started_at: str | None = None
+    last_heartbeat_at: str | None = None
+    completed_at: str | None = None
+    error_message: str | None = None
+    tools: list[str] = Field(default_factory=list)
+    timeout_per_tool: int = 180
+    summaries: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class CreateToolScanTaskRequest(BaseModel):
+    created_by: str = "tool_scan"
+    tools: list[str] = Field(default_factory=list)
+    timeout_per_tool: int = Field(default=180, ge=10, le=1800)
+
+    @field_validator("created_by")
+    @classmethod
+    def validate_created_by(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("must not be empty")
+        return text
+
+    @field_validator("tools")
+    @classmethod
+    def normalize_tools(cls, value: list[str]) -> list[str]:
+        seen: set[str] = set()
+        tools: list[str] = []
+        for item in value or []:
+            text = str(item).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            tools.append(text)
+        return tools
+
+
+class ClaimToolScanTaskRequest(BaseModel):
+    worker: str
+
+    @field_validator("worker")
+    @classmethod
+    def validate_worker(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("must not be empty")
+        return text
+
+
+class CompleteToolScanTaskRequest(ClaimToolScanTaskRequest):
+    summaries: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class FailToolScanTaskRequest(ClaimToolScanTaskRequest):
+    error_message: str
+
+    @field_validator("error_message")
+    @classmethod
+    def validate_error_message(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("must not be empty")
+        return text
+
+
+DynamicValidationStatus = Literal["static_only", "ready", "blocked"]
+DynamicValidationRisk = Literal["low", "medium", "high"]
+
+
+class DynamicValidationPlan(BaseModel):
+    id: str | None = None
+    project_id: str
+    snapshot_id: str
+    status: DynamicValidationStatus
+    mode: Literal["plan_only"] = "plan_only"
+    execution_default: Literal["disabled"] = "disabled"
+    recommended_strategy: str
+    risk_level: DynamicValidationRisk
+    large_project: bool
+    summary: str
+    launch_indicators: list[dict[str, Any]] = Field(default_factory=list)
+    allowed_actions: list[str] = Field(default_factory=list)
+    blocked_actions: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    created_by: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class CreateDynamicValidationPlanRequest(BaseModel):
+    created_by: str = "dynamic_validation_planner"
+
+    @field_validator("created_by")
+    @classmethod
+    def validate_created_by(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("must not be empty")
+        return text
 
 
 class CreateToolFindingRequest(BaseModel):

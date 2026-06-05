@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections import deque
@@ -23,14 +24,22 @@ from cairn.dispatcher.tasks.bootstrap import run_bootstrap_task
 from cairn.dispatcher.tasks.explore import run_explore_task
 from cairn.dispatcher.tasks.reason import run_reason_task
 from cairn.dispatcher.tasks.report_enrichment import run_report_enrichment_task
+from cairn.dispatcher.tasks.tool_scan import TOOL_SCAN_WORKER_NAME, run_tool_scan_task
 from cairn.server.models import Intent, ProjectDetail, ProjectSummary
 
 LOG = logging.getLogger(__name__)
 UNHEALTHY_RETRY_AFTER_SECONDS = 5
 REJECTED_RETRY_AFTER_SECONDS = 5
 SOURCE_PREFLIGHT_RETRY_AFTER_SECONDS = 60
+REASON_PARSE_FAILURE_LIMIT = 3
+REASON_PARSE_FAILURE_RETRY_AFTER_SECONDS = 180
+EXPLORE_PARSE_FAILURE_LIMIT = 3
+EXPLORE_PARSE_FAILURE_RETRY_AFTER_SECONDS = 180
+EXPLORE_WORKER_PARSE_RETRY_AFTER_SECONDS = 45
 BOOTSTRAP_INTENT_DESCRIPTION = "bootstrap"
 BOOTSTRAP_INTENT_CREATOR = "dispatcher.bootstrap"
+FINDING_ID_RE = re.compile(r"\bfinding_[0-9a-fA-F]{8,32}\b")
+REVIEW_INTENT_MARKERS = ("确认", "复核", "review", "reviews", "pending_review")
 
 
 @dataclass(slots=True)
@@ -41,6 +50,21 @@ class WorkerSelection:
     blocked_rejected: list[str]
     blocked_task_type: list[str]
     blocked_disabled: list[str]
+    blocked_policy: list[str]
+
+
+@dataclass(slots=True)
+class ReasonFailureState:
+    trigger: str
+    failures: int
+    cooldown_until: float = 0.0
+
+
+@dataclass(slots=True)
+class ExploreFailureState:
+    failures: int
+    cooldown_until: float = 0.0
+    last_error: str | None = None
 
 
 class DispatcherLoop:
@@ -51,13 +75,18 @@ class DispatcherLoop:
         self.container_manager = ContainerManager(self.config.container)
         self.executor = ThreadPoolExecutor(max_workers=self.config.runtime.max_workers)
         self.cleanup_executor = ThreadPoolExecutor(max_workers=max(1, min(8, self.config.runtime.max_workers)))
+        self.tool_scan_executor = ThreadPoolExecutor(max_workers=self.config.tasks.tool_scan.max_running)
         self.futures: dict[Future[str | TaskOutcome], RunningTask] = {}
+        self.tool_scan_futures: dict[Future[TaskOutcome], RunningTask] = {}
         self.cleanup_futures: dict[Future[bool], tuple[str, str | None, str | None]] = {}
         self.reason_checkpoints: dict[str, ReasonCheckpoint] = {}
         self.runtime_project_ids: set[str] = set()
         self.worker_unhealthy_until: dict[str, float] = {}
         self.worker_rejected_until: dict[tuple[str, str, str], float] = {}
         self.source_preflight_blocked_until: dict[tuple[str, str], float] = {}
+        self.reason_failure_state: dict[str, ReasonFailureState] = {}
+        self.explore_failure_state: dict[tuple[str, str], ExploreFailureState] = {}
+        self.explore_worker_parse_blocked_until: dict[tuple[str, str, str], float] = {}
         self._log_state: dict[str, tuple[int, str, tuple[object, ...]]] = {}
         self._cleanup_pending: set[str] = set()
         self._inactive_cleanup_done: dict[str, str] = {}
@@ -194,6 +223,7 @@ class DispatcherLoop:
                 sorted({task.project_id for task in self.futures.values()}),
             )
         self.executor.shutdown(wait=True)
+        self.tool_scan_executor.shutdown(wait=True)
         self.cleanup_executor.shutdown(wait=True)
         self.container_manager.close()
         self.client.close()
@@ -209,12 +239,14 @@ class DispatcherLoop:
                         self._validate_artifact_runtime()
                         self._settings_checked = True
                     self._reap_futures()
+                    self._reap_tool_scan_futures()
                     self._reap_cleanup_futures()
                     summaries = self.client.list_projects()
                     self._initialize_reason_checkpoints(summaries)
                     self._refresh_runtime_projects(summaries)
                     self._cancel_inactive_tasks(summaries)
                     self._queue_container_cleanups(summaries)
+                    self._dispatch_background_tool_scans(summaries)
                     self._dispatch_available(summaries)
                 except requests.RequestException as exc:
                     if once:
@@ -309,6 +341,128 @@ class DispatcherLoop:
                     dispatched = True
                     break
 
+    def _dispatch_background_tool_scans(self, summaries: list[ProjectSummary]) -> None:
+        config = self.config.tasks.tool_scan
+        if not config.enabled:
+            return
+        active = [summary for summary in summaries if summary.status == "active"]
+        if not active:
+            return
+        self._maybe_auto_enqueue_tool_scan_tasks(active)
+        if len(self.tool_scan_futures) >= config.max_running:
+            self._log_changed(
+                "tool_scan/limit",
+                logging.DEBUG,
+                "skip tool scan dispatch because max_running reached running_tasks=%s",
+                len(self.tool_scan_futures),
+            )
+            return
+        running_task_ids = self._running_tool_scan_task_ids()
+        pending = [
+            task
+            for task in self.client.list_pending_tool_scans(limit=max(1, config.max_running * 2))
+            if isinstance(task, dict) and str(task.get("id") or "") not in running_task_ids
+        ]
+        if not pending:
+            return
+        active_ids = {summary.id for summary in active}
+        for task in pending:
+            if len(self.tool_scan_futures) >= config.max_running:
+                return
+            if str(task.get("project_id") or "") not in active_ids:
+                continue
+            self._dispatch_tool_scan_task(task)
+
+    def _maybe_auto_enqueue_tool_scan_tasks(self, summaries: list[ProjectSummary]) -> None:
+        config = self.config.tasks.tool_scan
+        if not config.auto_enqueue:
+            return
+        for summary in summaries:
+            try:
+                project = self.client.get_project(summary.id)
+            except requests.RequestException:
+                raise
+            except Exception:
+                LOG.warning("failed to inspect project for tool scan auto enqueue project=%s", summary.id, exc_info=True)
+                continue
+            snapshot = next((source for source in project.sources if source.status == "ready"), None)
+            if snapshot is None:
+                continue
+            try:
+                existing = self.client.list_tool_scan_tasks(summary.id, snapshot_id=snapshot.id)
+            except requests.RequestException:
+                raise
+            except Exception:
+                LOG.warning(
+                    "failed to list tool scan tasks during auto enqueue project=%s snapshot=%s",
+                    summary.id,
+                    snapshot.id,
+                    exc_info=True,
+                )
+                continue
+            if any(task.get("status") in {"pending", "running", "completed"} for task in existing if isinstance(task, dict)):
+                continue
+            response = self.client.create_tool_scan_task(
+                summary.id,
+                snapshot.id,
+                created_by="dispatcher.auto_tool_scan",
+                tools=config.tools,
+                timeout_per_tool=config.timeout_per_tool,
+            )
+            if response.ok:
+                LOG.info("auto enqueued tool scan project=%s snapshot=%s", summary.id, snapshot.id)
+            elif response.status_code not in (403, 409):
+                LOG.warning(
+                    "tool scan auto enqueue failed project=%s snapshot=%s status=%s body=%s",
+                    summary.id,
+                    snapshot.id,
+                    response.status_code,
+                    response.text,
+                )
+
+    def _dispatch_tool_scan_task(self, task: dict) -> bool:
+        task_id = str(task.get("id") or "")
+        project_id = str(task.get("project_id") or "")
+        snapshot_id = str(task.get("snapshot_id") or "")
+        if not task_id or not project_id or not snapshot_id:
+            return False
+        claim = self.client.claim_tool_scan(task_id, TOOL_SCAN_WORKER_NAME)
+        if claim.status_code in (403, 409):
+            LOG.info(
+                "tool scan claim skipped project=%s task=%s status=%s",
+                project_id,
+                task_id,
+                claim.status_code,
+            )
+            return False
+        if not claim.ok:
+            LOG.warning(
+                "tool scan claim failed project=%s task=%s status=%s body=%s",
+                project_id,
+                task_id,
+                claim.status_code,
+                claim.text,
+            )
+            return False
+        if isinstance(claim.data, dict):
+            task = claim.data
+        try:
+            future = self.tool_scan_executor.submit(
+                run_tool_scan_task,
+                self.config,
+                self.client,
+                task,
+                cancellation := TaskCancellation(),
+            )
+        except Exception:
+            LOG.exception("failed to submit tool scan task project=%s task=%s", project_id, task_id)
+            self.client.release_tool_scan(task_id, TOOL_SCAN_WORKER_NAME)
+            return False
+        self.tool_scan_futures[future] = RunningTask(project_id, "tool_scan", TOOL_SCAN_WORKER_NAME, cancellation, intent_id=task_id)
+        self._clear_project_log_state(project_id)
+        LOG.info("dispatched tool scan project=%s task=%s snapshot=%s", project_id, task_id, snapshot_id)
+        return True
+
     def _ordered_projects(self, summaries: list[ProjectSummary]) -> list[ProjectSummary]:
         if not summaries:
             return []
@@ -373,6 +527,11 @@ class DispatcherLoop:
             and intent.id not in running_intent_ids
             and not self._is_bootstrap_intent(intent)
         ]
+        dispatchable_intents = [
+            intent
+            for intent in unclaimed_intents
+            if not self._explore_parse_cooldown(project.project.id, intent.id)
+        ]
         if running_intent_ids and not unclaimed_intents:
             self._log_changed(
                 f"{skip_scope}:explore_running",
@@ -381,9 +540,18 @@ class DispatcherLoop:
                 summary.id,
                 sorted(running_intent_ids),
             )
-        if unclaimed_intents:
-            newest = max(unclaimed_intents, key=lambda i: i.created_at)
-            export_yaml = self.client.export_project(summary.id)
+        if unclaimed_intents and not dispatchable_intents:
+            self._log_changed(
+                f"{skip_scope}:explore_parse_cooldown",
+                logging.INFO,
+                "skip explore project=%s because all unclaimed intents are cooling down after parse failures intents=%s",
+                summary.id,
+                sorted(intent.id for intent in unclaimed_intents),
+            )
+        if dispatchable_intents:
+            self._clear_log_state(f"{skip_scope}:explore_parse_cooldown")
+            newest = max(dispatchable_intents, key=lambda i: i.created_at)
+            export_yaml = self.client.export_project(summary.id, profile="explore", intent_id=newest.id)
             return self._dispatch_explore(project, export_yaml, newest)
         running_report_tasks = self._project_running_report_enrichment_tasks(summary.id)
         pending_report_tasks = [
@@ -415,7 +583,9 @@ class DispatcherLoop:
                 len(project.intents),
             )
             return False
-        export_yaml = self.client.export_project(summary.id)
+        if self._reason_parse_cooldown(project.project.id, reason_trigger):
+            return False
+        export_yaml = self.client.export_project(summary.id, profile="reason")
         return self._dispatch_reason(project, export_yaml, reason_trigger)
 
     def _dispatch_initial_project(self, project: ProjectDetail) -> bool:
@@ -502,6 +672,7 @@ class DispatcherLoop:
             fact_count=len(project.facts),
             hint_count=len(project.hints),
             open_intent_count=self._project_open_intent_count(project),
+            reason_trigger=trigger,
         )
         self.runtime_project_ids.add(project.project.id)
         self._clear_project_log_state(project.project.id)
@@ -571,18 +742,21 @@ class DispatcherLoop:
     def _dispatch_explore(self, project: ProjectDetail, export_yaml: str, intent: Intent) -> bool:
         if self._source_preflight_blocked(project.project.id, "explore"):
             return False
-        selection = self._select_worker(project.project.id, "explore")
+        excluded_workers = self._independent_review_excluded_workers(project.project.id, intent)
+        excluded_workers.update(self._explore_parse_excluded_workers(project.project.id, intent.id))
+        selection = self._select_worker(project.project.id, "explore", excluded_workers=excluded_workers)
         worker = selection.worker
         if worker is None:
             self._log_changed(
                 f"project:{project.project.id}:worker:explore",
                 logging.INFO,
-                "no worker available for explore project=%s intent=%s blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s",
+                "no worker available for explore project=%s intent=%s blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s blocked_policy=%s",
                 project.project.id,
                 intent.id,
                 selection.blocked_busy,
                 selection.blocked_unhealthy,
                 selection.blocked_rejected,
+                selection.blocked_policy,
             )
             return False
         self._clear_log_state(f"project:{project.project.id}:worker:explore")
@@ -691,20 +865,31 @@ class DispatcherLoop:
         LOG.info("dispatched report enrichment project=%s task=%s finding=%s worker=%s", project.project.id, task_id, finding_id, worker.name)
         return True
 
-    def _select_worker(self, project_id: str, task_type: str) -> WorkerSelection:
+    def _select_worker(
+        self,
+        project_id: str,
+        task_type: str,
+        *,
+        excluded_workers: set[str] | None = None,
+    ) -> WorkerSelection:
         now = time.time()
+        excluded_workers = excluded_workers or set()
         candidates: list[WorkerConfig] = []
         blocked_busy: list[str] = []
         blocked_unhealthy: list[str] = []
         blocked_rejected: list[str] = []
         blocked_task_type: list[str] = []
         blocked_disabled: list[str] = []
+        blocked_policy: list[str] = []
         running_counts = self._worker_counts()
         with self._config_lock:
             workers = list(self.config.workers)
         for worker in workers:
             if not worker.enabled:
                 blocked_disabled.append(worker.name)
+                continue
+            if worker.name in excluded_workers:
+                blocked_policy.append(worker.name)
                 continue
             if task_type not in worker.task_types:
                 blocked_task_type.append(worker.name)
@@ -724,7 +909,7 @@ class DispatcherLoop:
             candidates.append(worker)
         if not candidates:
             LOG.debug(
-                "worker selection project=%s task=%s no candidates blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s blocked_task_type=%s blocked_disabled=%s",
+                "worker selection project=%s task=%s no candidates blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s blocked_task_type=%s blocked_disabled=%s blocked_policy=%s",
                 project_id,
                 task_type,
                 blocked_busy,
@@ -732,6 +917,7 @@ class DispatcherLoop:
                 blocked_rejected,
                 blocked_task_type,
                 blocked_disabled,
+                blocked_policy,
             )
             return WorkerSelection(
                 worker=None,
@@ -740,10 +926,11 @@ class DispatcherLoop:
                 blocked_rejected=blocked_rejected,
                 blocked_task_type=blocked_task_type,
                 blocked_disabled=blocked_disabled,
+                blocked_policy=blocked_policy,
             )
         ordered = choose_worker(candidates, running_counts)
         LOG.debug(
-            "worker selection project=%s task=%s candidates=%s blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s blocked_task_type=%s blocked_disabled=%s chosen=%s",
+            "worker selection project=%s task=%s candidates=%s blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s blocked_task_type=%s blocked_disabled=%s blocked_policy=%s chosen=%s",
             project_id,
             task_type,
             [f"{worker.name}({running_counts.get(worker.name, 0)}/{worker.max_running},p{worker.priority})" for worker in candidates],
@@ -752,6 +939,7 @@ class DispatcherLoop:
             blocked_rejected,
             blocked_task_type,
             blocked_disabled,
+            blocked_policy,
             ordered[0].name if ordered else None,
         )
         return WorkerSelection(
@@ -761,6 +949,7 @@ class DispatcherLoop:
             blocked_rejected=blocked_rejected,
             blocked_task_type=blocked_task_type,
             blocked_disabled=blocked_disabled,
+            blocked_policy=blocked_policy,
         )
 
     def _worker_counts(self) -> dict[str, int]:
@@ -801,12 +990,50 @@ class DispatcherLoop:
             if task.project_id == project_id and task.task_type == "report_enrichment" and task.intent_id is not None
         }
 
+    def _running_tool_scan_task_ids(self) -> set[str]:
+        return {
+            task.intent_id
+            for task in self.tool_scan_futures.values()
+            if task.task_type == "tool_scan" and task.intent_id is not None
+        }
+
     def _running_project_count(self, summaries: list[ProjectSummary]) -> int:
         active_ids = {summary.id for summary in summaries if summary.status == "active"}
         return len(self.runtime_project_ids & active_ids)
 
     def _project_open_intent_count(self, project: ProjectDetail) -> int:
         return sum(1 for intent in project.intents if intent.to is None)
+
+    def _independent_review_excluded_workers(self, project_id: str, intent: Intent) -> set[str]:
+        description = intent.description or ""
+        lowered = description.lower()
+        if not any(marker in lowered for marker in REVIEW_INTENT_MARKERS):
+            return set()
+        finding_ids = set(FINDING_ID_RE.findall(description))
+        if not finding_ids:
+            return set()
+        try:
+            findings = self.client.list_audit_findings(project_id)
+        except Exception:
+            LOG.warning("failed to inspect audit findings for review worker selection project=%s intent=%s", project_id, intent.id, exc_info=True)
+            return set()
+        excluded = {
+            str(finding.get("discovered_by")).strip()
+            for finding in findings
+            if isinstance(finding, dict)
+            and finding.get("id") in finding_ids
+            and isinstance(finding.get("discovered_by"), str)
+            and str(finding.get("discovered_by")).strip()
+        }
+        if excluded:
+            LOG.debug(
+                "excluding finding discoverers for confirmation project=%s intent=%s findings=%s excluded_workers=%s",
+                project_id,
+                intent.id,
+                sorted(finding_ids),
+                sorted(excluded),
+            )
+        return excluded
 
     def _is_bootstrap_intent(self, intent: Intent) -> bool:
         return (
@@ -874,6 +1101,136 @@ class DispatcherLoop:
             return None
         return ",".join(changes)
 
+    def _reason_parse_cooldown(self, project_id: str, trigger: str) -> bool:
+        state = self.reason_failure_state.get(project_id)
+        if state is None or state.trigger != trigger:
+            return False
+        now = time.time()
+        if state.cooldown_until > now:
+            remaining = state.cooldown_until - now
+            self._log_changed(
+                f"project:{project_id}:reason_parse_cooldown:{trigger}",
+                logging.INFO,
+                "skip reason project=%s trigger=%s because repeated parse failures are cooling down retry_after=%.0fs",
+                project_id,
+                trigger,
+                remaining,
+            )
+            return True
+        if state.failures >= REASON_PARSE_FAILURE_LIMIT:
+            self.reason_failure_state.pop(project_id, None)
+        return False
+
+    def _record_reason_parse_failure(self, project_id: str, trigger: str) -> None:
+        current = self.reason_failure_state.get(project_id)
+        failures = current.failures + 1 if current is not None and current.trigger == trigger else 1
+        cooldown_until = 0.0
+        if failures >= REASON_PARSE_FAILURE_LIMIT:
+            cooldown_until = time.time() + REASON_PARSE_FAILURE_RETRY_AFTER_SECONDS
+        self.reason_failure_state[project_id] = ReasonFailureState(
+            trigger=trigger,
+            failures=failures,
+            cooldown_until=cooldown_until,
+        )
+        if cooldown_until:
+            LOG.warning(
+                "reason parse failure limit reached project=%s trigger=%s failures=%s retry_after=%.0fs",
+                project_id,
+                trigger,
+                failures,
+                REASON_PARSE_FAILURE_RETRY_AFTER_SECONDS,
+            )
+        else:
+            LOG.info(
+                "reason parse failure recorded project=%s trigger=%s failures=%s/%s",
+                project_id,
+                trigger,
+                failures,
+                REASON_PARSE_FAILURE_LIMIT,
+            )
+
+    def _explore_parse_cooldown(self, project_id: str, intent_id: str) -> bool:
+        key = (project_id, intent_id)
+        state = self.explore_failure_state.get(key)
+        if state is None:
+            return False
+        now = time.time()
+        if state.cooldown_until > now:
+            remaining = state.cooldown_until - now
+            self._log_changed(
+                f"project:{project_id}:explore_parse_cooldown:{intent_id}",
+                logging.INFO,
+                "skip explore project=%s intent=%s because repeated parse failures are cooling down retry_after=%.0fs",
+                project_id,
+                intent_id,
+                remaining,
+            )
+            return True
+        if state.failures >= EXPLORE_PARSE_FAILURE_LIMIT:
+            self.explore_failure_state.pop(key, None)
+        return False
+
+    def _explore_parse_excluded_workers(self, project_id: str, intent_id: str) -> set[str]:
+        now = time.time()
+        excluded: set[str] = set()
+        for key, retry_until in list(self.explore_worker_parse_blocked_until.items()):
+            key_project_id, key_intent_id, worker_name = key
+            if retry_until <= now:
+                self.explore_worker_parse_blocked_until.pop(key, None)
+                continue
+            if key_project_id == project_id and key_intent_id == intent_id:
+                excluded.add(worker_name)
+        return excluded
+
+    def _record_explore_parse_failure(
+        self,
+        project_id: str,
+        intent_id: str,
+        worker_name: str,
+        error_detail: str | None,
+    ) -> None:
+        now = time.time()
+        key = (project_id, intent_id)
+        current = self.explore_failure_state.get(key)
+        failures = current.failures + 1 if current is not None else 1
+        cooldown_until = 0.0
+        if failures >= EXPLORE_PARSE_FAILURE_LIMIT:
+            cooldown_until = now + EXPLORE_PARSE_FAILURE_RETRY_AFTER_SECONDS
+        self.explore_failure_state[key] = ExploreFailureState(
+            failures=failures,
+            cooldown_until=cooldown_until,
+            last_error=error_detail,
+        )
+        self.explore_worker_parse_blocked_until[(project_id, intent_id, worker_name)] = (
+            now + EXPLORE_WORKER_PARSE_RETRY_AFTER_SECONDS
+        )
+        if cooldown_until:
+            LOG.warning(
+                "explore parse failure limit reached project=%s intent=%s failures=%s retry_after=%.0fs last_error=%s",
+                project_id,
+                intent_id,
+                failures,
+                EXPLORE_PARSE_FAILURE_RETRY_AFTER_SECONDS,
+                error_detail,
+            )
+        else:
+            LOG.info(
+                "explore parse failure recorded project=%s intent=%s worker=%s failures=%s/%s worker_retry_after=%.0fs",
+                project_id,
+                intent_id,
+                worker_name,
+                failures,
+                EXPLORE_PARSE_FAILURE_LIMIT,
+                EXPLORE_WORKER_PARSE_RETRY_AFTER_SECONDS,
+            )
+
+    def _clear_explore_parse_failure(self, project_id: str, intent_id: str) -> None:
+        self.explore_failure_state.pop((project_id, intent_id), None)
+        prefix = (project_id, intent_id)
+        for key in list(self.explore_worker_parse_blocked_until):
+            if key[:2] == prefix:
+                self.explore_worker_parse_blocked_until.pop(key, None)
+
     def _reap_futures(self) -> None:
         done = [future for future in self.futures if future.done()]
         for future in done:
@@ -935,6 +1292,21 @@ class DispatcherLoop:
                     )
                 else:
                     self.worker_rejected_until.pop(rejection_key, None)
+                if task.task_type == "reason":
+                    if status == "success":
+                        self.reason_failure_state.pop(task.project_id, None)
+                    elif outcome.error_type == "parse_failed" and task.reason_trigger:
+                        self._record_reason_parse_failure(task.project_id, task.reason_trigger)
+                if task.task_type == "explore" and task.intent_id:
+                    if status == "success":
+                        self._clear_explore_parse_failure(task.project_id, task.intent_id)
+                    elif outcome.error_type in {"parse_failed", "fallback_parse_failed"}:
+                        self._record_explore_parse_failure(
+                            task.project_id,
+                            task.intent_id,
+                            task.worker_name,
+                            outcome.error_detail,
+                        )
                 if status == "success" and task.task_type == "reason":
                     assert task.fact_count is not None
                     assert task.hint_count is not None
@@ -953,6 +1325,28 @@ class DispatcherLoop:
                     )
             except Exception:
                 LOG.exception("task crashed project=%s task=%s worker=%s", task.project_id, task.task_type, task.worker_name)
+                self._persist_task_history(task, TaskOutcome(status="failed", error_type="task_crashed"))
+
+    def _reap_tool_scan_futures(self) -> None:
+        done = [future for future in self.tool_scan_futures if future.done()]
+        for future in done:
+            task = self.tool_scan_futures.pop(future)
+            try:
+                outcome = self._coerce_task_outcome(future.result())
+                self._record_task_history(task, outcome)
+                self._persist_task_history(task, outcome)
+                if outcome.status != "success":
+                    LOG.warning(
+                        "background tool scan finished project=%s task=%s worker=%s outcome=%s error_type=%s",
+                        task.project_id,
+                        task.intent_id,
+                        task.worker_name,
+                        outcome.status,
+                        outcome.error_type,
+                    )
+                self._clear_project_log_state(task.project_id)
+            except Exception:
+                LOG.exception("tool scan task crashed project=%s task=%s", task.project_id, task.intent_id)
                 self._persist_task_history(task, TaskOutcome(status="failed", error_type="task_crashed"))
 
     def _cleanup_completed_containers(self, summaries: list[ProjectSummary]) -> None:
@@ -1010,6 +1404,15 @@ class DispatcherLoop:
     def _refresh_runtime_projects(self, summaries: list[ProjectSummary]) -> None:
         active_ids = {summary.id for summary in summaries if summary.status == "active"}
         self.runtime_project_ids.intersection_update(active_ids)
+        for project_id in list(self.reason_failure_state):
+            if project_id not in active_ids:
+                self.reason_failure_state.pop(project_id, None)
+        for key in list(self.explore_failure_state):
+            if key[0] not in active_ids:
+                self.explore_failure_state.pop(key, None)
+        for key in list(self.explore_worker_parse_blocked_until):
+            if key[0] not in active_ids:
+                self.explore_worker_parse_blocked_until.pop(key, None)
         inactive_status_by_id = {summary.id: summary.status for summary in summaries if summary.status != "active"}
         for project_id, status in list(self._inactive_cleanup_done.items()):
             current_status = inactive_status_by_id.get(project_id)
@@ -1018,7 +1421,8 @@ class DispatcherLoop:
 
     def _cancel_inactive_tasks(self, summaries: list[ProjectSummary]) -> None:
         status_by_project = {summary.id: summary.status for summary in summaries}
-        for task in self.futures.values():
+        running_tasks = list(self.futures.values()) + list(self.tool_scan_futures.values())
+        for task in running_tasks:
             status = status_by_project.get(task.project_id, "deleted")
             if status != "active" and task.cancellation.cancel(status):
                 LOG.info(
