@@ -3,7 +3,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from cairn.dispatcher.protocol.client import ApiResult
+from cairn.dispatcher.runtime.cancellation import TaskCancellation
+from cairn.dispatcher.runtime.process import ProcessResult
+from cairn.dispatcher.tasks import explore as explore_tasks
 from cairn.dispatcher.tasks.explore import _write_explore_result
+from cairn.server.models import Intent
 
 
 def _proof_packet(path: str, payload: str) -> dict[str, str]:
@@ -93,6 +97,77 @@ class _FakeClient:
     ) -> ApiResult:
         self.reviews.append({"finding_id": finding_id, "reviewer": reviewer, "decision": decision})
         return ApiResult(status_code=200, data={"id": finding_id})
+
+
+class _FallbackClient:
+    def __init__(self):
+        self.released: list[tuple[str, str, str]] = []
+
+    def get_project(self, project_id: str):
+        return SimpleNamespace(project=SimpleNamespace(status="active"))
+
+    def release(self, project_id: str, intent_id: str, worker: str) -> ApiResult:
+        self.released.append((project_id, intent_id, worker))
+        return ApiResult(status_code=200, data={})
+
+
+class _FallbackContainerManager:
+    def ensure_running(self, project_id: str) -> str:
+        return f"container-{project_id}"
+
+    def write_text_file(self, container_name: str, path: str, content: str) -> None:
+        assert container_name
+        assert path
+        assert content
+
+
+class _FallbackDriver:
+    def supports_conclude(self) -> bool:
+        return True
+
+    def build_conclude(self, worker, prompt: str, session: str) -> list[str]:
+        assert prompt
+        assert session == "session-1"
+        return ["pi", "resume"]
+
+
+def test_conclude_fallback_returncode_124_is_reported_as_timeout(monkeypatch):
+    def fake_run_process(*args, **kwargs):
+        return ProcessResult(returncode=124, stdout="partial", stderr="", timed_out=False)
+
+    monkeypatch.setattr(explore_tasks, "_run_process", fake_run_process)
+
+    client = _FallbackClient()
+    outcome = explore_tasks._try_conclude_fallback(
+        SimpleNamespace(
+            runtime=SimpleNamespace(prompt_group="default"),
+            tasks=SimpleNamespace(explore=SimpleNamespace(conclude_timeout=90)),
+        ),
+        client,
+        _FallbackContainerManager(),
+        "container-proj_1",
+        SimpleNamespace(name="worker-a"),
+        _FallbackDriver(),
+        "proj_1",
+        Intent.model_validate(
+            {
+                "id": "i001",
+                "from": ["f001"],
+                "description": "audit user flow",
+                "creator": "tester",
+                "created_at": "2026-06-06T00:00:00Z",
+            }
+        ),
+        "facts: []",
+        "session-1",
+        SimpleNamespace(failure=None),
+        TaskCancellation(),
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.error_type == "fallback_timeout"
+    assert outcome.used_fallback is True
+    assert client.released == [("proj_1", "i001", "worker-a")]
 
 
 def test_write_explore_result_persists_batch_findings_and_candidate_closure():

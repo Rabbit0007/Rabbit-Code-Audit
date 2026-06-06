@@ -23,6 +23,13 @@ RATE_LIMIT_RE = re.compile(
     r"(?:\b429\b|rate\s*limit|too\s*many\s*requests|quota|访问频率|频率过高|禁止访问|限流)",
     re.IGNORECASE,
 )
+MODEL_CONNECTION_ERROR_RE = re.compile(
+    r"(?:connection\s+error|connection\s+reset|connection\s+refused|connect(?:ion)?\s+timed?\s*out|"
+    r"network\s+error|upstream\s+(?:timeout|unavailable|error)|\b(?:502|503|504)\b)",
+    re.IGNORECASE,
+)
+SOURCE_PREFLIGHT_ATTEMPTS = 5
+SOURCE_PREFLIGHT_RETRY_DELAY_SECONDS = 0.5
 LOG = logging.getLogger(__name__)
 
 
@@ -54,6 +61,18 @@ def preview(text: str, limit: int = LOG_PREVIEW_LIMIT) -> str:
 
 def is_rate_limited(*texts: str | None) -> bool:
     return any(text and RATE_LIMIT_RE.search(text) for text in texts)
+
+
+def is_model_connection_error(*texts: str | None) -> bool:
+    return any(text and MODEL_CONNECTION_ERROR_RE.search(text) for text in texts)
+
+
+def classify_worker_agent_error(*texts: str | None) -> tuple[str, bool]:
+    if is_rate_limited(*texts):
+        return "rate_limited", True
+    if is_model_connection_error(*texts):
+        return "model_connection_error", True
+    return "agent_error", False
 
 
 def task_outcome(
@@ -142,6 +161,8 @@ def verify_latest_source_available(
     *,
     phase: str,
     worker_name: str,
+    attempts: int = 1,
+    retry_delay_seconds: float = SOURCE_PREFLIGHT_RETRY_DELAY_SECONDS,
 ) -> SourcePreflightResult:
     source_path = latest_ready_source_path(project)
     if source_path is None:
@@ -154,12 +175,32 @@ def verify_latest_source_available(
             reason,
         )
         return SourcePreflightResult(ok=False, reason=reason)
-    if container_manager.directory_exists(container_name, source_path):
-        return SourcePreflightResult(ok=True, source_path=source_path)
+    attempt_count = max(1, attempts)
+    last_error: str | None = None
+    for attempt in range(1, attempt_count + 1):
+        try:
+            if container_manager.directory_exists(container_name, source_path):
+                return SourcePreflightResult(ok=True, source_path=source_path)
+            last_error = None
+        except RuntimeError as exc:
+            last_error = str(exc)
+        if attempt < attempt_count:
+            LOG.info(
+                "source preflight not ready; retrying project=%s worker=%s phase=%s source_path=%s attempt=%s/%s error=%s",
+                project.project.id,
+                worker_name,
+                phase,
+                source_path,
+                attempt,
+                attempt_count,
+                last_error,
+            )
+            time.sleep(max(0.0, retry_delay_seconds))
     mount_detail = getattr(container_manager, "artifact_mount_description", lambda: "artifact mount unknown")()
+    error_detail = f"; last_error={last_error}" if last_error else ""
     reason = (
         f"ready source snapshot is not readable in worker container at {source_path}; "
-        f"check artifact_host_path/artifact_volume mount configuration ({mount_detail})"
+        f"check artifact_host_path/artifact_volume mount configuration ({mount_detail}){error_detail}"
     )
     LOG.warning(
         "source preflight failed project=%s worker=%s phase=%s source_path=%s reason=%s",

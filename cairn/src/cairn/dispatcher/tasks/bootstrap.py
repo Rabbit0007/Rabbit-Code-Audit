@@ -16,8 +16,10 @@ from cairn.dispatcher.runtime.containers import ContainerManager
 from cairn.dispatcher.runtime.heartbeat import HeartbeatLease
 from cairn.dispatcher.models import TaskOutcome
 from cairn.dispatcher.tasks.common import (
+    SOURCE_PREFLIGHT_ATTEMPTS,
     best_effort_release,
     cancel_reason,
+    classify_worker_agent_error,
     did_timeout,
     latest_ready_source_path,
     project_allows_conclude_fallback,
@@ -30,6 +32,7 @@ from cairn.dispatcher.tasks.common import (
     write_conclude_result,
     write_conclude_result_with_fact_id,
 )
+from cairn.dispatcher.workers.base import WorkerAgentError
 from cairn.dispatcher.workers.registry import get_driver
 from cairn.server.models import Intent, ProjectDetail
 
@@ -58,6 +61,7 @@ def run_bootstrap_task(
             project,
             phase="bootstrap_preflight",
             worker_name=worker.name,
+            attempts=SOURCE_PREFLIGHT_ATTEMPTS,
         )
         if not source_check.ok:
             best_effort_release(client, project.project.id, intent.id, worker.name)
@@ -166,6 +170,28 @@ def run_bootstrap_task(
                 model_output = driver.extract_response_text(first.stdout, first.stderr)
                 payload = parse_json_output(model_output)
                 kind, data = validate_bootstrap_execute_payload(payload)
+            except WorkerAgentError as exc:
+                detail = str(exc)
+                error_type, cooldown = classify_worker_agent_error(detail, first.stdout, first.stderr)
+                LOG.warning(
+                    "bootstrap agent error project=%s intent=%s worker=%s error=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
+                    project.project.id,
+                    intent.id,
+                    worker.name,
+                    detail,
+                    execute_ms,
+                    int((time.perf_counter() - task_started) * 1000),
+                    preview(first.stdout),
+                    preview(first.stderr),
+                )
+                best_effort_release(client, project.project.id, intent.id, worker.name)
+                return task_outcome(
+                    "failed",
+                    error_type=error_type,
+                    error_detail=detail,
+                    result=first,
+                    rate_limited=cooldown,
+                )
             except Exception as exc:
                 LOG.warning(
                     "bootstrap parse failed project=%s intent=%s worker=%s error=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -424,6 +450,28 @@ def _try_conclude_fallback(
                 preview(str(conclude_data.get("complete"))),
             )
         kind, fact_description = validate_bootstrap_conclude_payload(payload)
+    except WorkerAgentError as exc:
+        detail = str(exc)
+        error_type, cooldown = classify_worker_agent_error(detail, result.stdout, result.stderr)
+        LOG.warning(
+            "bootstrap conclude agent error project=%s intent=%s worker=%s error=%s conclude_ms=%s stdout_preview=%s stderr_preview=%s",
+            project.project.id,
+            intent.id,
+            worker.name,
+            detail,
+            conclude_ms,
+            preview(result.stdout),
+            preview(result.stderr),
+        )
+        best_effort_release(client, project.project.id, intent.id, worker.name)
+        return task_outcome(
+            "failed",
+            error_type=error_type,
+            error_detail=detail,
+            result=result,
+            rate_limited=cooldown,
+            used_fallback=True,
+        )
     except Exception as exc:
         LOG.warning(
             "bootstrap conclude parse failed project=%s intent=%s worker=%s error=%s conclude_ms=%s stdout_preview=%s stderr_preview=%s",

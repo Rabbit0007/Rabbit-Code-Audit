@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import time
 import zipfile
 
 from fastapi import FastAPI
@@ -8,9 +9,11 @@ from fastapi.testclient import TestClient
 import yaml
 
 from cairn.dispatcher.contracts import validate_explore_payload
+from cairn.server.code_index import CodeSymbolRecord, _call_relationships
 from cairn.server import db
 from cairn.server.routers import business_graph, export, findings, intents, projects, sources, vulnerabilities
 from cairn.server.services import utcnow
+from cairn.server.source_models import CodeFile
 from cairn.server.source_service import rebuild_source_index
 
 
@@ -212,6 +215,18 @@ def test_explore_payload_accepts_structured_finding_and_review():
     )
     assert review_result["review"]["finding_id"] == "finding_1"
     assert review_result["reviews"][0]["finding_id"] == "finding_1"
+
+    _, incomplete_review = validate_explore_payload(
+        {
+            "accepted": True,
+            "data": {
+                "description": "confirmation produced a prose-only review",
+                "reviews": [{"decision": "confirmed"}],
+            },
+        }
+    )
+    assert incomplete_review["review"] is None
+    assert incomplete_review["reviews"] == []
 
 
 def test_candidate_confirmed_without_finding_id_does_not_fail_whole_payload():
@@ -513,6 +528,36 @@ Route::prefix('api')->group(function () {
 
     symbols = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/symbols").json()
     assert {"get_user", "lock_user", "UserController", "AdminController", "UsersController", "ready", "getUser"} <= {item["name"] for item in symbols}
+
+
+def test_call_relationship_extraction_is_bounded_for_large_symbol_sets():
+    snapshot_id = "snap_perf"
+    file = CodeFile(
+        snapshot_id=snapshot_id,
+        path="app/handler.js",
+        size_bytes=1_000_000,
+        sha256="0" * 64,
+        language="JavaScript",
+        is_binary=False,
+    )
+    text = "const payload = '" + ("x" * 1_000_000) + "';\n"
+    unique_symbols = {
+        f"Generated{i}": CodeSymbolRecord(
+            id=f"sym_{i}",
+            snapshot_id=snapshot_id,
+            path=f"lib/generated_{i}.js",
+            language="JavaScript",
+            kind="function",
+            name=f"Generated{i}",
+        )
+        for i in range(5000)
+    }
+
+    started = time.perf_counter()
+    relationships = _call_relationships(snapshot_id, file, text, unique_symbols)
+
+    assert relationships == []
+    assert time.perf_counter() - started < 1.5
 
 
 def test_source_index_builds_relationships_and_business_graph_chain(temp_db, monkeypatch, tmp_path):

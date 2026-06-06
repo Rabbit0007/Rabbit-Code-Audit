@@ -14,6 +14,7 @@ from cairn.dispatcher.runtime.containers import ContainerManager
 from cairn.dispatcher.runtime.heartbeat import HeartbeatLease
 from cairn.dispatcher.tasks.common import (
     cancel_reason,
+    classify_worker_agent_error,
     did_timeout,
     is_rate_limited,
     preview,
@@ -22,6 +23,7 @@ from cairn.dispatcher.tasks.common import (
     task_outcome,
     write_report_evidence_packet_reference,
 )
+from cairn.dispatcher.workers.base import WorkerAgentError
 from cairn.dispatcher.workers.registry import get_driver
 from cairn.server.models import ProjectDetail
 
@@ -134,6 +136,30 @@ def run_report_enrichment_task(
             model_output = driver.extract_response_text(result.stdout, result.stderr)
             payload = parse_json_output(model_output)
             kind, data = validate_report_enrichment_payload(payload)
+        except WorkerAgentError as exc:
+            detail = str(exc)
+            error_type, cooldown = classify_worker_agent_error(detail, result.stdout, result.stderr)
+            if cooldown:
+                client.release_report_enrichment(task_id, worker.name)
+                return task_outcome(
+                    "released",
+                    error_type=error_type,
+                    error_detail=detail,
+                    result=result,
+                    rate_limited=True,
+                )
+            LOG.warning(
+                "report enrichment agent error project=%s task=%s finding=%s worker=%s error=%s stdout_preview=%s stderr_preview=%s",
+                project.project.id,
+                task_id,
+                finding_id,
+                worker.name,
+                detail,
+                preview(result.stdout),
+                preview(result.stderr),
+            )
+            _fail_task(client, task_id, worker.name, detail)
+            return task_outcome("failed", error_type=error_type, error_detail=detail, result=result)
         except Exception as exc:
             detail = str(exc)
             if is_rate_limited(detail, result.stdout, result.stderr):

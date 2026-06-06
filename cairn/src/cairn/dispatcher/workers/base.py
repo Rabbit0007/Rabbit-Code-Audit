@@ -15,6 +15,10 @@ class DriverResult:
     session: str | None = None
 
 
+class WorkerAgentError(ValueError):
+    """The worker agent reported an execution/provider error, not bad JSON."""
+
+
 class WorkerDriver(abc.ABC):
     type_name: str
 

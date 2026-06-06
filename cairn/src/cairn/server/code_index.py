@@ -46,6 +46,29 @@ SYMBOL_RESERVED_NAMES = {
     "while",
     "with",
 }
+CALL_RELATIONSHIP_LANGUAGES = {"Python", "JavaScript", "TypeScript", "Vue", "PHP", "Java", "Kotlin", "Scala", "C#", "Go"}
+GENERATED_RELATIONSHIP_PARTS = {
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "target",
+    "vendor",
+}
+GENERATED_RELATIONSHIP_STEMS = {
+    "ace",
+    "codemirror",
+    "echarts",
+    "element-ui",
+    "exceljs",
+    "jquery",
+    "jspdf",
+    "monaco",
+    "vue",
+}
+CALL_TOKEN_RE = re.compile(r"\b(?:new\s+)?([A-Za-z_$][\w$]*)\s*(?:\(|\{)")
+MAX_CALL_TOKENS_PER_FILE = 4000
 PHP_DIRECT_SCRIPT_NAME_RE = re.compile(
     r"^(?:index|app|main|server|setup|install|upgrade|migrate|admin|login|logout|"
     r"callback|webhook|test)(?:[-_.][A-Za-z0-9_.-]+)?\.php$",
@@ -1067,35 +1090,60 @@ def _call_relationships(
     unique_symbols: dict[str, CodeSymbolRecord],
 ) -> list[CodeRelationshipRecord]:
     relationships: list[CodeRelationshipRecord] = []
+    if file.language not in CALL_RELATIONSHIP_LANGUAGES or _is_generated_relationship_path(file.path):
+        return relationships
     per_file_count = 0
-    for name, target in sorted(unique_symbols.items()):
+    seen_names: set[str] = set()
+    for match in CALL_TOKEN_RE.finditer(text):
         if per_file_count >= 80:
             break
+        if len(seen_names) >= MAX_CALL_TOKENS_PER_FILE:
+            break
+        name = match.group(1)
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        target = unique_symbols.get(name)
+        if target is None:
+            continue
         if target.path == file.path or target.kind == "data_object":
             continue
-        pattern = re.compile(rf"\b(?:new\s+)?{re.escape(name)}\s*(?:\(|\{{)")
-        for match in pattern.finditer(text):
-            line_start = _line_no(text, match.start())
-            line = _line_at(text, line_start).strip()
-            if _looks_like_symbol_declaration(line, name):
-                continue
-            relationships.append(
-                _relationship(
-                    snapshot_id,
-                    from_path=file.path,
-                    from_symbol=None,
-                    to_path=target.path,
-                    to_symbol=target.name,
-                    relation="calls",
-                    evidence=line,
-                    confidence=0.58,
-                    source="heuristic:unique_symbol_call",
-                    line_start=line_start,
-                )
+        if _is_generated_relationship_path(target.path):
+            continue
+        line_start = _line_no(text, match.start())
+        line = _line_at(text, line_start).strip()
+        if _looks_like_symbol_declaration(line, name):
+            continue
+        relationships.append(
+            _relationship(
+                snapshot_id,
+                from_path=file.path,
+                from_symbol=None,
+                to_path=target.path,
+                to_symbol=target.name,
+                relation="calls",
+                evidence=line,
+                confidence=0.58,
+                source="heuristic:unique_symbol_call",
+                line_start=line_start,
             )
-            per_file_count += 1
-            break
+        )
+        per_file_count += 1
     return relationships
+
+
+def _is_generated_relationship_path(path: str) -> bool:
+    pure_path = PurePosixPath(path)
+    suffix = pure_path.suffix.lower()
+    if suffix in {".map", ".min.js", ".min.css"}:
+        return True
+    if any(part.lower() in GENERATED_RELATIONSHIP_PARTS for part in pure_path.parts):
+        return True
+    name = pure_path.name.lower()
+    if ".min." in name or name.endswith(".bundle.js"):
+        return True
+    stem = pure_path.stem.lower()
+    return any(stem == item or stem.startswith(f"{item}.") or stem.startswith(f"{item}-") for item in GENERATED_RELATIONSHIP_STEMS)
 
 
 def _data_object_use_relationships(

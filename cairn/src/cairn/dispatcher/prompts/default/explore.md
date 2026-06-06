@@ -100,6 +100,18 @@ If a candidate is proven vulnerable, prefer adding a `findings` item with that
 - All user-facing JSON string fields must be written in Simplified Chinese. Keep exact paths, identifiers, commands, package names, CWE IDs, and technical terms unchanged.
 
 # Context
+## Immutable Source Root
+```
+{source_path}
+```
+
+Before producing the final JSON, read the source files named by the Current
+Intent, candidate IDs, finding IDs, business node evidence, or code index. If a
+path is relative, resolve it under the immutable source root above. For example,
+`SatRDA_V20240605/server/plugins/erp/user.js` means
+`{source_path}/SatRDA_V20240605/server/plugins/erp/user.js`. Do not close a
+candidate, business node, or finding from graph text alone.
+
 ## Graph
 ```
 {graph_yaml}

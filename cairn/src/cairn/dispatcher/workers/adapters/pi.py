@@ -6,7 +6,7 @@ from typing import Any
 
 from cairn.dispatcher.config import WorkerConfig
 from cairn.dispatcher.output_parser import strip_model_reasoning
-from cairn.dispatcher.workers.base import DriverResult, WorkerDriver
+from cairn.dispatcher.workers.base import DriverResult, WorkerAgentError, WorkerDriver
 
 
 class PiDriver(WorkerDriver):
@@ -83,7 +83,7 @@ class PiDriver(WorkerDriver):
         events = self._iter_events(stdout)
         error = self._event_error(events)
         if error is not None:
-            raise ValueError(error)
+            raise WorkerAgentError(error)
         assistant_message = self._assistant_message(events)
         if assistant_message is None:
             raise ValueError("pi output did not contain an assistant response")

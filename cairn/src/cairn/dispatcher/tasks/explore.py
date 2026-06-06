@@ -12,8 +12,10 @@ from cairn.dispatcher.runtime.containers import ContainerManager
 from cairn.dispatcher.runtime.heartbeat import HeartbeatLease
 from cairn.dispatcher.models import TaskOutcome
 from cairn.dispatcher.tasks.common import (
+    SOURCE_PREFLIGHT_ATTEMPTS,
     best_effort_release,
     cancel_reason,
+    classify_worker_agent_error,
     did_timeout,
     project_allows_conclude_fallback,
     preview,
@@ -26,6 +28,7 @@ from cairn.dispatcher.tasks.common import (
     write_conclude_result,
     write_graph_snapshot_reference,
 )
+from cairn.dispatcher.workers.base import WorkerAgentError
 from cairn.dispatcher.workers.registry import get_driver
 from cairn.server.models import Intent, ProjectDetail
 
@@ -55,6 +58,7 @@ def run_explore_task(
             project,
             phase="explore_preflight",
             worker_name=worker.name,
+            attempts=SOURCE_PREFLIGHT_ATTEMPTS,
         )
         if not source_check.ok:
             best_effort_release(client, project.project.id, intent.id, worker.name)
@@ -117,6 +121,7 @@ def run_explore_task(
         prompt = render_prompt(
             load_prompt(config.runtime.prompt_group, "explore.md"),
             {
+                "source_path": source_check.source_path or "",
                 "graph_yaml": write_graph_snapshot_reference(
                     container_manager,
                     container_name,
@@ -172,6 +177,28 @@ def run_explore_task(
                 model_output = driver.extract_response_text(first.stdout, first.stderr)
                 payload = parse_json_output(model_output)
                 kind, result_data = validate_explore_payload(payload)
+            except WorkerAgentError as exc:
+                detail = str(exc)
+                error_type, cooldown = classify_worker_agent_error(detail, first.stdout, first.stderr)
+                LOG.warning(
+                    "explore agent error project=%s intent=%s worker=%s error=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
+                    project.project.id,
+                    intent.id,
+                    worker.name,
+                    detail,
+                    execute_ms,
+                    int((time.perf_counter() - task_started) * 1000),
+                    preview(first.stdout),
+                    preview(first.stderr),
+                )
+                best_effort_release(client, project.project.id, intent.id, worker.name)
+                return task_outcome(
+                    "failed",
+                    error_type=error_type,
+                    error_detail=detail,
+                    result=first,
+                    rate_limited=cooldown,
+                )
             except Exception as exc:
                 LOG.warning(
                     "explore parse failed project=%s intent=%s worker=%s error=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -372,7 +399,8 @@ def _try_conclude_fallback(
     if lease.failure is not None:
         best_effort_release(client, project_id, intent.id, worker.name)
         return task_outcome("failed", error_type="heartbeat_lost", result=result, used_fallback=True)
-    if result.timed_out or result.returncode != 0:
+    fallback_timed_out = did_timeout(result)
+    if fallback_timed_out or result.returncode != 0:
         LOG.warning(
             "conclude failed project=%s intent=%s worker=%s code=%s timed_out=%s conclude_ms=%s stdout_preview=%s stderr_preview=%s",
             project_id,
@@ -387,7 +415,7 @@ def _try_conclude_fallback(
         best_effort_release(client, project_id, intent.id, worker.name)
         return task_outcome(
             "failed",
-            error_type="fallback_command_failed",
+            error_type="fallback_timeout" if fallback_timed_out else "fallback_command_failed",
             error_detail=f"returncode={result.returncode} timed_out={result.timed_out}",
             result=result,
             used_fallback=True,
@@ -396,6 +424,28 @@ def _try_conclude_fallback(
         model_output = driver.extract_response_text(result.stdout, result.stderr)
         payload = parse_json_output(model_output)
         kind, result_data = validate_explore_payload(payload)
+    except WorkerAgentError as exc:
+        detail = str(exc)
+        error_type, cooldown = classify_worker_agent_error(detail, result.stdout, result.stderr)
+        LOG.warning(
+            "conclude agent error project=%s intent=%s worker=%s error=%s conclude_ms=%s stdout_preview=%s stderr_preview=%s",
+            project_id,
+            intent.id,
+            worker.name,
+            detail,
+            conclude_ms,
+            preview(result.stdout),
+            preview(result.stderr),
+        )
+        best_effort_release(client, project_id, intent.id, worker.name)
+        return task_outcome(
+            "failed",
+            error_type=error_type,
+            error_detail=detail,
+            result=result,
+            rate_limited=cooldown,
+            used_fallback=True,
+        )
     except Exception as exc:
         LOG.warning(
             "conclude parse failed project=%s intent=%s worker=%s error=%s conclude_ms=%s stdout_preview=%s stderr_preview=%s",

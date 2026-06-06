@@ -9,7 +9,7 @@ from cairn.dispatcher.protocol.client import ApiResult
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
 from cairn.dispatcher.runtime.process import ProcessResult
 from cairn.dispatcher.tasks import report_enrichment
-from cairn.dispatcher.workers.base import DriverResult
+from cairn.dispatcher.workers.base import DriverResult, WorkerAgentError
 
 
 def _config() -> DispatchConfig:
@@ -222,6 +222,39 @@ def test_report_enrichment_rate_limit_releases_task(monkeypatch):
 
     assert outcome.status == "released"
     assert outcome.error_type == "rate_limited"
+    assert outcome.rate_limited is True
+    assert client.released is True
+    assert client.failed is None
+    assert client.completed_payload is None
+
+
+def test_report_enrichment_connection_error_releases_task(monkeypatch):
+    evidence_packet = {"finding": {"id": "finding_1", "status": "confirmed"}}
+    driver = _FakeDriver()
+
+    def raise_connection_error(stdout: str, stderr: str) -> str:  # noqa: ARG001
+        raise WorkerAgentError("Connection error.")
+
+    driver.extract_response_text = raise_connection_error
+    monkeypatch.setattr(report_enrichment, "get_driver", lambda worker_type: driver)
+
+    config = _config()
+    client = _FakeClient(evidence_packet)
+    container_manager = _FakeContainerManager(execute_stdout="")
+    project = SimpleNamespace(project=SimpleNamespace(id="proj_1"))
+
+    outcome: TaskOutcome = report_enrichment.run_report_enrichment_task(
+        config,
+        client,
+        container_manager,
+        project,
+        {"id": "rpt_1", "finding_id": "finding_1"},
+        config.workers[0],
+        TaskCancellation(),
+    )
+
+    assert outcome.status == "released"
+    assert outcome.error_type == "model_connection_error"
     assert outcome.rate_limited is True
     assert client.released is True
     assert client.failed is None

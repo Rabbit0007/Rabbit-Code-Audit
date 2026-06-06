@@ -8,6 +8,7 @@ from cairn.dispatcher.config import WorkerConfig
 from cairn.dispatcher.runtime.process import ProcessResult
 from cairn.dispatcher.runtime.startup_healthcheck import _run_worker_healthcheck
 from cairn.dispatcher.tasks.common import HealthcheckRun
+from cairn.dispatcher.workers.base import WorkerAgentError
 from cairn.dispatcher.workers.adapters.claudecode import ClaudeCodeDriver
 from cairn.dispatcher.workers.adapters.pi import PiDriver
 
@@ -68,7 +69,7 @@ def test_pi_driver_surfaces_agent_error_instead_of_returning_jsonl():
         _agent_end("", stop_reason="error", error_message="No API provider registered for api: openai"),
     )
 
-    with pytest.raises(ValueError, match="No API provider registered"):
+    with pytest.raises(WorkerAgentError, match="No API provider registered"):
         PiDriver().extract_response_text(stdout, "")
 
 

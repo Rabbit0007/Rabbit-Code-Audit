@@ -3615,9 +3615,29 @@ pre {
   border: 1px solid var(--line);
 }
 
+.history-row-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.history-row-header .badge {
+  flex: 0 0 auto;
+}
+
+.history-list article.history-row-attention {
+  border-color: rgba(255, 55, 95, 0.28);
+  background: rgba(255, 241, 244, 0.7);
+}
+
 .history-list span,
 .history-list small {
   color: var(--muted);
+}
+
+.history-list .history-error {
+  color: var(--red);
 }
 
 .task-ops-panel {

@@ -223,6 +223,34 @@ function reportTaskMaterialSummary(task) {
   return parts.length ? parts.join(" / ") : "暂无可导出的补充材料";
 }
 
+function workerHistoryOutcomeLabel(row) {
+  const base =
+    {
+      success: "成功",
+      failed: "历史失败",
+      rejected: "已拒绝",
+      cancelled: "已取消",
+      unhealthy: "健康检查失败",
+    }[row?.outcome] || row?.outcome || "未知";
+  const markers = [];
+  if (row?.rate_limited) markers.push("限速");
+  if (row?.used_fallback) markers.push("fallback");
+  return markers.length ? `${base} · ${markers.join(" / ")}` : base;
+}
+
+function workerHistoryOutcomeTone(row) {
+  if (row?.outcome === "success") return "success";
+  if (row?.rate_limited) return "warning";
+  if (row?.outcome === "failed" || row?.error_type) return "danger";
+  return "muted";
+}
+
+function workerHistoryErrorText(row) {
+  const type = row?.error_type ? `类型：${row.error_type}` : "";
+  const detail = row?.error_detail ? `详情：${clampText(row.error_detail, 180)}` : "";
+  return [type, detail].filter(Boolean).join("；");
+}
+
 function dynamicValidationStatusLabel(status) {
   return {
     static_only: "静态优先",
@@ -6214,6 +6242,15 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
   const [toolTaskQueue, setToolTaskQueue] = useState([]);
   const [reportTaskQueue, setReportTaskQueue] = useState([]);
   const [taskBusyId, setTaskBusyId] = useState(null);
+  const expandedRef = useRef(expanded);
+
+  useEffect(() => {
+    expandedRef.current = expanded;
+  }, [expanded]);
+
+  const fetchWorkerHistory = useCallback((workerName) => {
+    return apiRequest(`/api/workers/${encodeURIComponent(workerName)}/history`);
+  }, []);
 
   const load = useCallback(async () => {
     try {
@@ -6234,10 +6271,31 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
       setToolTaskQueue(Array.isArray(toolQueuePayload) ? toolQueuePayload : []);
       setReportTaskQueue(Array.isArray(reportQueuePayload) ? reportQueuePayload : []);
       setLastUpdated(new Date());
+      const expandedWorkers = Object.entries(expandedRef.current)
+        .filter(([, open]) => open)
+        .map(([name]) => name);
+      if (expandedWorkers.length) {
+        const rowsByWorker = await Promise.all(
+          expandedWorkers.map(async (name) => {
+            try {
+              return [name, await fetchWorkerHistory(name)];
+            } catch {
+              return [name, null];
+            }
+          }),
+        );
+        setHistory((prev) => {
+          const next = { ...prev };
+          for (const [name, rows] of rowsByWorker) {
+            if (Array.isArray(rows)) next[name] = rows;
+          }
+          return next;
+        });
+      }
     } finally {
       setLoading(false);
     }
-  }, [setToast]);
+  }, [fetchWorkerHistory, setToast]);
 
   useEffect(() => {
     load();
@@ -6292,16 +6350,16 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
     });
   };
 
-  const loadHistory = async (workerName) => {
-    if (history[workerName]) return;
-    const rows = await runAction(null, () => apiRequest(`/api/workers/${encodeURIComponent(workerName)}/history`));
+  const loadHistory = async (workerName, options = {}) => {
+    if (!options.force && history[workerName]) return;
+    const rows = await runAction(null, () => fetchWorkerHistory(workerName));
     setHistory((prev) => ({ ...prev, [workerName]: rows }));
   };
 
   const toggleHistory = async (workerName) => {
     const open = !expanded[workerName];
     setExpanded((prev) => ({ ...prev, [workerName]: open }));
-    if (open) await loadHistory(workerName);
+    if (open) await loadHistory(workerName, { force: true });
   };
 
   const saveEditor = async (worker) => {
@@ -6473,12 +6531,19 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
                         <p>该工作节点暂无任务历史记录。</p>
                       ) : (
                         history[worker.name].map((row, index) => (
-                          <article key={`${row.started_at}-${index}`}>
-                            <strong>{row.task_type}</strong>
+                          <article
+                            className={cn(row.outcome !== "success" && "history-row-attention")}
+                            key={`${row.started_at}-${index}`}
+                          >
+                            <div className="history-row-header">
+                              <strong>{row.task_type}</strong>
+                              <Badge tone={workerHistoryOutcomeTone(row)}>{workerHistoryOutcomeLabel(row)}</Badge>
+                            </div>
                             <span>{row.description}</span>
                             <small>
-                              {row.project_name} · {formatTime(row.started_at)} · {row.outcome}
+                              {row.project_name} · {formatTime(row.started_at)}
                             </small>
+                            {workerHistoryErrorText(row) && <small className="history-error">{workerHistoryErrorText(row)}</small>}
                           </article>
                         ))
                       )}

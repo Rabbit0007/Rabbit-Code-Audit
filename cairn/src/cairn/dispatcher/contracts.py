@@ -577,12 +577,12 @@ def _validate_findings(singular: Any, plural: Any) -> list[dict[str, Any]]:
     return findings
 
 
-def _validate_one_review(item: Any, index: int | None = None) -> dict[str, Any]:
+def _validate_one_review(item: Any, index: int | None = None) -> dict[str, Any] | None:
     label = "review" if index is None else f"review at index {index}"
     if not isinstance(item, dict):
         raise ValueError(f"{label} must be an object")
     if not isinstance(item.get("finding_id"), str) or not item["finding_id"].strip():
-        raise ValueError(f"{label}.finding_id is required")
+        return None
     if item.get("decision") not in ("confirmed", "rejected", "needs_more_evidence"):
         raise ValueError(f"{label}.decision is invalid")
     return {
@@ -594,12 +594,16 @@ def _validate_one_review(item: Any, index: int | None = None) -> dict[str, Any]:
 def _validate_reviews(singular: Any, plural: Any) -> list[dict[str, Any]]:
     reviews: list[dict[str, Any]] = []
     if singular is not None:
-        reviews.append(_validate_one_review(singular))
+        normalized = _validate_one_review(singular)
+        if normalized is not None:
+            reviews.append(normalized)
     if plural is not None:
         if not isinstance(plural, list):
             raise ValueError("reviews must be an array")
         for index, item in enumerate(plural):
-            reviews.append(_validate_one_review(item, index))
+            normalized = _validate_one_review(item, index)
+            if normalized is not None:
+                reviews.append(normalized)
     return reviews
 
 

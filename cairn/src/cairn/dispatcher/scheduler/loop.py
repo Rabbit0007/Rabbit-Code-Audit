@@ -37,6 +37,14 @@ REASON_PARSE_FAILURE_RETRY_AFTER_SECONDS = 180
 EXPLORE_PARSE_FAILURE_LIMIT = 3
 EXPLORE_PARSE_FAILURE_RETRY_AFTER_SECONDS = 180
 EXPLORE_WORKER_PARSE_RETRY_AFTER_SECONDS = 45
+EXPLORE_RETRYABLE_FAILURE_TYPES = frozenset(
+    {
+        "parse_failed",
+        "fallback_parse_failed",
+        "timeout",
+        "fallback_timeout",
+    }
+)
 BOOTSTRAP_INTENT_DESCRIPTION = "bootstrap"
 BOOTSTRAP_INTENT_CREATOR = "dispatcher.bootstrap"
 FINDING_ID_RE = re.compile(r"\bfinding_[0-9a-fA-F]{8,32}\b")
@@ -89,7 +97,8 @@ class DispatcherLoop:
         self.source_preflight_blocked_until: dict[tuple[str, str], float] = {}
         self.reason_failure_state: dict[str, ReasonFailureState] = {}
         self.explore_failure_state: dict[tuple[str, str], ExploreFailureState] = {}
-        self.explore_worker_parse_blocked_until: dict[tuple[str, str, str], float] = {}
+        self.explore_worker_retry_blocked_until: dict[tuple[str, str, str], float] = {}
+        self.explore_worker_parse_blocked_until = self.explore_worker_retry_blocked_until
         self._log_state: dict[str, tuple[int, str, tuple[object, ...]]] = {}
         self._cleanup_pending: set[str] = set()
         self._inactive_cleanup_done: dict[str, str] = {}
@@ -536,7 +545,7 @@ class DispatcherLoop:
         dispatchable_intents = [
             intent
             for intent in unclaimed_intents
-            if not self._explore_parse_cooldown(project.project.id, intent.id)
+            if not self._explore_retry_cooldown(project.project.id, intent.id)
         ]
         if running_intent_ids and not unclaimed_intents:
             self._log_changed(
@@ -548,14 +557,14 @@ class DispatcherLoop:
             )
         if unclaimed_intents and not dispatchable_intents:
             self._log_changed(
-                f"{skip_scope}:explore_parse_cooldown",
+                f"{skip_scope}:explore_retry_cooldown",
                 logging.INFO,
-                "skip explore project=%s because all unclaimed intents are cooling down after parse failures intents=%s",
+                "skip explore project=%s because all unclaimed intents are cooling down after retryable failures intents=%s",
                 summary.id,
                 sorted(intent.id for intent in unclaimed_intents),
             )
         if dispatchable_intents:
-            self._clear_log_state(f"{skip_scope}:explore_parse_cooldown")
+            self._clear_log_state(f"{skip_scope}:explore_retry_cooldown")
             newest = max(dispatchable_intents, key=lambda i: i.created_at)
             export_yaml = self.client.export_project(summary.id, profile="explore", intent_id=newest.id)
             return self._dispatch_explore(project, export_yaml, newest)
@@ -751,7 +760,7 @@ class DispatcherLoop:
         if self._source_preflight_blocked(project.project.id, "explore"):
             return False
         excluded_workers = self._independent_review_excluded_workers(project.project.id, intent)
-        excluded_workers.update(self._explore_parse_excluded_workers(project.project.id, intent.id))
+        excluded_workers.update(self._explore_retry_excluded_workers(project.project.id, intent.id))
         selection = self._select_worker(project.project.id, "explore", excluded_workers=excluded_workers)
         worker = selection.worker
         if worker is None:
@@ -1140,7 +1149,7 @@ class DispatcherLoop:
             self.reason_failure_state.pop(project_id, None)
         return False
 
-    def _record_reason_parse_failure(self, project_id: str, trigger: str) -> None:
+    def _record_reason_parse_failure(self, project_id: str, trigger: str) -> bool:
         current = self.reason_failure_state.get(project_id)
         failures = current.failures + 1 if current is not None and current.trigger == trigger else 1
         cooldown_until = 0.0
@@ -1167,8 +1176,9 @@ class DispatcherLoop:
                 failures,
                 REASON_PARSE_FAILURE_LIMIT,
             )
+        return bool(cooldown_until)
 
-    def _explore_parse_cooldown(self, project_id: str, intent_id: str) -> bool:
+    def _explore_retry_cooldown(self, project_id: str, intent_id: str) -> bool:
         key = (project_id, intent_id)
         state = self.explore_failure_state.get(key)
         if state is None:
@@ -1177,9 +1187,9 @@ class DispatcherLoop:
         if state.cooldown_until > now:
             remaining = state.cooldown_until - now
             self._log_changed(
-                f"project:{project_id}:explore_parse_cooldown:{intent_id}",
+                f"project:{project_id}:explore_retry_cooldown:{intent_id}",
                 logging.INFO,
-                "skip explore project=%s intent=%s because repeated parse failures are cooling down retry_after=%.0fs",
+                "skip explore project=%s intent=%s because repeated retryable failures are cooling down retry_after=%.0fs",
                 project_id,
                 intent_id,
                 remaining,
@@ -1189,19 +1199,26 @@ class DispatcherLoop:
             self.explore_failure_state.pop(key, None)
         return False
 
-    def _explore_parse_excluded_workers(self, project_id: str, intent_id: str) -> set[str]:
+    def _explore_parse_cooldown(self, project_id: str, intent_id: str) -> bool:
+        return self._explore_retry_cooldown(project_id, intent_id)
+
+    def _explore_retry_excluded_workers(self, project_id: str, intent_id: str) -> set[str]:
         now = time.time()
         excluded: set[str] = set()
-        for key, retry_until in list(self.explore_worker_parse_blocked_until.items()):
+        blocked_until = self._explore_retry_blocked_until()
+        for key, retry_until in list(blocked_until.items()):
             key_project_id, key_intent_id, worker_name = key
             if retry_until <= now:
-                self.explore_worker_parse_blocked_until.pop(key, None)
+                blocked_until.pop(key, None)
                 continue
             if key_project_id == project_id and key_intent_id == intent_id:
                 excluded.add(worker_name)
         return excluded
 
-    def _record_explore_parse_failure(
+    def _explore_parse_excluded_workers(self, project_id: str, intent_id: str) -> set[str]:
+        return self._explore_retry_excluded_workers(project_id, intent_id)
+
+    def _record_explore_retryable_failure(
         self,
         project_id: str,
         intent_id: str,
@@ -1220,12 +1237,12 @@ class DispatcherLoop:
             cooldown_until=cooldown_until,
             last_error=error_detail,
         )
-        self.explore_worker_parse_blocked_until[(project_id, intent_id, worker_name)] = (
+        self._explore_retry_blocked_until()[(project_id, intent_id, worker_name)] = (
             now + EXPLORE_WORKER_PARSE_RETRY_AFTER_SECONDS
         )
         if cooldown_until:
             LOG.warning(
-                "explore parse failure limit reached project=%s intent=%s failures=%s retry_after=%.0fs last_error=%s",
+                "explore retryable failure limit reached project=%s intent=%s failures=%s retry_after=%.0fs last_error=%s",
                 project_id,
                 intent_id,
                 failures,
@@ -1234,7 +1251,7 @@ class DispatcherLoop:
             )
         else:
             LOG.info(
-                "explore parse failure recorded project=%s intent=%s worker=%s failures=%s/%s worker_retry_after=%.0fs",
+                "explore retryable failure recorded project=%s intent=%s worker=%s failures=%s/%s worker_retry_after=%.0fs",
                 project_id,
                 intent_id,
                 worker_name,
@@ -1243,12 +1260,30 @@ class DispatcherLoop:
                 EXPLORE_WORKER_PARSE_RETRY_AFTER_SECONDS,
             )
 
+    def _record_explore_parse_failure(
+        self,
+        project_id: str,
+        intent_id: str,
+        worker_name: str,
+        error_detail: str | None,
+    ) -> None:
+        self._record_explore_retryable_failure(project_id, intent_id, worker_name, error_detail)
+
     def _clear_explore_parse_failure(self, project_id: str, intent_id: str) -> None:
         self.explore_failure_state.pop((project_id, intent_id), None)
         prefix = (project_id, intent_id)
-        for key in list(self.explore_worker_parse_blocked_until):
+        blocked_until = self._explore_retry_blocked_until()
+        for key in list(blocked_until):
             if key[:2] == prefix:
-                self.explore_worker_parse_blocked_until.pop(key, None)
+                blocked_until.pop(key, None)
+
+    def _explore_retry_blocked_until(self) -> dict[tuple[str, str, str], float]:
+        blocked_until = getattr(self, "explore_worker_retry_blocked_until", None)
+        if blocked_until is None:
+            blocked_until = getattr(self, "explore_worker_parse_blocked_until", {})
+            self.explore_worker_retry_blocked_until = blocked_until
+        self.explore_worker_parse_blocked_until = blocked_until
+        return blocked_until
 
     def _reap_futures(self) -> None:
         done = [future for future in self.futures if future.done()]
@@ -1326,12 +1361,31 @@ class DispatcherLoop:
                     if status == "success":
                         self.reason_failure_state.pop(task.project_id, None)
                     elif outcome.error_type == "parse_failed" and task.reason_trigger:
-                        self._record_reason_parse_failure(task.project_id, task.reason_trigger)
+                        limit_reached = self._record_reason_parse_failure(task.project_id, task.reason_trigger)
+                        if (
+                            limit_reached
+                            and task.fact_count is not None
+                            and task.hint_count is not None
+                            and task.open_intent_count is not None
+                        ):
+                            self.reason_checkpoints[task.project_id] = ReasonCheckpoint(
+                                fact_count=task.fact_count,
+                                hint_count=task.hint_count,
+                                open_intent_count=task.open_intent_count,
+                            )
+                            LOG.warning(
+                                "reason parse failures reached limit; checkpointing current graph state project=%s trigger=%s facts=%s hints=%s open_intents=%s",
+                                task.project_id,
+                                task.reason_trigger,
+                                task.fact_count,
+                                task.hint_count,
+                                task.open_intent_count,
+                            )
                 if task.task_type == "explore" and task.intent_id:
                     if status == "success":
                         self._clear_explore_parse_failure(task.project_id, task.intent_id)
-                    elif outcome.error_type in {"parse_failed", "fallback_parse_failed"}:
-                        self._record_explore_parse_failure(
+                    elif outcome.error_type in EXPLORE_RETRYABLE_FAILURE_TYPES:
+                        self._record_explore_retryable_failure(
                             task.project_id,
                             task.intent_id,
                             task.worker_name,
@@ -1440,9 +1494,10 @@ class DispatcherLoop:
         for key in list(self.explore_failure_state):
             if key[0] not in active_ids:
                 self.explore_failure_state.pop(key, None)
-        for key in list(self.explore_worker_parse_blocked_until):
+        blocked_until = self._explore_retry_blocked_until()
+        for key in list(blocked_until):
             if key[0] not in active_ids:
-                self.explore_worker_parse_blocked_until.pop(key, None)
+                blocked_until.pop(key, None)
         inactive_status_by_id = {summary.id: summary.status for summary in summaries if summary.status != "active"}
         for project_id, status in list(self._inactive_cleanup_done.items()):
             current_status = inactive_status_by_id.get(project_id)

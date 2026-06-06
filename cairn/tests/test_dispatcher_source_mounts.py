@@ -43,6 +43,16 @@ class _FakeContainerManager:
         return self.exists
 
 
+class _FlakyContainerManager:
+    def __init__(self, results: list[bool]):
+        self.results = results
+        self.checked: list[tuple[str, str]] = []
+
+    def directory_exists(self, container_name: str, path: str) -> bool:
+        self.checked.append((container_name, path))
+        return self.results.pop(0)
+
+
 def test_container_config_accepts_artifact_host_path():
     config = ContainerConfig(
         image="worker:latest",
@@ -122,3 +132,26 @@ def test_source_preflight_passes_when_container_directory_exists():
 
     assert result.ok
     assert result.source_path == "/audit-data/artifacts/snapshots/snap_ok/source"
+
+
+def test_source_preflight_retries_transient_missing_directory():
+    manager = _FlakyContainerManager([False, False, True])
+    project = _project([_snapshot("snap_eventual")])
+
+    result = verify_latest_source_available(
+        manager,
+        "cairn-dispatch-proj_1",
+        project,
+        phase="bootstrap_preflight",
+        worker_name="worker-1",
+        attempts=5,
+        retry_delay_seconds=0,
+    )
+
+    assert result.ok
+    assert result.source_path == "/audit-data/artifacts/snapshots/snap_eventual/source"
+    assert manager.checked == [
+        ("cairn-dispatch-proj_1", "/audit-data/artifacts/snapshots/snap_eventual/source"),
+        ("cairn-dispatch-proj_1", "/audit-data/artifacts/snapshots/snap_eventual/source"),
+        ("cairn-dispatch-proj_1", "/audit-data/artifacts/snapshots/snap_eventual/source"),
+    ]
