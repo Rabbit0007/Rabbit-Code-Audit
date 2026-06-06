@@ -12,6 +12,19 @@ from cairn.server.models import Intent, ProjectMeta, ProjectReason
 BUSINESS_NODE_COVERAGE_NOTE_LIMIT = 1000
 BACKGROUND_TASK_STALE_MIN_SECONDS = 60
 BACKGROUND_TASK_STALE_TIMEOUT_MULTIPLIER = 3
+HIGH_IMPACT_AUDIT_MARKERS = (
+    "文件读写/加载能力",
+    "系统进程能力",
+    "对象反序列化能力",
+    "file upload",
+    "upload",
+    "文件上传",
+    "任意文件",
+    "路径穿越",
+    "writefile",
+    "move_uploaded_file",
+    "savemultipartfile",
+)
 
 
 def utcnow() -> str:
@@ -84,11 +97,17 @@ def sync_business_node_coverage_from_latest_conclusions(
     rows = conn.execute(
         f"""
         SELECT c.*, af.status AS audit_finding_status,
-               af.business_node_id AS audit_finding_business_node_id
+               af.business_node_id AS audit_finding_business_node_id,
+               bn.title AS title,
+               bn.coverage_note AS coverage_note,
+               bn.risk_tags_json AS risk_tags_json
         FROM business_node_conclusions c
         LEFT JOIN audit_findings af
           ON af.id = c.audit_finding_id
          AND af.project_id = c.project_id
+        LEFT JOIN business_nodes bn
+          ON bn.id = c.business_node_id
+         AND bn.project_id = c.project_id
         {where_sql}
         ORDER BY c.project_id, c.business_node_id, c.created_at DESC, c.rowid DESC
         """,
@@ -102,7 +121,11 @@ def sync_business_node_coverage_from_latest_conclusions(
         if key in seen:
             continue
         seen.add(key)
-        if not _business_node_conclusion_provides_coverage(row, row["business_node_id"]):
+        if not _business_node_conclusion_provides_coverage(
+            row,
+            row["business_node_id"],
+            require_decisive=is_high_impact_business_node_row(row),
+        ):
             continue
         status = business_node_coverage_status_for_conclusion(row["conclusion"])
         assert status is not None
@@ -279,6 +302,48 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
             },
         )
 
+    high_impact_unresolved_candidates = [
+        row
+        for row in conn.execute(
+            """
+            SELECT id, title, severity, status, candidate_type, description,
+                   file_path, line_start, entry_point
+            FROM audit_candidates
+            WHERE project_id = ?
+              AND status = 'needs_more_evidence'
+              AND severity IN ('critical', 'high', 'unknown')
+            ORDER BY updated_at, id
+            LIMIT 200
+            """,
+            (project_id,),
+        ).fetchall()
+        if is_high_impact_audit_candidate_row(row)
+    ][:20]
+    if high_impact_unresolved_candidates:
+        raise HTTPException(
+            409,
+            {
+                "message": (
+                    "High-impact audit candidates require confirmed or rejected closure "
+                    "before completion"
+                ),
+                "audit_candidates": [
+                    {
+                        "id": row["id"],
+                        "title": row["title"],
+                        "severity": row["severity"],
+                        "status": row["status"],
+                        "candidate_type": row["candidate_type"],
+                        "file_path": row["file_path"],
+                        "line_start": row["line_start"],
+                        "entry_point": row["entry_point"],
+                        "reason": "high_impact_needs_more_evidence",
+                    }
+                    for row in high_impact_unresolved_candidates
+                ],
+            },
+        )
+
     invalid_candidate_conclusions = conn.execute(
         """
         SELECT c.id, c.title, c.severity, c.status, c.candidate_type,
@@ -440,7 +505,7 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
 
     business_nodes = conn.execute(
         """
-        SELECT id, title, risk_level, review_status, coverage_note
+        SELECT id, title, risk_level, review_status, coverage_note, risk_tags_json
         FROM business_nodes
         WHERE project_id = ?
           AND risk_level IN ('critical', 'high', 'unknown')
@@ -481,7 +546,11 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
     conclusion_blockers = []
     for row in business_nodes:
         conclusion = latest_conclusions_by_node.get(row["id"])
-        reason = _business_node_conclusion_blocker_reason(conclusion, row["id"])
+        reason = _business_node_conclusion_blocker_reason(
+            conclusion,
+            row["id"],
+            require_decisive=is_high_impact_business_node_row(row),
+        )
         if reason is not None:
             conclusion_blockers.append(
                 {
@@ -529,14 +598,27 @@ def _business_node_has_effective_coverage(
 ) -> bool:
     if _business_node_has_coverage(row):
         return True
-    return _business_node_conclusion_provides_coverage(conclusion, row["id"])
+    return _business_node_conclusion_provides_coverage(
+        conclusion,
+        row["id"],
+        require_decisive=is_high_impact_business_node_row(row),
+    )
 
 
 def _business_node_conclusion_provides_coverage(
     conclusion: sqlite3.Row | None,
     business_node_id: str,
+    *,
+    require_decisive: bool = False,
 ) -> bool:
-    if _business_node_conclusion_blocker_reason(conclusion, business_node_id) is not None:
+    if (
+        _business_node_conclusion_blocker_reason(
+            conclusion,
+            business_node_id,
+            require_decisive=require_decisive,
+        )
+        is not None
+    ):
         return False
     return (
         conclusion is not None
@@ -656,6 +738,8 @@ def _poc_list(poc: dict, key: str) -> list[str]:
 def _business_node_conclusion_blocker_reason(
     conclusion: sqlite3.Row | None,
     business_node_id: str,
+    *,
+    require_decisive: bool = False,
 ) -> str | None:
     if conclusion is None:
         return "missing_conclusion"
@@ -675,8 +759,34 @@ def _business_node_conclusion_blocker_reason(
         evidence = conclusion["evidence"]
         if evidence is None or evidence.strip() == "":
             return "missing_evidence"
+        if require_decisive and kind == "needs_more_evidence":
+            return "high_impact_needs_more_evidence"
         return None
     return "invalid_conclusion"
+
+
+def is_high_impact_audit_candidate_row(row) -> bool:
+    if row["candidate_type"] != "data_flow":
+        return False
+    return _contains_high_impact_marker(
+        row["title"],
+        row["description"],
+        row["file_path"],
+        row["entry_point"],
+    )
+
+
+def is_high_impact_business_node_row(row) -> bool:
+    return _contains_high_impact_marker(
+        row["title"],
+        row["coverage_note"],
+        row["risk_tags_json"],
+    )
+
+
+def _contains_high_impact_marker(*values: object) -> bool:
+    text = " ".join(str(value or "") for value in values).lower()
+    return any(marker in text for marker in HIGH_IMPACT_AUDIT_MARKERS)
 
 
 def validate_intent_creator_worker(creator: str, worker: str | None) -> None:
@@ -858,6 +968,10 @@ def expire_reason_leases(conn: sqlite3.Connection, project_id: str | None = None
 
 def expire_report_enrichment_tasks(conn: sqlite3.Connection, project_id: str | None = None) -> None:
     _expire_background_tasks(conn, "report_enrichment_tasks", "report enrichment", project_id)
+
+
+def expire_review_tasks(conn: sqlite3.Connection, project_id: str | None = None) -> None:
+    _expire_background_tasks(conn, "review_tasks", "review", project_id)
 
 
 def expire_tool_scan_tasks(conn: sqlite3.Connection, project_id: str | None = None) -> None:

@@ -248,6 +248,19 @@ class CairnClient:
         payload = response.json()
         return payload if isinstance(payload, list) else []
 
+    def list_report_enrichments(self, project_id: str, status: str | None = None) -> list[dict[str, Any]]:
+        params: dict[str, str] = {}
+        if status:
+            params["status"] = status
+        response = self._session().get(
+            self._url(f"/api/projects/{project_id}/report-enrichments"),
+            params=params,
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
+
     def claim_report_enrichment(self, task_id: str, worker: str) -> ApiResult:
         return self._request_json(
             "POST",
@@ -292,6 +305,69 @@ class CairnClient:
         payload = response.json()
         if not isinstance(payload, dict):
             raise ProtocolError("report enrichment packet must be an object", response.status_code, response.text)
+        return payload
+
+    def list_pending_review_tasks(self, project_id: str, limit: int = 10) -> list[dict[str, Any]]:
+        response = self._session().get(
+            self._url("/api/review-tasks/pending"),
+            params={"project_id": project_id, "limit": limit},
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
+
+    def claim_review_task(self, task_id: str, worker: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/review-tasks/{task_id}/claim",
+            json={"worker": worker},
+        )
+
+    def review_task_heartbeat(self, task_id: str, worker: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/review-tasks/{task_id}/heartbeat",
+            json={"worker": worker},
+        )
+
+    def release_review_task(self, task_id: str, worker: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/review-tasks/{task_id}/release",
+            json={"worker": worker},
+        )
+
+    def mark_review_task_availability(self, task_id: str, status: str, reason: str | None = None) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/review-tasks/{task_id}/availability",
+            json={"status": status, "reason": reason},
+        )
+
+    def complete_review_task(self, task_id: str, worker: str, decision: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/review-tasks/{task_id}/complete",
+            json={"worker": worker, "decision": decision},
+        )
+
+    def fail_review_task(self, task_id: str, worker: str, error_message: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/api/review-tasks/{task_id}/fail",
+            json={"worker": worker, "error_message": error_message},
+        )
+
+    def get_review_task_packet(self, task_id: str) -> dict[str, Any]:
+        response = self._session().get(
+            self._url(f"/api/review-tasks/{task_id}/packet"),
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ProtocolError("review task packet must be an object", response.status_code, response.text)
         return payload
 
     def list_tool_scan_tasks(

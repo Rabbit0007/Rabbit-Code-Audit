@@ -24,6 +24,7 @@ from cairn.dispatcher.tasks.bootstrap import run_bootstrap_task
 from cairn.dispatcher.tasks.explore import run_explore_task
 from cairn.dispatcher.tasks.reason import run_reason_task
 from cairn.dispatcher.tasks.report_enrichment import run_report_enrichment_task
+from cairn.dispatcher.tasks.review import run_review_task
 from cairn.dispatcher.tasks.tool_scan import TOOL_SCAN_WORKER_NAME, run_tool_scan_task
 from cairn.server.models import Intent, ProjectDetail, ProjectSummary
 
@@ -47,6 +48,11 @@ EXPLORE_RETRYABLE_FAILURE_TYPES = frozenset(
 )
 BOOTSTRAP_INTENT_DESCRIPTION = "bootstrap"
 BOOTSTRAP_INTENT_CREATOR = "dispatcher.bootstrap"
+AUTO_COMPLETE_WORKER = "dispatcher.auto_complete"
+AUTO_COMPLETE_DESCRIPTION = (
+    "自动完成：所有审计意图、独立复核和报告材料任务均已收口，服务器完成校验已通过。"
+)
+AUTO_COMPLETE_BLOCKED_TRIGGER = "completion_blocked"
 FINDING_ID_RE = re.compile(r"\bfinding_[0-9a-fA-F]{8,32}\b")
 REVIEW_INTENT_MARKERS = ("确认", "复核", "review", "reviews", "pending_review")
 
@@ -565,9 +571,18 @@ class DispatcherLoop:
             )
         if dispatchable_intents:
             self._clear_log_state(f"{skip_scope}:explore_retry_cooldown")
-            newest = max(dispatchable_intents, key=lambda i: i.created_at)
-            export_yaml = self.client.export_project(summary.id, profile="explore", intent_id=newest.id)
-            return self._dispatch_explore(project, export_yaml, newest)
+            if self._dispatch_first_available_explore(project, dispatchable_intents):
+                return True
+        running_review_tasks = self._project_running_review_tasks(summary.id)
+        pending_review_tasks = [
+            task
+            for task in self.client.list_pending_review_tasks(summary.id, limit=10)
+            if isinstance(task, dict) and str(task.get("id") or "") not in running_review_tasks
+        ]
+        if pending_review_tasks:
+            for task in pending_review_tasks:
+                if self._dispatch_review_task(project, task):
+                    return True
         running_report_tasks = self._project_running_report_enrichment_tasks(summary.id)
         pending_report_tasks = [
             task
@@ -585,7 +600,23 @@ class DispatcherLoop:
                 project.project.reason.worker,
             )
             return False
+        completion = "not_attempted"
+        if self._project_can_attempt_auto_complete(
+            project,
+            running_intent_ids=running_intent_ids,
+            running_review_tasks=running_review_tasks,
+            pending_review_tasks=pending_review_tasks,
+            running_report_tasks=running_report_tasks,
+            pending_report_tasks=pending_report_tasks,
+        ):
+            completion = self._try_auto_complete_project(project)
+            if completion == "completed":
+                return True
+            if completion == "waiting":
+                return False
         reason_trigger = self._reason_trigger(project)
+        if completion == "blocked" and reason_trigger is None:
+            reason_trigger = AUTO_COMPLETE_BLOCKED_TRIGGER
         if reason_trigger is None:
             self._log_changed(
                 f"{skip_scope}:graph_unchanged",
@@ -598,10 +629,86 @@ class DispatcherLoop:
                 len(project.intents),
             )
             return False
+        if reason_trigger == AUTO_COMPLETE_BLOCKED_TRIGGER:
+            LOG.info(
+                "project completion guards blocked auto complete; dispatching reason project=%s",
+                project.project.id,
+            )
         if self._reason_parse_cooldown(project.project.id, reason_trigger):
             return False
         export_yaml = self.client.export_project(summary.id, profile="reason")
         return self._dispatch_reason(project, export_yaml, reason_trigger)
+
+    def _project_can_attempt_auto_complete(
+        self,
+        project: ProjectDetail,
+        *,
+        running_intent_ids: set[str],
+        running_review_tasks: set[str],
+        pending_review_tasks: list[dict],
+        running_report_tasks: set[str],
+        pending_report_tasks: list[dict],
+    ) -> bool:
+        if self._project_open_intent_count(project) > 0:
+            return False
+        if running_intent_ids or running_review_tasks or pending_review_tasks:
+            return False
+        if running_report_tasks or pending_report_tasks:
+            return False
+        return True
+
+    def _try_auto_complete_project(self, project: ProjectDetail) -> str:
+        project_id = project.project.id
+        if self._project_has_active_report_enrichment_tasks(project_id):
+            self._log_changed(
+                f"project:{project_id}:auto_complete:report_active",
+                logging.INFO,
+                "skip auto complete project=%s because report enrichment tasks are still active",
+                project_id,
+            )
+            return "waiting"
+        from_ids = [fact.id for fact in project.facts if fact.id != "goal"]
+        if not from_ids:
+            LOG.warning("skip auto complete project=%s because no non-goal facts are available", project_id)
+            return "skipped"
+        response = self.client.complete(
+            project_id,
+            from_ids,
+            AUTO_COMPLETE_DESCRIPTION,
+            AUTO_COMPLETE_WORKER,
+        )
+        if response.ok:
+            self.runtime_project_ids.discard(project_id)
+            self._clear_project_log_state(project_id)
+            LOG.info("auto completed project=%s facts=%s", project_id, len(from_ids))
+            return "completed"
+        if response.status_code == 403:
+            self.runtime_project_ids.discard(project_id)
+            LOG.info("auto complete skipped because project became inactive project=%s", project_id)
+            return "completed"
+        if response.status_code == 409:
+            self._log_changed(
+                f"project:{project_id}:auto_complete:blocked",
+                logging.INFO,
+                "auto complete blocked by server guards project=%s body=%s",
+                project_id,
+                response.text,
+            )
+            return "blocked"
+        LOG.warning(
+            "auto complete failed project=%s status=%s body=%s",
+            project_id,
+            response.status_code,
+            response.text,
+        )
+        return "skipped"
+
+    def _project_has_active_report_enrichment_tasks(self, project_id: str) -> bool:
+        for status in ("pending", "running"):
+            tasks = self.client.list_report_enrichments(project_id, status=status)
+            if any(isinstance(task, dict) for task in tasks):
+                return True
+        return False
 
     def _dispatch_initial_project(self, project: ProjectDetail) -> bool:
         intent = self._get_bootstrap_intent(project)
@@ -628,6 +735,18 @@ class DispatcherLoop:
             )
             return False
         return self._dispatch_bootstrap(project, intent)
+
+    def _dispatch_first_available_explore(self, project: ProjectDetail, intents: list[Intent]) -> bool:
+        for intent in sorted(intents, key=lambda item: item.created_at, reverse=True):
+            export_yaml = self.client.export_project(project.project.id, profile="explore", intent_id=intent.id)
+            if self._dispatch_explore(project, export_yaml, intent):
+                return True
+            LOG.debug(
+                "explore dispatch skipped candidate project=%s intent=%s; trying next open intent if available",
+                project.project.id,
+                intent.id,
+            )
+        return False
 
     def _dispatch_reason(self, project: ProjectDetail, export_yaml: str, trigger: str) -> bool:
         selection = self._select_worker(project.project.id, "reason")
@@ -819,6 +938,115 @@ class DispatcherLoop:
         self.runtime_project_ids.add(project.project.id)
         self._clear_project_log_state(project.project.id)
         LOG.info("dispatched explore project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
+        return True
+
+    def _dispatch_review_task(self, project: ProjectDetail, task: dict) -> bool:
+        task_id = str(task.get("id") or "")
+        finding_id = str(task.get("finding_id") or "")
+        if not task_id or not finding_id:
+            return False
+        discovered_by = str(task.get("discovered_by") or "").strip()
+        excluded_workers = {discovered_by} if discovered_by else set()
+        selection = self._select_worker(project.project.id, "review", excluded_workers=excluded_workers)
+        worker = selection.worker
+        if worker is None:
+            if self._has_configured_independent_review_worker(excluded_workers):
+                status = "waiting_for_reviewer"
+                reason = (
+                    "independent review worker is temporarily unavailable: "
+                    f"busy={selection.blocked_busy} unhealthy={selection.blocked_unhealthy} "
+                    f"rate_limited={selection.blocked_rate_limited} rejected={selection.blocked_rejected}"
+                )
+            else:
+                status = "blocked_no_independent_worker"
+                reason = (
+                    "no enabled review worker is configured outside the discoverer set: "
+                    f"excluded={sorted(excluded_workers)}"
+                )
+            if str(task.get("status") or "") != status:
+                response = self.client.mark_review_task_availability(task_id, status, reason)
+                if not response.ok and response.status_code not in (403, 409):
+                    LOG.warning(
+                        "review availability write failed project=%s task=%s status=%s body=%s",
+                        project.project.id,
+                        task_id,
+                        response.status_code,
+                        response.text,
+                    )
+            self._log_changed(
+                f"project:{project.project.id}:worker:review:{task_id}",
+                logging.INFO,
+                "no independent review worker project=%s task=%s finding=%s availability=%s blocked_busy=%s blocked_unhealthy=%s blocked_rate_limited=%s blocked_rejected=%s blocked_policy=%s",
+                project.project.id,
+                task_id,
+                finding_id,
+                status,
+                selection.blocked_busy,
+                selection.blocked_unhealthy,
+                selection.blocked_rate_limited,
+                selection.blocked_rejected,
+                selection.blocked_policy,
+            )
+            return False
+        self._clear_log_state(f"project:{project.project.id}:worker:review:{task_id}")
+        claim = self.client.claim_review_task(task_id, worker.name)
+        if claim.status_code in (403, 409):
+            level = logging.INFO if claim.status_code == 403 else logging.WARNING
+            LOG.log(
+                level,
+                "review claim skipped project=%s task=%s finding=%s worker=%s status=%s",
+                project.project.id,
+                task_id,
+                finding_id,
+                worker.name,
+                claim.status_code,
+            )
+            return False
+        if not claim.ok:
+            LOG.warning(
+                "review claim failed project=%s task=%s finding=%s worker=%s status=%s body=%s",
+                project.project.id,
+                task_id,
+                finding_id,
+                worker.name,
+                claim.status_code,
+                claim.text,
+            )
+            return False
+        if isinstance(claim.data, dict):
+            task = claim.data
+        try:
+            future = self.executor.submit(
+                run_review_task,
+                self.config,
+                self.client,
+                self.container_manager,
+                project,
+                task,
+                worker,
+                cancellation := TaskCancellation(),
+            )
+        except Exception:
+            LOG.exception(
+                "failed to submit review task project=%s task=%s finding=%s worker=%s",
+                project.project.id,
+                task_id,
+                finding_id,
+                worker.name,
+            )
+            self.client.release_review_task(task_id, worker.name)
+            return False
+        self.futures[future] = RunningTask(project.project.id, "review", worker.name, cancellation, intent_id=task_id)
+        self.runtime_project_ids.add(project.project.id)
+        self._clear_project_log_state(project.project.id)
+        LOG.info(
+            "dispatched review project=%s task=%s finding=%s worker=%s excluded_discoverer=%s",
+            project.project.id,
+            task_id,
+            finding_id,
+            worker.name,
+            discovered_by or None,
+        )
         return True
 
     def _dispatch_report_enrichment(self, project: ProjectDetail, task: dict) -> bool:
@@ -1017,6 +1245,23 @@ class DispatcherLoop:
             for task in self.futures.values()
             if task.project_id == project_id and task.task_type == "report_enrichment" and task.intent_id is not None
         }
+
+    def _project_running_review_tasks(self, project_id: str) -> set[str]:
+        return {
+            task.intent_id
+            for task in self.futures.values()
+            if task.project_id == project_id and task.task_type == "review" and task.intent_id is not None
+        }
+
+    def _has_configured_independent_review_worker(self, excluded_workers: set[str]) -> bool:
+        with self._config_lock:
+            workers = list(self.config.workers)
+        return any(
+            worker.enabled
+            and "review" in worker.task_types
+            and worker.name not in excluded_workers
+            for worker in workers
+        )
 
     def _running_tool_scan_task_ids(self) -> set[str]:
         return {

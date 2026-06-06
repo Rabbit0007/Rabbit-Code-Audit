@@ -459,6 +459,31 @@ CREATE INDEX IF NOT EXISTS idx_report_enrichment_project
     ON report_enrichment_tasks(project_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_report_enrichment_finding
     ON report_enrichment_tasks(project_id, finding_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS review_tasks (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    finding_id TEXT NOT NULL REFERENCES audit_findings(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN (
+            'pending', 'running', 'waiting_for_reviewer',
+            'blocked_no_independent_worker', 'completed', 'failed'
+        )),
+    created_by TEXT NOT NULL,
+    worker TEXT,
+    blocked_reason TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    last_heartbeat_at TEXT,
+    completed_at TEXT,
+    error_message TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_tasks_project
+    ON review_tasks(project_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_review_tasks_finding
+    ON review_tasks(project_id, finding_id, status, created_at);
 """
 
 VULNERABILITY_COLUMNS: dict[str, str] = {
@@ -528,6 +553,11 @@ REPORT_ENRICHMENT_COLUMNS: dict[str, str] = {
     "delivery_notes_json": "TEXT NOT NULL DEFAULT '[]'",
 }
 
+REVIEW_TASK_COLUMNS: dict[str, str] = {
+    "blocked_reason": "TEXT",
+    "retry_count": "INTEGER NOT NULL DEFAULT 0",
+}
+
 
 def _ensure_vulnerability_columns(conn) -> None:
     existing = {
@@ -569,6 +599,7 @@ def configure_product_db() -> None:
         _ensure_columns(conn, "code_entrypoints", CODE_ENTRYPOINT_COLUMNS)
         _ensure_columns(conn, "worker_task_history", WORKER_TASK_HISTORY_COLUMNS)
         _ensure_columns(conn, "report_enrichment_tasks", REPORT_ENRICHMENT_COLUMNS)
+        _ensure_columns(conn, "review_tasks", REVIEW_TASK_COLUMNS)
         from cairn.server.services import sync_business_node_coverage_from_latest_conclusions
 
         sync_business_node_coverage_from_latest_conclusions(conn)

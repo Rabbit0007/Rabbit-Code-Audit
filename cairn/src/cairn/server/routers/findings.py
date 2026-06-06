@@ -7,7 +7,12 @@ import uuid
 from fastapi import APIRouter, HTTPException
 
 from cairn.server.db import get_conn
-from cairn.server.services import get_project_or_404, utcnow
+from cairn.server.services import (
+    get_project_or_404,
+    next_fact_id,
+    sync_business_node_coverage_from_conclusion,
+    utcnow,
+)
 from cairn.server.source_models import (
     AuditCandidate,
     AuditFinding,
@@ -146,6 +151,8 @@ def create_audit_finding(project_id: str, body: CreateAuditFindingRequest):
                 created_at,
             ),
         )
+        if initial_status == "pending_review":
+            _ensure_review_task(conn, project_id, finding_id, body.discovered_by)
         row = conn.execute("SELECT * FROM audit_findings WHERE id = ?", (finding_id,)).fetchone()
     assert row is not None
     return _audit_finding_from_row(row)
@@ -274,32 +281,255 @@ def conclude_audit_candidate(
 def review_audit_finding(project_id: str, finding_id: str, body: ReviewAuditFindingRequest):
     with get_conn() as conn:
         get_project_or_404(conn, project_id)
-        row = conn.execute(
-            "SELECT * FROM audit_findings WHERE id = ? AND project_id = ?",
-            (finding_id, project_id),
-        ).fetchone()
-        if row is None:
-            raise HTTPException(404, "Audit finding not found")
-        if body.reviewer == row["discovered_by"]:
-            raise HTTPException(409, "Independent review must be performed by a different worker")
-        reviewed_at = utcnow()
+        updated = _apply_audit_finding_review(
+            conn,
+            project_id,
+            finding_id,
+            body.reviewer,
+            body.decision,
+        )
+    return _audit_finding_from_row(updated)
+
+
+def _apply_audit_finding_review(
+    conn,
+    project_id: str,
+    finding_id: str,
+    reviewer: str,
+    decision: str,
+):
+    row = conn.execute(
+        "SELECT * FROM audit_findings WHERE id = ? AND project_id = ?",
+        (finding_id, project_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "Audit finding not found")
+    if reviewer == row["discovered_by"]:
+        raise HTTPException(409, "Independent review must be performed by a different worker")
+    reviewed_at = utcnow()
+    conn.execute(
+        """
+        UPDATE audit_findings
+        SET status = ?, reviewed_by = ?, reviewed_at = ?
+        WHERE id = ? AND project_id = ?
+        """,
+        (decision, reviewer, reviewed_at, finding_id, project_id),
+    )
+    _sync_reportable_finding(conn, finding_id)
+    if decision == "confirmed":
+        _sync_confirmed_finding_coverage(
+            conn,
+            project_id,
+            finding_id,
+            reviewer,
+            reviewed_at,
+        )
+        _ensure_report_enrichment_task(conn, project_id, finding_id, reviewer)
+    _complete_related_review_tasks(conn, project_id, finding_id, reviewer, reviewed_at)
+    _conclude_legacy_review_intents(conn, project_id, finding_id, reviewer, decision, reviewed_at)
+    updated = conn.execute(
+        "SELECT * FROM audit_findings WHERE id = ? AND project_id = ?",
+        (finding_id, project_id),
+    ).fetchone()
+    assert updated is not None
+    return updated
+
+
+def _sync_confirmed_finding_coverage(
+    conn,
+    project_id: str,
+    finding_id: str,
+    reviewer: str,
+    now: str,
+) -> None:
+    finding = conn.execute(
+        """
+        SELECT id, snapshot_id, title, file_path, line_start, line_end, symbol,
+               entry_point, evidence, business_node_id
+        FROM audit_findings
+        WHERE id = ? AND project_id = ? AND status = 'confirmed'
+        """,
+        (finding_id, project_id),
+    ).fetchone()
+    if finding is None or not finding["business_node_id"]:
+        return
+
+    summary = f"已确认 finding 闭合该审计对象：{finding['title']}"
+    evidence = finding["evidence"] or _finding_location_evidence(finding)
+    matched_candidate_ids = _matching_index_candidate_ids_for_finding(conn, project_id, finding)
+    if matched_candidate_ids:
+        placeholders = ", ".join("?" for _ in matched_candidate_ids)
+        conn.execute(
+            f"""
+            UPDATE audit_candidates
+            SET status = 'confirmed',
+                conclusion_summary = ?,
+                evidence = ?,
+                audit_finding_id = ?,
+                concluded_by = ?,
+                concluded_at = ?,
+                updated_at = ?
+            WHERE project_id = ?
+              AND snapshot_id = ?
+              AND business_node_id = ?
+              AND source = 'index'
+              AND id IN ({placeholders})
+              AND (status != 'confirmed' OR audit_finding_id IS NULL)
+            """,
+            (
+                summary,
+                evidence,
+                finding_id,
+                reviewer,
+                now,
+                now,
+                project_id,
+                finding["snapshot_id"],
+                finding["business_node_id"],
+                *matched_candidate_ids,
+            ),
+        )
+
+    existing = conn.execute(
+        """
+        SELECT id
+        FROM business_node_conclusions
+        WHERE project_id = ?
+          AND business_node_id = ?
+          AND conclusion = 'confirmed_finding'
+          AND audit_finding_id = ?
+        """,
+        (project_id, finding["business_node_id"], finding_id),
+    ).fetchone()
+    if existing is None:
         conn.execute(
             """
-            UPDATE audit_findings
-            SET status = ?, reviewed_by = ?, reviewed_at = ?
-            WHERE id = ? AND project_id = ?
+            INSERT INTO business_node_conclusions (
+                id, project_id, business_node_id, conclusion, summary, evidence,
+                audit_finding_id, created_by, created_at
+            )
+            VALUES (?, ?, ?, 'confirmed_finding', ?, ?, ?, ?, ?)
             """,
-            (body.decision, body.reviewer, reviewed_at, finding_id, project_id),
+            (
+                f"biz_conclusion_{uuid.uuid4().hex[:16]}",
+                project_id,
+                finding["business_node_id"],
+                summary,
+                evidence,
+                finding_id,
+                reviewer,
+                now,
+            ),
         )
-        _sync_reportable_finding(conn, finding_id)
-        if body.decision == "confirmed":
-            _ensure_report_enrichment_task(conn, project_id, finding_id, body.reviewer)
-        updated = conn.execute(
-            "SELECT * FROM audit_findings WHERE id = ? AND project_id = ?",
-            (finding_id, project_id),
-        ).fetchone()
-    assert updated is not None
-    return _audit_finding_from_row(updated)
+    sync_business_node_coverage_from_conclusion(
+        conn,
+        project_id,
+        finding["business_node_id"],
+        "confirmed_finding",
+        summary,
+        evidence,
+        now=now,
+    )
+
+
+def _finding_location_evidence(finding) -> str:
+    if finding["file_path"] and finding["line_start"]:
+        return f"{finding['file_path']}:{finding['line_start']}"
+    return finding["file_path"] or finding["id"]
+
+
+def _matching_index_candidate_ids_for_finding(conn, project_id: str, finding) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT id, candidate_type, file_path, line_start, line_end, entry_point, symbol
+        FROM audit_candidates
+        WHERE project_id = ?
+          AND snapshot_id = ?
+          AND business_node_id = ?
+          AND source = 'index'
+        """,
+        (project_id, finding["snapshot_id"], finding["business_node_id"]),
+    ).fetchall()
+    matches: list[tuple[tuple[int, int, int], str]] = []
+    for row in rows:
+        score = _index_candidate_finding_match_score(row, finding)
+        if score is not None:
+            matches.append((score, row["id"]))
+    if not matches:
+        return []
+    matches.sort(key=lambda item: item[0])
+    best_score = matches[0][0]
+    return [candidate_id for score, candidate_id in matches if score == best_score]
+
+
+def _index_candidate_finding_match_score(candidate, finding) -> tuple[int, int, int] | None:
+    finding_file = finding["file_path"]
+    candidate_file = candidate["file_path"]
+    if finding_file:
+        if not candidate_file or candidate_file != finding_file:
+            return None
+    elif not _entry_points_overlap(candidate["entry_point"], finding["entry_point"]):
+        return None
+
+    line_score = _line_match_score(
+        candidate["line_start"],
+        candidate["line_end"],
+        finding["line_start"],
+        finding["line_end"],
+    )
+    entry_overlap = _entry_points_overlap(candidate["entry_point"], finding["entry_point"])
+    symbol_overlap = bool(candidate["symbol"] and finding["symbol"] and candidate["symbol"] == finding["symbol"])
+
+    if line_score is None and not entry_overlap and not symbol_overlap:
+        return None
+    if line_score is not None and line_score > 30:
+        if candidate["candidate_type"] == "data_flow" and not symbol_overlap:
+            return None
+        if not entry_overlap and not symbol_overlap:
+            return None
+
+    candidate_type_score = 0 if candidate["candidate_type"] == "data_flow" else 1
+    if line_score is None:
+        line_score = 20 if entry_overlap or symbol_overlap else 99
+    entry_score = 0 if entry_overlap else 1
+    return (candidate_type_score, line_score, entry_score)
+
+
+def _line_match_score(
+    candidate_start: int | None,
+    candidate_end: int | None,
+    finding_start: int | None,
+    finding_end: int | None,
+) -> int | None:
+    if candidate_start is None or finding_start is None:
+        return None
+    candidate_last = candidate_end or candidate_start
+    finding_last = finding_end or finding_start
+    if candidate_start <= finding_last and finding_start <= candidate_last:
+        return 0
+    return min(abs(candidate_start - finding_start), abs(candidate_last - finding_last))
+
+
+def _entry_points_overlap(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    left_route = _entry_route_key(left)
+    right_route = _entry_route_key(right)
+    if left_route and right_route and left_route == right_route:
+        return True
+    left_text = left.strip().lower()
+    right_text = right.strip().lower()
+    return left_text in right_text or right_text in left_text
+
+
+def _entry_route_key(value: str) -> str | None:
+    text = value.strip()
+    if not text:
+        return None
+    parts = text.split()
+    route = parts[1] if len(parts) >= 2 and parts[0].isalpha() else parts[0]
+    route = route.split("?", 1)[0].split("#", 1)[0].strip()
+    return route.lower() or None
 
 
 def _validate_snapshot(conn, project_id: str, snapshot_id: str) -> None:
@@ -471,7 +701,8 @@ def _infer_business_node_for_finding(
         return None
     rows = conn.execute(
         """
-        SELECT id, candidate_type, line_start, entry_point, business_node_id
+        SELECT id, candidate_type, file_path, line_start, line_end, entry_point,
+               symbol, business_node_id
         FROM audit_candidates
         WHERE project_id = ?
           AND snapshot_id = ?
@@ -483,18 +714,22 @@ def _infer_business_node_for_finding(
     if not rows:
         return None
 
-    def score(row) -> tuple[int, int, int]:
-        exact_line = body.line_start is not None and row["line_start"] == body.line_start
-        same_entry = bool(body.entry_point and row["entry_point"] and row["entry_point"] in body.entry_point)
-        data_flow = row["candidate_type"] == "data_flow"
-        return (
-            0 if exact_line else 1,
-            0 if same_entry else 1,
-            0 if data_flow else 1,
-        )
-
-    best = sorted(rows, key=score)[0]
-    return best["business_node_id"]
+    finding_like = {
+        "file_path": body.file_path,
+        "line_start": body.line_start,
+        "line_end": body.line_end,
+        "symbol": body.symbol,
+        "entry_point": body.entry_point,
+    }
+    scored: list[tuple[tuple[int, int, int], str]] = []
+    for row in rows:
+        score = _index_candidate_finding_match_score(row, finding_like)
+        if score is not None:
+            scored.append((score, row["business_node_id"]))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0])
+    return scored[0][1]
 
 
 def _validate_candidate_conclusion(
@@ -532,6 +767,63 @@ def _validate_business_node(conn, project_id: str, node_id: str) -> None:
         raise HTTPException(404, "Business node not found")
 
 
+def _ensure_review_task(conn, project_id: str, finding_id: str, discovered_by: str) -> None:
+    existing = conn.execute(
+        """
+        SELECT id
+        FROM review_tasks
+        WHERE project_id = ?
+          AND finding_id = ?
+          AND status IN (
+              'pending', 'running', 'waiting_for_reviewer',
+              'blocked_no_independent_worker', 'completed'
+          )
+        LIMIT 1
+        """,
+        (project_id, finding_id),
+    ).fetchone()
+    if existing is not None:
+        return
+    now = utcnow()
+    task_id = f"rev_{uuid.uuid4().hex[:16]}"
+    conn.execute(
+        """
+        INSERT INTO review_tasks (
+            id, project_id, finding_id, status, created_by, created_at
+        )
+        VALUES (?, ?, ?, 'pending', ?, ?)
+        """,
+        (task_id, project_id, finding_id, f"finding:{discovered_by}", now),
+    )
+
+
+def _complete_related_review_tasks(
+    conn,
+    project_id: str,
+    finding_id: str,
+    reviewer: str,
+    completed_at: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE review_tasks
+        SET status = 'completed',
+            worker = COALESCE(worker, ?),
+            last_heartbeat_at = ?,
+            completed_at = ?,
+            blocked_reason = NULL,
+            error_message = NULL
+        WHERE project_id = ?
+          AND finding_id = ?
+          AND status IN (
+              'pending', 'running', 'waiting_for_reviewer',
+              'blocked_no_independent_worker'
+          )
+        """,
+        (reviewer, completed_at, completed_at, project_id, finding_id),
+    )
+
+
 def _ensure_report_enrichment_task(conn, project_id: str, finding_id: str, reviewer: str) -> None:
     existing = conn.execute(
         """
@@ -557,6 +849,58 @@ def _ensure_report_enrichment_task(conn, project_id: str, finding_id: str, revie
         """,
         (task_id, project_id, finding_id, f"review:{reviewer}", now),
     )
+
+
+_LEGACY_REVIEW_INTENT_MARKERS = ("确认", "复核", "review", "reviews", "pending_review")
+
+
+def _conclude_legacy_review_intents(
+    conn,
+    project_id: str,
+    finding_id: str,
+    reviewer: str,
+    decision: str,
+    now: str,
+) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, description
+        FROM intents
+        WHERE project_id = ?
+          AND to_fact_id IS NULL
+          AND description LIKE ?
+        ORDER BY created_at, id
+        LIMIT 20
+        """,
+        (project_id, f"%{finding_id}%"),
+    ).fetchall()
+    for row in rows:
+        description = row["description"] or ""
+        lowered = description.lower()
+        if not any(marker in lowered for marker in _LEGACY_REVIEW_INTENT_MARKERS):
+            continue
+        fact_id = next_fact_id(conn, project_id)
+        conn.execute(
+            "INSERT INTO facts (id, project_id, description) VALUES (?, ?, ?)",
+            (
+                fact_id,
+                project_id,
+                f"自动复核队列已处理 {finding_id}：decision={decision}，reviewer={reviewer}",
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE intents
+            SET to_fact_id = ?,
+                worker = COALESCE(worker, ?),
+                last_heartbeat_at = ?,
+                concluded_at = ?
+            WHERE id = ?
+              AND project_id = ?
+              AND to_fact_id IS NULL
+            """,
+            (fact_id, reviewer, now, now, row["id"], project_id),
+        )
 
 
 def _sync_reportable_finding(conn, finding_id: str) -> None:

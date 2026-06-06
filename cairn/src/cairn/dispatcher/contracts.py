@@ -217,6 +217,17 @@ def _looks_like_report_enrichment_data(payload: dict[str, Any]) -> bool:
     }
 
 
+def _looks_like_review_data(payload: dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    keys = set(payload)
+    return bool(keys) and keys <= {
+        "description",
+        "review",
+        "reviews",
+    }
+
+
 def _string_list(value: Any, field_name: str) -> list[str]:
     if value is None:
         return []
@@ -835,6 +846,33 @@ def validate_report_enrichment_payload(payload: dict[str, Any]) -> tuple[str, di
     if isinstance(finding_id, str) and finding_id.strip():
         result["finding_id"] = finding_id.strip()
     return "complete", result
+
+
+def validate_review_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    accepted, data = _unwrap_wrapped_payload(payload)
+    if accepted is False:
+        return "rejected", None
+    if accepted is None:
+        if not _looks_like_review_data(payload):
+            raise ValueError("accepted must be true or false")
+        data = payload
+    if not isinstance(data, dict):
+        raise ValueError("accepted must be true or false")
+
+    extra = set(data) - {"description", "review", "reviews"}
+    if extra:
+        raise ValueError(f"unexpected keys in review payload: {', '.join(sorted(extra))}")
+    if any(key in data for key in ("finding", "findings", "audit_candidates", "candidate_conclusions")):
+        raise ValueError("review task must not emit discovery outputs")
+    reviews = _validate_reviews(data.get("review"), data.get("reviews"))
+    if len(reviews) != 1:
+        raise ValueError("review task must return exactly one structured review")
+    description = data.get("description")
+    return "review", {
+        "description": description.strip() if isinstance(description, str) and description.strip() else None,
+        "review": reviews[0],
+        "reviews": reviews,
+    }
 
 
 def _validate_packet_templates(value: Any) -> list[dict[str, str]]:

@@ -11,6 +11,8 @@ from cairn.server.services import (
     expire_reason_leases,
     expire_workers,
     get_project_or_404,
+    is_high_impact_audit_candidate_row,
+    is_high_impact_business_node_row,
 )
 from cairn.server.source_service import list_snapshots, snapshot_container_path
 from cairn.server.source_service import (
@@ -183,7 +185,11 @@ def _load_business_graph(
                     }
                 )
             else:
-                reason = _business_node_conclusion_blocker_reason(conclusion, row["id"])
+                reason = _business_node_conclusion_blocker_reason(
+                    conclusion,
+                    row["id"],
+                    require_decisive=is_high_impact_business_node_row(row),
+                )
                 if reason is not None:
                     coverage["high_or_unknown_invalid_conclusion"].append(
                         {
@@ -273,7 +279,14 @@ def _business_node_effective_review(row, conclusion) -> tuple[str, str | None]:
     coverage_note = row["coverage_note"]
     if conclusion is None:
         return status, coverage_note
-    if _business_node_conclusion_blocker_reason(conclusion, row["id"]) is not None:
+    if (
+        _business_node_conclusion_blocker_reason(
+            conclusion,
+            row["id"],
+            require_decisive=is_high_impact_business_node_row(row),
+        )
+        is not None
+    ):
         return status, coverage_note
     conclusion_status = business_node_coverage_status_for_conclusion(conclusion["conclusion"])
     if conclusion_status is None:
@@ -336,7 +349,12 @@ def _select_business_graph_rows(
     return selected_nodes, selected_edges
 
 
-def _business_node_conclusion_blocker_reason(conclusion, business_node_id: str) -> str | None:
+def _business_node_conclusion_blocker_reason(
+    conclusion,
+    business_node_id: str,
+    *,
+    require_decisive: bool = False,
+) -> str | None:
     summary = conclusion["summary"]
     if summary is None or summary.strip() == "":
         return "missing_summary"
@@ -353,6 +371,8 @@ def _business_node_conclusion_blocker_reason(conclusion, business_node_id: str) 
         evidence = conclusion["evidence"]
         if evidence is None or evidence.strip() == "":
             return "missing_evidence"
+        if require_decisive and kind == "needs_more_evidence":
+            return "high_impact_needs_more_evidence"
         return None
     return "invalid_conclusion"
 
@@ -496,6 +516,8 @@ def _audit_candidate_conclusion_blocker_reason(row) -> str | None:
         evidence = row["evidence"]
         if evidence is None or evidence.strip() == "":
             return "missing_evidence"
+        if status == "needs_more_evidence" and is_high_impact_audit_candidate_row(row):
+            return "high_impact_needs_more_evidence"
         return None
     return "invalid_status"
 

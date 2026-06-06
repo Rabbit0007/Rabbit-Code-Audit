@@ -11,7 +11,7 @@ import yaml
 from cairn.dispatcher.contracts import validate_explore_payload
 from cairn.server.code_index import CodeSymbolRecord, _call_relationships
 from cairn.server import db
-from cairn.server.routers import business_graph, export, findings, intents, projects, sources, vulnerabilities
+from cairn.server.routers import business_graph, export, findings, intents, projects, review_tasks, sources, vulnerabilities
 from cairn.server.services import utcnow
 from cairn.server.source_models import CodeFile
 from cairn.server.source_service import rebuild_source_index
@@ -23,6 +23,7 @@ def _app(temp_db) -> FastAPI:
     app.include_router(intents.router)
     app.include_router(sources.router)
     app.include_router(findings.router)
+    app.include_router(review_tasks.router)
     app.include_router(business_graph.router)
     app.include_router(export.router)
     app.include_router(vulnerabilities.router)
@@ -707,17 +708,33 @@ satrda.Router.all(ApiPre + "/system/user/profile", profile);
         for item in candidates
         if item["candidate_type"] == "data_flow"
         and item["file_path"] == "server/plugins/erp/h5dw.js"
-        and "文件/包含操作面" in item["title"]
+        and "外部输入到文件读写/加载能力" in item["title"]
     )
     assert file_write["business_node_id"]
+    assert file_write["severity"] == "high"
+    assert "该候选是数据流事实，不是漏洞类型判断" in file_write["description"]
+    assert "高影响能力提示" in file_write["description"]
+    assert "局部代码切片" in file_write["description"]
+    assert "filename" in file_write["description"]
+    assert len(file_write["description"]) <= 1600
 
     graph = client.get(f"/api/projects/{project_id}/business-graph").json()
     endpoint_titles = {node["title"] for node in graph["nodes"] if node["node_type"] == "endpoint"}
     assert {"入口 /erp/file", "入口 /erp/h5dw", "入口 /erp/system/user/profile"} <= endpoint_titles
     risk_nodes = [node for node in graph["nodes"] if node["node_type"] == "risk"]
-    assert any("文件/包含操作面" in node["title"] for node in risk_nodes)
-    assert any(node["risk_level"] == "unknown" for node in risk_nodes)
+    file_risk = next(node for node in risk_nodes if "外部输入到文件读写/加载能力" in node["title"])
+    assert file_risk["risk_level"] == "high"
     assert graph["edges"]
+
+    reason_export = client.get(
+        f"/projects/{project_id}/export",
+        params={"format": "yaml", "profile": "reason"},
+    )
+    reason_data = yaml.safe_load(reason_export.text)
+    open_required_ids = {
+        item["id"] for item in reason_data["audit_candidates"]["coverage"]["open_required"]
+    }
+    assert file_write["id"] in open_required_ids
 
 
 def test_source_import_creates_generic_audit_candidates(temp_db, monkeypatch, tmp_path):
@@ -749,7 +766,7 @@ function loginHandler(req, res) { res.send("ok"); }
     assert any(
         item["candidate_type"] == "data_flow"
         and item["file_path"] == "public/index.php"
-        and "不代表已确认漏洞" in item["description"]
+        and "不是漏洞类型判断" in item["description"]
         for item in candidates
     )
 
@@ -895,7 +912,7 @@ echo "ok";
     sql_candidates = [
         item
         for item in candidates
-        if item["candidate_type"] == "data_flow" and "SQL 注入面" in item["title"]
+        if item["candidate_type"] == "data_flow" and "外部输入到数据库执行能力" in item["title"]
     ]
     assert len(sql_candidates) == 2
     assert {item["file_path"] for item in sql_candidates} == {"Less-1/index.php", "Less-2/index.php"}
@@ -929,7 +946,7 @@ def test_source_index_does_not_tie_far_same_name_input_to_sink(temp_db, monkeypa
     assert not [
         item
         for item in candidates
-        if item["candidate_type"] == "data_flow" and "SQL 注入面" in item["title"]
+        if item["candidate_type"] == "data_flow" and "外部输入到数据库执行能力" in item["title"]
     ]
 
 
@@ -965,6 +982,72 @@ $result=mysql_query($sql);
     assert all(item["conclusion_summary"] for item in candidates)
     assert all(item["evidence"] for item in candidates)
     assert all(item["business_node_id"] for item in candidates if item["candidate_type"] == "data_flow")
+
+
+def test_rebuild_source_index_refreshes_existing_index_candidate_without_resetting_conclusion(
+    temp_db,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/app.php": b"""<?php
+$id=$_GET['id'];
+$sql="SELECT * FROM users WHERE id=$id";
+$result=mysql_query($sql);
+""",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("legacy.zip", payload, "application/zip")},
+    ).json()
+    candidate = next(
+        item
+        for item in client.get(f"/api/projects/{project_id}/audit-candidates").json()
+        if item["candidate_type"] == "data_flow"
+    )
+
+    concluded = client.post(
+        f"/api/projects/{project_id}/audit-candidates/{candidate['id']}/conclude",
+        json={
+            "reviewer": "worker-a",
+            "decision": "needs_more_evidence",
+            "summary": "保留现有 worker 结论",
+            "evidence": "worker 已读过源码但还缺运行时证据",
+        },
+    )
+    assert concluded.status_code == 200
+    with db.get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE audit_candidates
+            SET title = '审计数据流: SQL 注入面 app.php:4',
+                description = '旧版候选描述',
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (utcnow(), candidate["id"]),
+        )
+
+    rebuild_source_index(snapshot["id"])
+
+    refreshed = next(
+        item
+        for item in client.get(f"/api/projects/{project_id}/audit-candidates").json()
+        if item["id"] == candidate["id"]
+    )
+    assert "外部输入到数据库执行能力" in refreshed["title"]
+    assert "该候选是数据流事实，不是漏洞类型判断" in refreshed["description"]
+    assert len(refreshed["description"]) <= 1600
+    assert refreshed["status"] == "needs_more_evidence"
+    assert refreshed["conclusion_summary"] == "保留现有 worker 结论"
+    assert refreshed["evidence"] == "worker 已读过源码但还缺运行时证据"
+    assert refreshed["concluded_by"] == "worker-a"
 
 
 def test_export_profiles_focus_graph_context_and_validation_strategy(temp_db, monkeypatch, tmp_path):
@@ -1315,3 +1398,185 @@ def test_high_severity_finding_requires_different_reviewer(temp_db, monkeypatch,
             (project_id,),
         ).fetchone()
     assert row["count"] == 1
+
+
+def test_high_severity_finding_creates_independent_review_task_queue(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    payload = _zip_bytes({"app.php": b"<?php echo $_GET['x'];"})
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("demo.zip", payload, "application/zip")},
+    ).json()
+
+    created = client.post(
+        f"/api/projects/{project_id}/audit-findings",
+        json={
+            "snapshot_id": snapshot["id"],
+            "title": "reflected xss",
+            "category": "xss",
+            "severity": "high",
+            "file_path": "app.php",
+            "line_start": 1,
+            "entry_point": "GET /app.php?x=",
+            "description": "reflected output reaches the response without escaping",
+            "impact": "attacker can execute script in a victim browser",
+            "evidence": "app.php echoes $_GET['x'] directly",
+            "proof_packets": [_proof_packet()],
+            "discovered_by": "worker-a",
+        },
+    )
+    assert created.status_code == 201
+    finding = created.json()
+    assert finding["status"] == "pending_review"
+
+    pending = client.get("/api/review-tasks/pending", params={"project_id": project_id}).json()
+    assert len(pending) == 1
+    task = pending[0]
+    assert task["finding_id"] == finding["id"]
+    assert task["status"] == "pending"
+    assert task["discovered_by"] == "worker-a"
+
+    same_worker = client.post(f"/api/review-tasks/{task['id']}/claim", json={"worker": "worker-a"})
+    assert same_worker.status_code == 409
+
+    claimed = client.post(f"/api/review-tasks/{task['id']}/claim", json={"worker": "worker-b"})
+    assert claimed.status_code == 200
+    assert claimed.json()["status"] == "running"
+    assert claimed.json()["worker"] == "worker-b"
+
+    completed = client.post(
+        f"/api/review-tasks/{task['id']}/complete",
+        json={"worker": "worker-b", "decision": "confirmed"},
+    )
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "completed"
+
+    reviewed = client.get(f"/api/projects/{project_id}/audit-findings").json()
+    assert reviewed[0]["id"] == finding["id"]
+    assert reviewed[0]["status"] == "confirmed"
+    assert reviewed[0]["reviewed_by"] == "worker-b"
+
+    pending_after = client.get("/api/review-tasks/pending", params={"project_id": project_id}).json()
+    assert pending_after == []
+    with db.get_conn() as conn:
+        report_task = conn.execute(
+            """
+            SELECT finding_id, status, created_by
+            FROM report_enrichment_tasks
+            WHERE project_id = ?
+            """,
+            (project_id,),
+        ).fetchone()
+    assert report_task is not None
+    assert report_task["finding_id"] == finding["id"]
+    assert report_task["status"] == "pending"
+    assert report_task["created_by"] == "review:worker-b"
+
+
+def test_confirmed_finding_backfills_index_candidate_and_business_node(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    payload = _zip_bytes({"app.php": b"<?php echo $_GET['x'];"})
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("demo.zip", payload, "application/zip")},
+    ).json()
+
+    candidate = next(
+        item
+        for item in client.get(f"/api/projects/{project_id}/audit-candidates").json()
+        if item["candidate_type"] == "data_flow" and item["business_node_id"]
+    )
+    blocked = client.post(
+        f"/api/projects/{project_id}/audit-candidates/{candidate['id']}/conclude",
+        json={
+            "reviewer": "worker-a",
+            "decision": "needs_more_evidence",
+            "summary": "首次 worker 未完成源码审计",
+            "evidence": "未读取目标源码，暂不能确认或排除",
+        },
+    )
+    assert blocked.status_code == 200
+    assert blocked.json()["status"] == "needs_more_evidence"
+
+    now = utcnow()
+    with db.get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_candidates (
+                id, project_id, snapshot_id, source, candidate_type, severity,
+                title, description, file_path, line_start, entry_point, business_node_id,
+                status, created_by, created_at, updated_at
+            )
+            VALUES (
+                'cand_unrelated_same_node', ?, ?, 'index', 'data_flow', 'unknown',
+                '审计数据流: 外部输入到响应渲染输出能力 app.php:100',
+                '同业务节点下的另一条远距离数据流，不应被该 finding 自动闭合',
+                'app.php', 100, 'GET /app.php?x=', ?, 'candidate',
+                'source_index', ?, ?
+            )
+            """,
+            (project_id, snapshot["id"], candidate["business_node_id"], now, now),
+        )
+
+    created = client.post(
+        f"/api/projects/{project_id}/audit-findings",
+        json={
+            "snapshot_id": snapshot["id"],
+            "title": "reflected xss",
+            "category": "xss",
+            "severity": "high",
+            "file_path": "app.php",
+            "line_start": 1,
+            "entry_point": "GET /app.php?x=",
+            "business_node_id": candidate["business_node_id"],
+            "description": "reflected output reaches the response without escaping",
+            "impact": "attacker can execute script in a victim browser",
+            "evidence": "app.php echoes $_GET['x'] directly",
+            "proof_packets": [_proof_packet()],
+            "discovered_by": "worker-b",
+        },
+    )
+    assert created.status_code == 201
+    finding = created.json()
+
+    reviewed = client.post(
+        f"/api/projects/{project_id}/audit-findings/{finding['id']}/review",
+        json={"reviewer": "worker-c", "decision": "confirmed"},
+    )
+    assert reviewed.status_code == 200
+
+    updated_candidate = next(
+        item
+        for item in client.get(f"/api/projects/{project_id}/audit-candidates").json()
+        if item["id"] == candidate["id"]
+    )
+    assert updated_candidate["status"] == "confirmed"
+    assert updated_candidate["audit_finding_id"] == finding["id"]
+    assert updated_candidate["concluded_by"] == "worker-c"
+    unrelated_candidate = next(
+        item
+        for item in client.get(f"/api/projects/{project_id}/audit-candidates").json()
+        if item["id"] == "cand_unrelated_same_node"
+    )
+    assert unrelated_candidate["status"] == "candidate"
+    assert unrelated_candidate["audit_finding_id"] is None
+
+    conclusions = client.get(
+        f"/api/projects/{project_id}/business-graph/conclusions",
+        params={"business_node_id": candidate["business_node_id"]},
+    ).json()
+    assert len(conclusions) == 1
+    assert conclusions[0]["conclusion"] == "confirmed_finding"
+    assert conclusions[0]["audit_finding_id"] == finding["id"]
+
+    node = next(
+        item
+        for item in client.get(f"/api/projects/{project_id}/business-graph").json()["nodes"]
+        if item["id"] == candidate["business_node_id"]
+    )
+    assert node["review_status"] == "covered"
+    assert "已确认 finding 闭合该审计对象" in node["coverage_note"]

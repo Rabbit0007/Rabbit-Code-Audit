@@ -117,7 +117,7 @@ class CreateWorkerTaskHistoryRequest(BaseModel):
         return text or None
 
 
-TaskType = Literal["reason", "explore", "bootstrap", "report_enrichment"]
+TaskType = Literal["reason", "explore", "bootstrap", "report_enrichment", "review"]
 WorkerType = Literal["claudecode", "codex", "pi", "mock"]
 
 

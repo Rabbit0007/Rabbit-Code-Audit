@@ -175,6 +175,69 @@ def test_complete_rejects_open_required_audit_candidates(temp_db):
     assert detail["audit_candidates"][0]["id"] == "cand_1"
 
 
+def test_complete_rejects_high_impact_candidate_needing_more_evidence(temp_db):
+    client = _client()
+    project_id = _create_project(client)
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO source_snapshots (
+                id, project_id, source_type, status, file_count, total_bytes,
+                detected_languages_json, created_at
+            )
+            VALUES ('snap_1', ?, 'zip', 'ready', 1, 10, '{}', '2026-01-01T00:00:00Z')
+            """,
+            (project_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO business_nodes (
+                id, project_id, node_type, title, risk_level, review_status,
+                coverage_note, risk_tags_json, evidence_json, created_by, created_at, updated_at
+            )
+            VALUES (
+                'biz_1', ?, 'risk', '待审计数据流 外部输入到文件读写/加载能力 app.js:9',
+                'high', 'blocked', 'worker 只确认到写文件能力，还缺执行/加载边界',
+                '["文件读写/加载能力"]', '[]', 'source_index',
+                '2026-01-01T00:00:01Z', '2026-01-01T00:00:01Z'
+            )
+            """,
+            (project_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_candidates (
+                id, project_id, snapshot_id, source, candidate_type, severity,
+                title, description, file_path, line_start, entry_point, business_node_id,
+                status, conclusion_summary, evidence, created_by, created_at, updated_at
+            )
+            VALUES (
+                'cand_upload', ?, 'snap_1', 'index', 'data_flow', 'high',
+                '审计数据流: 外部输入到文件读写/加载能力 app.js:9',
+                'filename from request reaches writeFile',
+                'app.js', 9, 'POST /upload', 'biz_1', 'needs_more_evidence',
+                '已确认外部输入进入文件写入，但尚未确认执行边界',
+                'app.js:9 writeFile(pathFromRequest, body)',
+                'source_index', '2026-01-01T00:00:01Z', '2026-01-01T00:00:02Z'
+            )
+            """,
+            (project_id,),
+        )
+
+    complete = client.post(
+        f"/projects/{project_id}/complete",
+        json={"from": ["origin"], "description": "done", "worker": "worker-1"},
+    )
+
+    assert complete.status_code == 409
+    detail = complete.json()["detail"]
+    assert detail["message"] == (
+        "High-impact audit candidates require confirmed or rejected closure before completion"
+    )
+    assert detail["audit_candidates"][0]["reason"] == "high_impact_needs_more_evidence"
+
+
 def test_complete_rejects_pending_high_audit_findings(temp_db):
     client = _client()
     project_id = _create_project(client)
@@ -449,6 +512,47 @@ def test_complete_allows_blocked_node_with_needs_more_evidence_conclusion(temp_d
 
     assert complete.status_code == 200
     assert complete.json()["to"] == "goal"
+
+
+def test_complete_rejects_high_impact_node_with_needs_more_evidence_conclusion(temp_db):
+    client = _client()
+    project_id = _create_project(client)
+
+    node = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "risk",
+            "title": "外部输入到文件读写/加载能力 app.js:9",
+            "risk_level": "high",
+            "review_status": "blocked",
+            "coverage_note": "已看到 filename 进入 writeFile，但未确认加载/执行边界",
+            "risk_tags": ["文件读写/加载能力"],
+            "created_by": "worker-1",
+        },
+    ).json()
+    conclusion = client.post(
+        f"/api/projects/{project_id}/business-graph/conclusions",
+        json={
+            "business_node_id": node["id"],
+            "conclusion": "needs_more_evidence",
+            "summary": "已确认外部输入进入文件写入，但缺少运行时文件 API 边界证据",
+            "evidence": "app.js reads filename from request and passes it to writeFile",
+            "created_by": "worker-1",
+        },
+    )
+    assert conclusion.status_code == 201
+
+    complete = client.post(
+        f"/projects/{project_id}/complete",
+        json={"from": ["origin"], "description": "done", "worker": "worker-1"},
+    )
+
+    assert complete.status_code == 409
+    detail = complete.json()["detail"]
+    assert detail["message"] == (
+        "Critical, high, or unknown-risk business nodes require a structured audit conclusion before completion"
+    )
+    assert detail["business_nodes"][0]["reason"] == "high_impact_needs_more_evidence"
 
 
 def test_complete_allows_confirmed_finding_business_node_conclusion(temp_db):

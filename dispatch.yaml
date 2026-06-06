@@ -18,6 +18,8 @@ tasks:
     conclude_timeout: 90
   report_enrichment:
     timeout: 120
+  review:
+    timeout: 300
   tool_scan:
     enabled: true
     auto_enqueue: false
@@ -222,6 +224,18 @@ workers:
   - report_enrichment
   max_running: 1
   priority: 13
+  env:
+    PI_MODEL: gpt-5.5
+    PI_BASE_URL: https://vsllm.com/v1
+    PI_API_KEY: sk-qcTmy1lhc0MkEBKcjkuFJLo7Mo7pK0Fs9S3Axl4QZvSZ1Y6G
+    PI_PROVIDER_API: openai-completions
+- name: review-gpt55-1
+  type: pi
+  enabled: true
+  task_types:
+  - review
+  max_running: 1
+  priority: 14
   env:
     PI_MODEL: gpt-5.5
     PI_BASE_URL: https://vsllm.com/v1

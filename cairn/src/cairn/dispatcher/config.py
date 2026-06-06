@@ -10,7 +10,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-TaskType = Literal["reason", "explore", "bootstrap", "report_enrichment"]
+TaskType = Literal["reason", "explore", "bootstrap", "report_enrichment", "review"]
 WorkerType = Literal["claudecode", "codex", "pi", "mock"]
 CompletedAction = Literal["remove", "stop"]
 
@@ -44,6 +44,7 @@ DEFAULT_PROMPT_REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
     "explore.md": ("{source_path}", "{graph_yaml}", "{intent_id}", "{intent_description}"),
     "explore_conclude.md": ("{graph_yaml}", "{intent_id}", "{intent_description}"),
     "report_enrichment.md": ("{finding_id}", "{evidence_packet_reference}"),
+    "review.md": ("{finding_id}", "{review_packet_reference}"),
     "bootstrap.md": ("{origin}", "{goal}", "{hints}", "{source_path}"),
     "bootstrap_conclude.md": ("{origin}", "{goal}", "{hints}", "{source_path}"),
 }
@@ -54,6 +55,7 @@ PROMPT_REQUIRED_TOKENS_BY_GROUP: dict[str, dict[str, tuple[str, ...]]] = {
         "explore.md": ("{intent_id}",),
         "explore_conclude.md": ("{intent_id}",),
         "report_enrichment.md": ("{finding_id}", "{evidence_packet_json}"),
+        "review.md": ("{finding_id}", "{review_packet_json}"),
         "bootstrap.md": ("{origin}", "{goal}", "{hints}"),
         "bootstrap_conclude.md": ("{origin}", "{goal}", "{hints}"),
     }
@@ -65,6 +67,7 @@ MOCK_ALLOWED_OUTCOMES: dict[str, frozenset[str]] = {
     "explore_execute": frozenset({"fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
     "explore_conclude": frozenset({"fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
     "report_enrichment": frozenset({"complete", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
+    "review": frozenset({"confirmed", "rejected", "needs_more_evidence", "model_rejected", "invalid_json", "invalid_payload", "command_fail"}),
     "bootstrap": frozenset({"complete", "fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
     "bootstrap_conclude": frozenset({"fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
 }
@@ -116,6 +119,18 @@ MOCK_DEFAULT_BEHAVIOR: dict[str, dict[str, Any]] = {
             "command_fail": "0.0",
         },
     },
+    "review": {
+        "delay": [0.05, 0.3],
+        "outcomes": {
+            "confirmed": "1.0",
+            "rejected": "0.0",
+            "needs_more_evidence": "0.0",
+            "model_rejected": "0.0",
+            "invalid_json": "0.0",
+            "invalid_payload": "0.0",
+            "command_fail": "0.0",
+        },
+    },
     "bootstrap": {
         "delay": [0.05, 0.3],
         "outcomes": {
@@ -158,6 +173,10 @@ class ReportEnrichmentTaskConfig(BaseModel):
     timeout: int = Field(gt=0, default=120)
 
 
+class ReviewTaskConfig(BaseModel):
+    timeout: int = Field(gt=0, default=120)
+
+
 class ToolScanTaskConfig(BaseModel):
     enabled: bool = False
     auto_enqueue: bool = False
@@ -189,6 +208,7 @@ class TasksConfig(BaseModel):
     reason: ReasonTaskConfig
     explore: ExploreTaskConfig
     report_enrichment: ReportEnrichmentTaskConfig = Field(default_factory=ReportEnrichmentTaskConfig)
+    review: ReviewTaskConfig = Field(default_factory=ReviewTaskConfig)
     tool_scan: ToolScanTaskConfig = Field(default_factory=ToolScanTaskConfig)
 
 

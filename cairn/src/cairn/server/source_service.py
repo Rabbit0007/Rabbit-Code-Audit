@@ -83,6 +83,13 @@ WEB_SCRIPT_EXCLUDED_PARTS = {
 MAX_SOURCE_INDEX_CANDIDATES = 2000
 MAX_DATA_FLOW_CANDIDATES_PER_FILE = 8
 MAX_INPUT_TO_SINK_LINE_DISTANCE = 80
+MAX_SIGNAL_FRAGMENT_CHARS = 140
+MAX_AUDIT_CANDIDATE_DESCRIPTION_CHARS = 1600
+HIGH_IMPACT_RISK_SIGNAL_CATEGORIES = {
+    "文件读写/加载能力",
+    "系统进程能力",
+    "对象反序列化能力",
+}
 
 InputVariableMap = dict[str, list[int]]
 
@@ -95,6 +102,8 @@ class RiskSignal:
     line_end: int | None
     evidence: str
     source_summary: str
+    control_summary: str | None = None
+    context_summary: str | None = None
     symbol: str | None = None
 
 
@@ -113,6 +122,25 @@ INPUT_SOURCE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("Java Web 参数", re.compile(r"\b(?:getParameter|getHeader|getCookies)\s*\(|@(RequestParam|PathVariable|RequestBody)\b")),
     ("Go Web 参数", re.compile(r"\b(?:URL\.Query|FormValue|PostFormValue|Param)\s*\(")),
 )
+CONTROL_SIGNAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "会话/鉴权/权限线索",
+        re.compile(
+            r"\b(?:getSession|session\.get|isAuthenticated|authenticate|authorize|hasRole|hasPermission|"
+            r"checkRole|checkPermission|requireAuth|login|logout|jwt|token|principal|userId|roleId)\b"
+            r"|@(?:PreAuthorize|RolesAllowed|Secured)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "边界/规范化/白名单线索",
+        re.compile(
+            r"\b(?:normalize|realpath|resolve|basename|secure_filename|allowed|whitelist|blacklist|"
+            r"validate|sanitize|escape|parameter|prepared|bind|limit|size|extension|mime|contentType)\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
 INPUT_VARIABLE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\$([A-Za-z_][\w]*)\s*=\s*.*(?:\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\b|php://input)"),
     re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*.*\b(?:req|request|ctx)\.(?:query|body|params|headers|cookies)\b"),
@@ -126,8 +154,8 @@ JS_DERIVED_VARIABLE_PATTERN = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$
 PHP_DERIVED_VARIABLE_PATTERN = re.compile(r"\$([A-Za-z_][\w]*)\s*=\s*(.+)")
 SINK_PATTERNS: tuple[SinkPattern, ...] = (
     SinkPattern(
-        "SQL 注入面",
-        "SQL 查询执行",
+        "数据库执行能力",
+        "数据库查询/更新能力",
         re.compile(
             r"\b(?:mysql_query|mysqli_query|mysqli_multi_query|pg_query|sqlite_query)\s*\("
             r"|->query\s*\("
@@ -138,8 +166,8 @@ SINK_PATTERNS: tuple[SinkPattern, ...] = (
         ),
     ),
     SinkPattern(
-        "命令执行面",
-        "系统命令执行",
+        "系统进程能力",
+        "系统命令/进程调用能力",
         re.compile(
             r"\b(?:system|exec|shell_exec|passthru|popen|proc_open)\s*\("
             r"|\bchild_process\.(?:exec|execFile|spawn)\s*\("
@@ -151,8 +179,8 @@ SINK_PATTERNS: tuple[SinkPattern, ...] = (
         ),
     ),
     SinkPattern(
-        "文件/包含操作面",
-        "文件读取写入或动态包含",
+        "文件读写/加载能力",
+        "文件读写/加载能力",
         re.compile(
             r"\b(?:include|require|include_once|require_once)\s*\(?"
             r"|\b(?:file_get_contents|readfile|fopen|unlink|copy|move_uploaded_file)\s*\("
@@ -163,8 +191,8 @@ SINK_PATTERNS: tuple[SinkPattern, ...] = (
         ),
     ),
     SinkPattern(
-        "SSRF/外联请求面",
-        "服务端外联请求",
+        "服务端外联能力",
+        "服务端网络请求能力",
         re.compile(
             r"\bcurl_exec\s*\("
             r"|\bcurl_setopt\s*\([^;\n]*CURLOPT_URL"
@@ -176,8 +204,8 @@ SINK_PATTERNS: tuple[SinkPattern, ...] = (
         ),
     ),
     SinkPattern(
-        "反序列化面",
-        "不可信数据反序列化",
+        "对象反序列化能力",
+        "对象反序列化能力",
         re.compile(
             r"\bunserialize\s*\("
             r"|\bpickle\.loads\s*\("
@@ -188,8 +216,8 @@ SINK_PATTERNS: tuple[SinkPattern, ...] = (
         ),
     ),
     SinkPattern(
-        "响应输出面",
-        "未确认编码的响应输出",
+        "响应渲染输出能力",
+        "响应输出/渲染能力",
         re.compile(r"\b(?:echo|print|printf)\b|\bres\.(?:send|write|end)\s*\(|\.innerHTML\s*=", re.IGNORECASE),
     ),
 )
@@ -1147,6 +1175,7 @@ def _insert_audit_candidates_from_index(
     created_at = utcnow()
     candidates: list[tuple[object, ...]] = []
     seen: set[tuple[str, str | None, int | None, str | None]] = set()
+    existing_candidate_ids = _load_existing_index_candidate_ids(conn, snapshot_id)
 
     def add_candidate(
         *,
@@ -1159,6 +1188,7 @@ def _insert_audit_candidates_from_index(
         line_end: int | None = None,
         entry_point: str | None = None,
         symbol: str | None = None,
+        severity: str = "unknown",
     ) -> None:
         if len(candidates) >= MAX_SOURCE_INDEX_CANDIDATES:
             return
@@ -1166,7 +1196,9 @@ def _insert_audit_candidates_from_index(
         if key in seen:
             return
         seen.add(key)
-        candidate_id = _stable_candidate_id(snapshot_id, source, candidate_type, file_path, line_start, entry_point, title)
+        candidate_id = existing_candidate_ids.get(
+            (source, candidate_type, file_path, line_start, entry_point)
+        ) or _stable_candidate_id(snapshot_id, source, candidate_type, file_path, line_start, entry_point)
         status = "needs_more_evidence" if project_completed else "candidate"
         conclusion_summary = None
         evidence = None
@@ -1174,7 +1206,7 @@ def _insert_audit_candidates_from_index(
         concluded_at = None
         if project_completed:
             conclusion_summary = (
-                "项目完成后由源码索引回填该待审计面，未重新判定漏洞，"
+                "项目完成后由源码索引回填该待审计数据流，未重新判定漏洞，"
                 "仅作为后续确认覆盖线索保留。"
             )
             evidence = _candidate_backfill_evidence(file_path, line_start, description)
@@ -1187,7 +1219,7 @@ def _insert_audit_candidates_from_index(
                 snapshot_id,
                 source,
                 candidate_type,
-                "unknown",
+                severity,
                 title,
                 description,
                 file_path,
@@ -1259,38 +1291,95 @@ def _insert_audit_candidates_from_index(
         if entry_point is None and _is_web_script_candidate_path(file.path, text):
             entry_point = f"/{file.path}"
         for signal in _extract_risk_signals(text):
+            severity = _risk_signal_candidate_severity(signal)
             add_candidate(
                 source="index",
                 candidate_type="data_flow",
-                title=f"审计数据流: {signal.category} {file.path}:{signal.line_start}",
-                description=(
-                    f"源码索引发现 {file.path}:{signal.line_start} 存在 {signal.title}，"
-                    f"同时在同一文件识别到 {signal.source_summary}。"
-                    "该候选只表示需要审计，不代表已确认漏洞；请检查输入可达性、净化/参数化、"
-                    "权限控制和真实影响，并输出结构化 findings 或 candidate_conclusions。"
-                    f" 代码证据：{signal.evidence}"
-                ),
+                title=f"审计数据流: 外部输入到{signal.category} {file.path}:{signal.line_start}",
+                description=_audit_candidate_signal_description(file.path, entry_point, signal),
                 file_path=file.path,
                 line_start=signal.line_start,
                 line_end=signal.line_end,
                 entry_point=entry_point,
                 symbol=signal.symbol,
+                severity=severity,
             )
 
     if not candidates:
         return
     conn.executemany(
         """
-        INSERT OR IGNORE INTO audit_candidates (
+        INSERT INTO audit_candidates (
             id, project_id, snapshot_id, source, candidate_type, severity,
             title, description, file_path, line_start, line_end, entry_point,
             symbol, status, conclusion_summary, evidence, created_by,
             created_at, updated_at, concluded_by, concluded_at
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            severity = excluded.severity,
+            title = excluded.title,
+            description = excluded.description,
+            line_end = excluded.line_end,
+            entry_point = excluded.entry_point,
+            symbol = excluded.symbol,
+            updated_at = excluded.updated_at
         """,
         candidates,
     )
+
+
+def _load_existing_index_candidate_ids(conn, snapshot_id: str) -> dict[tuple[str, str, str | None, int | None, str | None], str]:
+    rows = conn.execute(
+        """
+        SELECT id, source, candidate_type, file_path, line_start, entry_point
+        FROM audit_candidates
+        WHERE snapshot_id = ?
+          AND source = 'index'
+        ORDER BY created_at, id
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    result: dict[tuple[str, str, str | None, int | None, str | None], str] = {}
+    for row in rows:
+        key = (row["source"], row["candidate_type"], row["file_path"], row["line_start"], row["entry_point"])
+        result.setdefault(key, row["id"])
+    return result
+
+
+def _audit_candidate_signal_description(file_path: str, entry_point: str | None, signal: RiskSignal) -> str:
+    parts = [
+        (
+            f"事实：{file_path}:{signal.line_start} 的外部输入数据流进入 `{signal.title}`。"
+        ),
+        f"入口：{entry_point or '未从索引确定具体入口'}。",
+        f"输入：{signal.source_summary}。",
+        f"能力证据：第 {signal.line_start} 行 `{signal.evidence}`。",
+    ]
+    if signal.context_summary:
+        parts.append(f"局部代码切片：{signal.context_summary}。")
+    if signal.control_summary:
+        parts.append(f"控制/校验：{signal.control_summary}。")
+    else:
+        parts.append("控制/校验：邻近片段未抽取到明显控制语句，需以 worker 源码阅读为准。")
+    if signal.category in HIGH_IMPACT_RISK_SIGNAL_CATEGORIES:
+        parts.append(
+            "高影响能力提示：请优先确认该输入是否可绕过认证/权限、是否可控路径或目标、"
+            "是否存在路径穿越/扩展名或内容边界缺失，以及写入/加载/执行结果是否能被后续入口、"
+            "模板、插件、解释器或静态资源服务触发。"
+        )
+    parts.append(
+        "该候选是数据流事实，不是漏洞类型判断；worker 需要重新阅读源码，"
+        "基于输入可达性、控制流顺序、边界校验和真实影响自行归纳漏洞类型，"
+        "并输出结构化 findings 或 candidate_conclusions。"
+    )
+    return _clip_text(" ".join(parts), MAX_AUDIT_CANDIDATE_DESCRIPTION_CHARS)
+
+
+def _risk_signal_candidate_severity(signal: RiskSignal) -> str:
+    if signal.category in HIGH_IMPACT_RISK_SIGNAL_CATEGORIES:
+        return "high"
+    return "unknown"
 
 
 def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
@@ -1604,7 +1693,7 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
 
     candidates = conn.execute(
         """
-        SELECT id, candidate_type, title, description, file_path, line_start,
+        SELECT id, candidate_type, severity, title, description, file_path, line_start,
                line_end, entry_point, symbol, business_node_id
         FROM audit_candidates
         WHERE snapshot_id = ?
@@ -1618,21 +1707,22 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
         node_id = _stable_business_id("biz", snapshot_id, "risk", candidate["id"])
         evidence = _business_evidence(candidate["file_path"], candidate["line_start"], candidate["description"])
         risk_tag = _candidate_risk_tag(candidate["title"])
+        risk_level = _candidate_business_risk_level(candidate["severity"], candidate["title"])
         _insert_business_node_seed(
             conn,
             project_id,
             snapshot_id=snapshot_id,
             node_id=node_id,
             node_type="risk",
-            title=f"待审计风险面 {candidate['title']}",
+            title=f"待审计数据流 {candidate['title']}",
             description=(
                 f"{candidate['description']} "
-                "该节点由源码索引生成，只表示需要 worker 读取源码确认，不代表已确认漏洞。"
+                "该节点由源码索引生成，只表示需要 worker 读取源码确认，不预设最终漏洞类型。"
             ),
-            risk_level="unknown",
+            risk_level=risk_level,
             review_status="unreviewed",
-            coverage_note="索引自动生成的高价值待审计风险面，需要源码证据闭环。",
-            risk_tags=[risk_tag] if risk_tag else ["待审计风险面"],
+            coverage_note="索引自动生成的高价值待审计数据流，需要源码证据闭环。",
+            risk_tags=[risk_tag] if risk_tag else ["待审计数据流"],
             evidence=evidence,
             confidence=0.72,
             created_by="source_index",
@@ -1655,7 +1745,7 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
                 from_node_id=endpoint_id,
                 to_node_id=node_id,
                 relation="risk_of",
-                description="入口关联到索引发现的待审计风险面。",
+                description="入口关联到索引发现的待审计数据流。",
                 confidence=0.7,
                 created_by="source_index",
                 now=now,
@@ -1667,7 +1757,7 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
                 from_node_id=control_id,
                 to_node_id=node_id,
                 relation="risk_of",
-                description="处理逻辑关联到索引发现的待审计风险面。",
+                description="处理逻辑关联到索引发现的待审计数据流。",
                 confidence=0.66,
                 created_by="source_index",
                 now=now,
@@ -1679,7 +1769,7 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
                 from_node_id=data_id,
                 to_node_id=node_id,
                 relation="risk_of",
-                description="数据对象关联到索引发现的待审计风险面。",
+                description="数据对象关联到索引发现的待审计数据流。",
                 confidence=0.6,
                 created_by="source_index",
                 now=now,
@@ -1806,6 +1896,15 @@ def _candidate_backfill_evidence(file_path: str | None, line_start: int | None, 
     return f"{location} {description[:500]}"
 
 
+def _clip_text(text: str, limit: int) -> str:
+    value = " ".join(text.split())
+    if len(value) <= limit:
+        return value
+    if limit <= 3:
+        return value[:limit]
+    return value[: limit - 3].rstrip() + "..."
+
+
 def _candidate_risk_tag(title: str | None) -> str | None:
     if not title:
         return None
@@ -1813,6 +1912,15 @@ def _candidate_risk_tag(title: str | None) -> str | None:
     if match:
         return match.group(1)
     return None
+
+
+def _candidate_business_risk_level(severity: str | None, title: str | None) -> str:
+    if severity in ("critical", "high"):
+        return severity
+    risk_tag = _candidate_risk_tag(title)
+    if risk_tag in HIGH_IMPACT_RISK_SIGNAL_CATEGORIES:
+        return "high"
+    return "unknown"
 
 
 def _stable_business_id(prefix: str, *parts: object) -> str:
@@ -1879,8 +1987,10 @@ def _extract_risk_signals(text: str) -> list[RiskSignal]:
                     title=sink.title,
                     line_start=lineno,
                     line_end=lineno,
-                    evidence=line[:260],
+                    evidence=_clip_text(line, MAX_SIGNAL_FRAGMENT_CHARS),
                     source_summary=_source_summary(nearby_sources or sources[:3]),
+                    control_summary=_control_summary(text, lineno),
+                    context_summary=_context_summary(text, lineno),
                     symbol=_best_input_symbol(line, lineno, input_variables),
                 )
             )
@@ -1896,7 +2006,7 @@ def _collect_input_sources(text: str) -> list[tuple[int, str]]:
         if not line or line.startswith(("//", "#")):
             continue
         if any(pattern.search(line) for _label, pattern in INPUT_SOURCE_PATTERNS):
-            sources.append((lineno, line[:180]))
+            sources.append((lineno, _clip_text(line, MAX_SIGNAL_FRAGMENT_CHARS)))
             if len(sources) >= 12:
                 break
     return sources
@@ -1982,10 +2092,41 @@ def _nearby_input_sources(sources: list[tuple[int, str]], sink_lineno: int) -> l
 
 
 def _source_summary(sources: list[tuple[int, str]]) -> str:
-    first_items = [f"第 {lineno} 行 `{line}`" for lineno, line in sources[:3]]
+    first_items = [f"第 {lineno} 行 `{_clip_text(line, MAX_SIGNAL_FRAGMENT_CHARS)}`" for lineno, line in sources[:3]]
     if len(sources) > 3:
         first_items.append(f"另有 {len(sources) - 3} 处输入读取")
     return "、".join(first_items)
+
+
+def _control_summary(text: str, sink_lineno: int) -> str | None:
+    lines = text.splitlines()
+    start = max(1, sink_lineno - 12)
+    end = min(len(lines), sink_lineno + 12)
+    items: list[str] = []
+    for lineno in range(start, end + 1):
+        stripped = lines[lineno - 1].strip()
+        if not stripped or stripped.startswith(("//", "#")):
+            continue
+        for label, pattern in CONTROL_SIGNAL_PATTERNS:
+            if pattern.search(stripped):
+                items.append(f"{label}: 第 {lineno} 行 `{_clip_text(stripped, MAX_SIGNAL_FRAGMENT_CHARS)}`")
+                break
+        if len(items) >= 3:
+            break
+    return "、".join(items) if items else None
+
+
+def _context_summary(text: str, sink_lineno: int) -> str | None:
+    lines = text.splitlines()
+    start = max(1, sink_lineno - 2)
+    end = min(len(lines), sink_lineno + 2)
+    items: list[str] = []
+    for lineno in range(start, end + 1):
+        stripped = lines[lineno - 1].strip()
+        if not stripped:
+            continue
+        items.append(f"第 {lineno} 行 `{_clip_text(stripped, MAX_SIGNAL_FRAGMENT_CHARS)}`")
+    return "、".join(items) if items else None
 
 
 def _sink_line_is_tied_to_input(line: str, lineno: int, input_variables: InputVariableMap) -> bool:

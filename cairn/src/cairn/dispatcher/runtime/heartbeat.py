@@ -86,6 +86,22 @@ class HeartbeatLease:
             interval=interval,
         )
 
+    @classmethod
+    def for_review_task(
+        cls,
+        client: CairnClient,
+        project_id: str,
+        task_id: str,
+        worker_name: str,
+        interval: int,
+    ) -> "HeartbeatLease":
+        return cls(
+            heartbeat=lambda: client.review_task_heartbeat(task_id, worker_name),
+            scope=f"project={project_id} review={task_id}",
+            worker_name=worker_name,
+            interval=interval,
+        )
+
     def start(self) -> None:
         self._thread.start()
 

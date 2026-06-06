@@ -141,6 +141,19 @@ if phase=="report_enrichment":
         print(json.dumps({"accepted":True,"data":{}}, ensure_ascii=False))
     raise SystemExit(0)
 
+if phase=="review":
+    finding_id = prompt.get("finding_id") or "finding_mock"
+    if outcome in ("confirmed", "rejected", "needs_more_evidence"):
+        print(json.dumps({"accepted":True,"data":{
+            "description": f"mock review {outcome} for {finding_id}",
+            "reviews": [{"finding_id": finding_id, "decision": outcome}]
+        }}, ensure_ascii=False))
+    elif outcome=="model_rejected":
+        print(json.dumps({"accepted":False,"reason":"mock_rejected"}, ensure_ascii=False))
+    else:
+        print(json.dumps({"accepted":True,"data":{}}, ensure_ascii=False))
+    raise SystemExit(0)
+
 if outcome=="fact":
     label = prompt.get("intent_id") or phase
     print(json.dumps({"accepted":True,"data":{"description":f"mock fact for {label}"}} , ensure_ascii=False))

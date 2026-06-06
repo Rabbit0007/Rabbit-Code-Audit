@@ -373,26 +373,6 @@ def _fallback_intents_from_graph(export_yaml: str, allowed_fact_ids: list[str], 
     intents: list[dict] = []
 
     audit_coverage = _nested_dict(graph, "audit_candidates", "coverage")
-    pending_findings = _item_list(audit_coverage.get("pending_high_findings"))
-    if pending_findings:
-        items = pending_findings[:3]
-        finding_ids = _ids(items, "finding")
-        targets = _target_summary(items)
-        intents.append(
-            {
-                "from": from_facts,
-                "description": (
-                    "复核待确认高危发现，必须先读取对应源码并输出结构化 reviews。"
-                    f" finding_ids: {', '.join(finding_ids)}。"
-                    f" source_targets: {targets}。"
-                    " 如果源码证据不足，使用 needs_more_evidence 并说明缺失证据。"
-                ),
-            }
-        )
-
-    if len(intents) >= max_intents:
-        return intents[:max_intents]
-
     business_coverage = _nested_dict(graph, "business_graph", "coverage")
     business_items = (
         _item_list(business_coverage.get("high_or_unknown_without_conclusion"))
@@ -469,10 +449,28 @@ def _ids(items: list[dict], fallback_prefix: str) -> list[str]:
 def _target_summary(items: list[dict]) -> str:
     targets: list[str] = []
     for item in items:
-        for key in ("file_path", "entry_point", "symbol", "title"):
+        matched = False
+        for key in ("file_path", "entry_point", "symbol"):
             value = item.get(key)
             text = str(value).strip() if value is not None else ""
             if text:
                 targets.append(text)
+                matched = True
                 break
+        if matched:
+            continue
+        evidence = item.get("evidence")
+        if isinstance(evidence, list):
+            for value in evidence:
+                text = str(value).strip()
+                if text:
+                    targets.append(text)
+                    matched = True
+                    break
+        if matched:
+            continue
+        title = item.get("title")
+        text = str(title).strip() if title is not None else ""
+        if text:
+            targets.append(text)
     return "; ".join(targets) if targets else "未在覆盖摘要中提供具体源码目标"

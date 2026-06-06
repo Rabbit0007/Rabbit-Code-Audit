@@ -146,6 +146,21 @@ def write_report_evidence_packet_reference(
     )
 
 
+def write_review_packet_reference(
+    container_manager: ContainerManager,
+    container_name: str,
+    review_packet_json: str,
+) -> str:
+    path = f"{GRAPH_SNAPSHOT_ROOT}/review-{uuid.uuid4().hex[:12]}/review_packet.json"
+    container_manager.write_text_file(container_name, path, review_packet_json)
+    return (
+        "The review packet JSON is stored in this file inside the current container:\n\n"
+        f"{path}\n\n"
+        "Before producing the review output, read the entire file and treat its contents "
+        "as the supplied Review packet JSON."
+    )
+
+
 def latest_ready_source_path(project: ProjectDetail) -> str | None:
     ready = [source for source in project.sources if source.status == "ready"]
     if not ready:
