@@ -96,6 +96,22 @@ class CodeRelationship(BaseModel):
     line_start: int | None = None
 
 
+class CodeCapability(BaseModel):
+    id: str
+    snapshot_id: str
+    path: str
+    symbol: str | None = None
+    category: str
+    title: str
+    line_start: int | None = None
+    line_end: int | None = None
+    evidence: str | None = None
+    risk_level: Literal["critical", "high", "medium", "low", "info", "unknown"] = "unknown"
+    risk_tags: list[str] = Field(default_factory=list)
+    confidence: float = 0.65
+    source: str = "heuristic"
+
+
 class DependencyManifest(BaseModel):
     id: str
     snapshot_id: str

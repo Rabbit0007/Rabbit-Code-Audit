@@ -16,6 +16,12 @@ HIGH_IMPACT_AUDIT_MARKERS = (
     "文件读写/加载能力",
     "系统进程能力",
     "对象反序列化能力",
+    "能力链",
+    "归档解压",
+    "文件写入",
+    "任务执行",
+    "后台任务",
+    "runner",
     "file upload",
     "upload",
     "文件上传",
@@ -766,7 +772,7 @@ def _business_node_conclusion_blocker_reason(
 
 
 def is_high_impact_audit_candidate_row(row) -> bool:
-    if row["candidate_type"] != "data_flow":
+    if row["candidate_type"] not in {"data_flow", "capability_chain"}:
         return False
     return _contains_high_impact_marker(
         row["title"],

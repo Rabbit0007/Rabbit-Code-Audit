@@ -21,6 +21,7 @@ from cairn.server.code_index import extract_code_index, is_likely_generic_web_sc
 from cairn.server import db
 from cairn.server.services import get_project_or_404, utcnow
 from cairn.server.source_models import (
+    CodeCapability,
     CodeEntrypoint,
     CodeFile,
     CodeRelationship,
@@ -85,11 +86,71 @@ MAX_DATA_FLOW_CANDIDATES_PER_FILE = 8
 MAX_INPUT_TO_SINK_LINE_DISTANCE = 80
 MAX_SIGNAL_FRAGMENT_CHARS = 140
 MAX_AUDIT_CANDIDATE_DESCRIPTION_CHARS = 1600
+MAX_CODE_CAPABILITIES_PER_FILE = 20
+MAX_CAPABILITY_CHAIN_CANDIDATES = 120
 HIGH_IMPACT_RISK_SIGNAL_CATEGORIES = {
     "文件读写/加载能力",
     "系统进程能力",
     "对象反序列化能力",
 }
+HIGH_IMPACT_CAPABILITY_CATEGORIES = {
+    "archive_extract",
+    "file_write",
+    "process_execution",
+    "task_execution",
+    "credential_access",
+}
+CAPABILITY_CATEGORY_TITLES = {
+    "archive_extract": "归档解压/展开能力",
+    "file_read": "文件读取能力",
+    "file_write": "文件写入/删除能力",
+    "process_execution": "系统进程/命令执行能力",
+    "task_execution": "后台任务/Runner 执行能力",
+    "template_render": "模板/YAML/解释器能力",
+    "credential_access": "凭据/令牌访问能力",
+    "websocket_boundary": "WebSocket/长连接边界",
+    "object_id_lookup": "对象 ID 查询/资源定位能力",
+}
+CAPABILITY_TAGS_BY_CATEGORY = {
+    "archive_extract": ["文件能力", "归档展开"],
+    "file_read": ["文件能力", "读取"],
+    "file_write": ["文件能力", "写入"],
+    "process_execution": ["执行能力", "进程"],
+    "task_execution": ["执行能力", "后台任务"],
+    "template_render": ["解释器能力", "模板"],
+    "credential_access": ["敏感资产", "凭据"],
+    "websocket_boundary": ["入口边界", "长连接"],
+    "object_id_lookup": ["对象边界", "资源定位"],
+}
+CONTROL_PLANE_KEYWORDS = (
+    "admin",
+    "ops",
+    "operation",
+    "playbook",
+    "ansible",
+    "celery",
+    "task",
+    "job",
+    "runner",
+    "terminal",
+    "command",
+    "asset",
+    "credential",
+    "secret",
+    "token",
+    "ldap",
+    "k8s",
+    "kubernetes",
+    "websocket",
+    "upload",
+    "import",
+    "plugin",
+    "automation",
+)
+UPLOAD_CONTEXT_RE = re.compile(
+    r"\b(?:upload|multipart|form-data|request\.FILES|files\[|serializer\.save|UploadedFile|move_uploaded_file|saveMultipartFile)\b",
+    re.IGNORECASE,
+)
 
 InputVariableMap = dict[str, list[int]]
 
@@ -105,6 +166,23 @@ class RiskSignal:
     control_summary: str | None = None
     context_summary: str | None = None
     symbol: str | None = None
+
+
+@dataclass(frozen=True)
+class CodeCapabilityFact:
+    id: str
+    snapshot_id: str
+    path: str
+    symbol: str | None
+    category: str
+    title: str
+    line_start: int
+    line_end: int | None
+    evidence: str
+    risk_level: str
+    risk_tags: tuple[str, ...]
+    confidence: float = 0.65
+    source: str = "heuristic:capability"
 
 
 @dataclass(frozen=True)
@@ -219,6 +297,90 @@ SINK_PATTERNS: tuple[SinkPattern, ...] = (
         "响应渲染输出能力",
         "响应输出/渲染能力",
         re.compile(r"\b(?:echo|print|printf)\b|\bres\.(?:send|write|end)\s*\(|\.innerHTML\s*=", re.IGNORECASE),
+    ),
+)
+CAPABILITY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "archive_extract",
+        re.compile(
+            r"\bzipfile\.ZipFile\b|\.extract(?:all)?\s*\(|\bZipArchive\b|->extractTo\s*\("
+            r"|\b(?:ZipInputStream|ArchiveInputStream|TarArchiveInputStream)\b"
+            r"|\b(?:adm-zip|unzipper|decompress|extract-zip)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "file_write",
+        re.compile(
+            r"\bopen\s*\([^;\n]*(?:['\"][wax]\+?['\"]|mode\s*=\s*['\"][wax]\+?['\"])"
+            r"|\b(?:os\.(?:rename|remove|unlink)|shutil\.rmtree|Path\([^)]*\)\.write_text|Path\([^)]*\)\.write_bytes)\s*\("
+            r"|\b(?:file_put_contents|move_uploaded_file|unlink|rename|copy)\s*\("
+            r"|\bfs\.(?:writeFile|unlink|rm|rename|createWriteStream)\s*\("
+            r"|\b(?:os|ioutil)\.WriteFile\s*\(|\bFiles\.(?:write|delete|move)\s*\("
+            r"|\bFileOutputStream\s*\(",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "file_read",
+        re.compile(
+            r"\bopen\s*\([^;\n]*(?:['\"]r\+?['\"]|mode\s*=\s*['\"]r\+?['\"])"
+            r"|\b(?:Path\([^)]*\)\.read_text|Path\([^)]*\)\.read_bytes)\s*\("
+            r"|\b(?:file_get_contents|readfile|fopen)\s*\("
+            r"|\bfs\.(?:readFile|createReadStream)\s*\("
+            r"|\b(?:os|ioutil)\.ReadFile\s*\(|\bFiles\.(?:readString|readAllBytes|lines)\s*\("
+            r"|\bFileInputStream\s*\(",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "process_execution",
+        re.compile(
+            r"\b(?:subprocess\.(?:Popen|run|call|check_output)|os\.system)\s*\("
+            r"|\b(?:system|exec|shell_exec|passthru|popen|proc_open)\s*\("
+            r"|\bchild_process\.(?:exec|execFile|spawn)\s*\("
+            r"|\bRuntime\.getRuntime\(\)\.exec\s*\(|\bProcessBuilder\s*\("
+            r"|\bexec\.Command\s*\(|\bCommand::new\s*\(",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "task_execution",
+        re.compile(
+            r"\b(?:Celery|shared_task|AsyncResult)\b|\.apply_async\s*\(|\.delay\s*\("
+            r"|\b[A-Za-z_][\w]*Runner\s*\(|\brunner\.(?:run|start)\s*\("
+            r"|\b(?:queue|dispatch|enqueue|schedule)\s*\(",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "template_render",
+        re.compile(
+            r"\b(?:jinja2?|Template|render_template|render_to_string)\b"
+            r"|\byaml\.(?:load|safe_load)\s*\(|\bunserialize\s*\(|\bpickle\.loads\s*\("
+            r"|\bObjectInputStream\b|\breadObject\s*\(",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "credential_access",
+        re.compile(
+            r"\b(?:secret|token|credential|password|passwd|private_key|access_key|api_key|session_key)\b"
+            r"|settings\.[A-Z_]*(?:SECRET|TOKEN|KEY|PASSWORD)[A-Z_]*",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "websocket_boundary",
+        re.compile(r"\b(?:websocket|WebSocket|AsyncWebsocketConsumer|SocketHandler|ws://|wss://)\b", re.IGNORECASE),
+    ),
+    (
+        "object_id_lookup",
+        re.compile(
+            r"\bget_object_or_404\s*\(|\.objects\.(?:get|filter)\s*\([^;\n]*(?:id|pk)\s*="
+            r"|\bfindById\s*\(|\bfind_by_id\s*\(|\bwhere\s*\([^;\n]*(?:id|pk)",
+            re.IGNORECASE,
+        ),
     ),
 )
 
@@ -748,6 +910,42 @@ def list_code_relationships(project_id: str, snapshot_id: str, limit: int = 1000
     return [CodeRelationship(**dict(row)) for row in rows]
 
 
+def list_code_capabilities(project_id: str, snapshot_id: str, limit: int = 1000) -> list[CodeCapability]:
+    snapshot = get_snapshot(project_id, snapshot_id)
+    _ensure_code_index(snapshot)
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM code_capabilities
+            WHERE snapshot_id = ?
+            ORDER BY
+                CASE risk_level
+                    WHEN 'critical' THEN 0
+                    WHEN 'high' THEN 1
+                    WHEN 'medium' THEN 2
+                    WHEN 'unknown' THEN 3
+                    WHEN 'low' THEN 4
+                    ELSE 5
+                END,
+                path,
+                COALESCE(line_start, 0),
+                category
+            LIMIT ?
+            """,
+            (snapshot_id, limit),
+        ).fetchall()
+    return [
+        CodeCapability(
+            **{
+                **dict(row),
+                "risk_tags": _decode_json_list(row["risk_tags_json"]),
+            }
+        )
+        for row in rows
+    ]
+
+
 def list_dependency_manifests(project_id: str, snapshot_id: str, limit: int = 1000) -> list[DependencyManifest]:
     snapshot = get_snapshot(project_id, snapshot_id)
     _ensure_code_index(snapshot)
@@ -791,6 +989,7 @@ def rebuild_source_index(snapshot_id: str) -> SourceIndexSummary:
         code_index = extract_code_index(snapshot_id, root, files)
         _clear_source_index_for_rebuild(conn, project_id, snapshot_id)
         _insert_code_index(conn, code_index)
+        _insert_code_capabilities(conn, snapshot_id, files, root=root, code_index=code_index)
         _insert_audit_candidates_from_index(conn, snapshot_id, files, code_index, root=root)
         _ensure_business_graph_seed(conn, snapshot_id)
     return get_source_index_summary(project_id, snapshot_id)
@@ -839,7 +1038,7 @@ def _clear_source_index_for_rebuild(conn, project_id: str, snapshot_id: str) -> 
             (project_id,),
         ).fetchall()
     )
-    for table in ("code_relationships", "code_symbols", "code_entrypoints", "dependency_manifests"):
+    for table in ("code_relationships", "code_symbols", "code_entrypoints", "code_capabilities", "dependency_manifests"):
         conn.execute(f"DELETE FROM {table} WHERE snapshot_id = ?", (snapshot_id,))
     conn.execute(
         """
@@ -1019,6 +1218,7 @@ def _finalize_snapshot(
             ],
         )
         _insert_code_index(conn, code_index)
+        _insert_code_capabilities(conn, snapshot_id, files, root=snapshot_path(snapshot_id), code_index=code_index)
         _insert_audit_candidates_from_index(conn, snapshot_id, files, code_index, root=snapshot_path(snapshot_id))
         _ensure_business_graph_seed(conn, snapshot_id)
         conn.execute(
@@ -1149,6 +1349,109 @@ def _insert_code_index(conn, code_index) -> None:
             for item in code_index.manifests
         ],
     )
+
+
+def _insert_code_capabilities(
+    conn,
+    snapshot_id: str,
+    files: list[CodeFile],
+    *,
+    root: Path,
+    code_index,
+) -> None:
+    facts = _extract_code_capabilities(snapshot_id, files, root=root, code_index=code_index)
+    if not facts:
+        return
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO code_capabilities (
+            id, snapshot_id, path, symbol, category, title, line_start, line_end,
+            evidence, risk_level, risk_tags_json, confidence, source
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                item.id,
+                item.snapshot_id,
+                item.path,
+                item.symbol,
+                item.category,
+                item.title,
+                item.line_start,
+                item.line_end,
+                item.evidence,
+                item.risk_level,
+                json.dumps(list(item.risk_tags), ensure_ascii=False),
+                item.confidence,
+                item.source,
+            )
+            for item in facts
+        ],
+    )
+
+
+def _extract_code_capabilities(
+    snapshot_id: str,
+    files: list[CodeFile],
+    *,
+    root: Path,
+    code_index,
+) -> list[CodeCapabilityFact]:
+    symbols_by_path: dict[str, list] = {}
+    for symbol in code_index.symbols:
+        symbols_by_path.setdefault(symbol.path, []).append(symbol)
+    reachable_entrypoints = _entrypoint_labels_by_target_path(code_index)
+    facts: list[CodeCapabilityFact] = []
+    seen: set[tuple[str, str, int, str]] = set()
+    for file in files:
+        if file.is_binary or not _is_candidate_source_path(file.path):
+            continue
+        text = _read_candidate_text(root / file.path)
+        if text is None:
+            continue
+        file_count = 0
+        lines = text.splitlines()
+        for lineno, raw_line in enumerate(lines, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith(("//", "#")):
+                continue
+            for category, pattern in CAPABILITY_PATTERNS:
+                if not pattern.search(line):
+                    continue
+                key = (file.path, category, lineno, line[:120])
+                if key in seen:
+                    continue
+                seen.add(key)
+                symbol = _symbol_for_line(symbols_by_path.get(file.path, []), lineno)
+                context = _context_window(lines, lineno, radius=4)
+                reachable = reachable_entrypoints.get(file.path, [])
+                tags = _capability_risk_tags(file.path, category, line, context, reachable)
+                risk_level = _capability_risk_level(category, file.path, line, context, tags, reachable)
+                confidence = _capability_confidence(category, tags, reachable)
+                title = CAPABILITY_CATEGORY_TITLES.get(category, category)
+                facts.append(
+                    CodeCapabilityFact(
+                        id=_stable_business_id("cap", snapshot_id, file.path, category, lineno, line),
+                        snapshot_id=snapshot_id,
+                        path=file.path,
+                        symbol=symbol,
+                        category=category,
+                        title=title,
+                        line_start=lineno,
+                        line_end=lineno,
+                        evidence=_clip_text(line, MAX_SIGNAL_FRAGMENT_CHARS),
+                        risk_level=risk_level,
+                        risk_tags=tuple(tags),
+                        confidence=confidence,
+                    )
+                )
+                file_count += 1
+                if file_count >= MAX_CODE_CAPABILITIES_PER_FILE:
+                    break
+            if file_count >= MAX_CODE_CAPABILITIES_PER_FILE:
+                break
+    return facts
 
 
 def _insert_audit_candidates_from_index(
@@ -1305,6 +1608,42 @@ def _insert_audit_candidates_from_index(
                 severity=severity,
             )
 
+    reachable_entrypoints = _entrypoint_labels_by_target_path(code_index)
+    capability_rows = conn.execute(
+        """
+        SELECT *
+        FROM code_capabilities
+        WHERE snapshot_id = ?
+          AND risk_level IN ('critical', 'high')
+        ORDER BY
+            CASE risk_level WHEN 'critical' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
+            path,
+            COALESCE(line_start, 0),
+            category
+        LIMIT ?
+        """,
+        (snapshot_id, MAX_CAPABILITY_CHAIN_CANDIDATES),
+    ).fetchall()
+    for capability in capability_rows:
+        tags = _decode_json_list(capability["risk_tags_json"])
+        entrypoints = reachable_entrypoints.get(capability["path"], [])
+        entry_point = entrypoints[0] if entrypoints else None
+        add_candidate(
+            source="index",
+            candidate_type="capability_chain",
+            title=(
+                f"审计能力链: {capability['title']} "
+                f"{capability['path']}:{capability['line_start']}"
+            ),
+            description=_capability_chain_candidate_description(capability, tags, entrypoints),
+            file_path=capability["path"],
+            line_start=capability["line_start"],
+            line_end=capability["line_end"],
+            entry_point=entry_point,
+            symbol=capability["symbol"],
+            severity=capability["risk_level"],
+        )
+
     if not candidates:
         return
     conn.executemany(
@@ -1376,10 +1715,154 @@ def _audit_candidate_signal_description(file_path: str, entry_point: str | None,
     return _clip_text(" ".join(parts), MAX_AUDIT_CANDIDATE_DESCRIPTION_CHARS)
 
 
+def _capability_chain_candidate_description(capability, tags: list[str], entrypoints: list[str]) -> str:
+    location = f"{capability['path']}:{capability['line_start']}"
+    parts = [
+        f"事实：{location} 存在 `{capability['title']}`。",
+        f"能力证据：`{capability['evidence'] or '未提供'}`。",
+        f"入口可达：{'; '.join(entrypoints[:5]) if entrypoints else '索引未直接确定入口，需要先从路由、调用关系或任务入口定位可达性'}。",
+        f"风险标签：{', '.join(tags[:8]) if tags else '未标注'}。",
+        "审计要求：不得仅确认路由或能力调用存在；必须读取实现链、认证/权限、对象查询、路径/内容控制、落盘位置和后续加载/执行点。",
+        "该候选是源码能力链事实，不是漏洞类型判断；worker 需要基于可达性、控制边界和真实影响自行归纳漏洞类型，并输出 findings 或 candidate_conclusions。",
+    ]
+    return _clip_text(" ".join(parts), MAX_AUDIT_CANDIDATE_DESCRIPTION_CHARS)
+
+
 def _risk_signal_candidate_severity(signal: RiskSignal) -> str:
     if signal.category in HIGH_IMPACT_RISK_SIGNAL_CATEGORIES:
         return "high"
     return "unknown"
+
+
+def _entrypoint_labels_by_target_path(code_index) -> dict[str, list[str]]:
+    labels_by_source: dict[tuple[str, str], str] = {}
+    labels_by_path: dict[str, list[str]] = {}
+    adjacency: dict[str, set[str]] = {}
+    for entrypoint in code_index.entrypoints:
+        label = _entrypoint_label(entrypoint.method, entrypoint.route)
+        labels_by_source[(entrypoint.path, label)] = label
+        labels_by_path.setdefault(entrypoint.path, [])
+        if label not in labels_by_path[entrypoint.path]:
+            labels_by_path[entrypoint.path].append(label)
+    for relationship in code_index.relationships:
+        if relationship.relation not in {"calls", "imports", "uses"}:
+            continue
+        adjacency.setdefault(relationship.from_path, set()).add(relationship.to_path)
+    for entrypoint in code_index.entrypoints:
+        label = _entrypoint_label(entrypoint.method, entrypoint.route)
+        seen = {entrypoint.path}
+        frontier = [(entrypoint.path, 0)]
+        while frontier:
+            path, depth = frontier.pop(0)
+            labels = labels_by_path.setdefault(path, [])
+            if label not in labels:
+                labels.append(label)
+            if depth >= 3:
+                continue
+            for next_path in sorted(adjacency.get(path, set())):
+                if next_path in seen:
+                    continue
+                seen.add(next_path)
+                frontier.append((next_path, depth + 1))
+    return labels_by_path
+
+
+def _symbol_for_line(symbols: list, lineno: int) -> str | None:
+    containing = [
+        symbol
+        for symbol in symbols
+        if symbol.line_start is not None
+        and symbol.line_start <= lineno
+        and (symbol.line_end is None or lineno <= symbol.line_end)
+    ]
+    if containing:
+        containing.sort(key=lambda item: (item.line_end or lineno) - (item.line_start or lineno))
+        return containing[0].name
+    before = [symbol for symbol in symbols if symbol.line_start is not None and symbol.line_start <= lineno]
+    if before:
+        before.sort(key=lambda item: item.line_start or 0, reverse=True)
+        return before[0].name
+    return None
+
+
+def _context_window(lines: list[str], lineno: int, *, radius: int = 4) -> str:
+    start = max(1, lineno - radius)
+    end = min(len(lines), lineno + radius)
+    return "\n".join(lines[index - 1] for index in range(start, end + 1))
+
+
+def _capability_risk_tags(
+    path: str,
+    category: str,
+    evidence: str,
+    context: str,
+    reachable_entrypoints: list[str],
+) -> list[str]:
+    tags: list[str] = []
+    for tag in CAPABILITY_TAGS_BY_CATEGORY.get(category, []):
+        _append_unique(tags, tag)
+    haystack = f"{path}\n{evidence}\n{context}\n{' '.join(reachable_entrypoints)}"
+    lower = haystack.lower()
+    if any(keyword in lower for keyword in CONTROL_PLANE_KEYWORDS):
+        _append_unique(tags, "控制面")
+    if reachable_entrypoints:
+        _append_unique(tags, "入口可达")
+    if UPLOAD_CONTEXT_RE.search(haystack):
+        _append_unique(tags, "上传持久化")
+    if re.search(r"\b(?:rbac|permission|authorize|auth|role|policy|is_authenticated)\b", haystack, re.IGNORECASE):
+        _append_unique(tags, "权限边界")
+    if re.search(r"\b(?:id|pk|uuid|object_id|resource_id)\b", haystack, re.IGNORECASE):
+        _append_unique(tags, "对象边界")
+    return tags
+
+
+def _capability_risk_level(
+    category: str,
+    path: str,
+    evidence: str,
+    context: str,
+    tags: list[str],
+    reachable_entrypoints: list[str],
+) -> str:
+    high_context = bool(
+        {"控制面", "上传持久化", "入口可达", "权限边界"} & set(tags)
+    )
+    if category in {"process_execution", "task_execution"}:
+        return "high"
+    if category == "archive_extract":
+        return "high" if high_context else "medium"
+    if category == "file_write":
+        return "high" if high_context else "medium"
+    if category == "credential_access":
+        secret_context = re.search(
+            r"\b(?:secret|token|credential|private_key|access_key|api_key|session_key)\b|settings\.",
+            f"{path}\n{evidence}\n{context}",
+            re.IGNORECASE,
+        )
+        return "high" if secret_context and ("控制面" in tags or reachable_entrypoints) else "medium"
+    if category == "file_read":
+        return "high" if {"控制面", "入口可达", "对象边界"} <= set(tags) else "medium"
+    if category in {"template_render", "websocket_boundary"}:
+        return "high" if high_context else "medium"
+    if category == "object_id_lookup":
+        return "medium" if reachable_entrypoints or "控制面" in tags else "unknown"
+    return "unknown"
+
+
+def _capability_confidence(category: str, tags: list[str], reachable_entrypoints: list[str]) -> float:
+    confidence = 0.66
+    if category in HIGH_IMPACT_CAPABILITY_CATEGORIES:
+        confidence += 0.05
+    if "入口可达" in tags or reachable_entrypoints:
+        confidence += 0.08
+    if "上传持久化" in tags or "控制面" in tags:
+        confidence += 0.06
+    return min(0.88, confidence)
+
+
+def _append_unique(items: list[str], value: str) -> None:
+    if value and value not in items:
+        items.append(value)
 
 
 def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
@@ -1427,7 +1910,6 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
         """,
         (snapshot_id,),
     ).fetchall()
-
     def ensure_feature(entrypoint) -> str | None:
         feature_key = _route_feature_key(entrypoint["route"])
         if feature_key is None:
@@ -1698,7 +2180,7 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
         FROM audit_candidates
         WHERE snapshot_id = ?
           AND source = 'index'
-          AND candidate_type = 'data_flow'
+          AND candidate_type IN ('data_flow', 'capability_chain')
         ORDER BY created_at, id
         """,
         (snapshot_id,),
@@ -1706,23 +2188,24 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
     for candidate in candidates:
         node_id = _stable_business_id("biz", snapshot_id, "risk", candidate["id"])
         evidence = _business_evidence(candidate["file_path"], candidate["line_start"], candidate["description"])
-        risk_tag = _candidate_risk_tag(candidate["title"])
+        risk_tag = _candidate_risk_tag(candidate["title"]) or _candidate_capability_risk_tag(candidate["title"])
         risk_level = _candidate_business_risk_level(candidate["severity"], candidate["title"])
+        node_title_prefix = "待审计能力链" if candidate["candidate_type"] == "capability_chain" else "待审计数据流"
         _insert_business_node_seed(
             conn,
             project_id,
             snapshot_id=snapshot_id,
             node_id=node_id,
             node_type="risk",
-            title=f"待审计数据流 {candidate['title']}",
+            title=f"{node_title_prefix} {candidate['title']}",
             description=(
                 f"{candidate['description']} "
                 "该节点由源码索引生成，只表示需要 worker 读取源码确认，不预设最终漏洞类型。"
             ),
             risk_level=risk_level,
             review_status="unreviewed",
-            coverage_note="索引自动生成的高价值待审计数据流，需要源码证据闭环。",
-            risk_tags=[risk_tag] if risk_tag else ["待审计数据流"],
+            coverage_note=f"索引自动生成的高价值{node_title_prefix[3:]}，需要源码证据闭环。",
+            risk_tags=[risk_tag] if risk_tag else [node_title_prefix],
             evidence=evidence,
             confidence=0.72,
             created_by="source_index",
@@ -1914,12 +2397,23 @@ def _candidate_risk_tag(title: str | None) -> str | None:
     return None
 
 
+def _candidate_capability_risk_tag(title: str | None) -> str | None:
+    if not title:
+        return None
+    match = re.search(r"审计能力链:\s*([^\s]+)", title)
+    if match:
+        return match.group(1)
+    return None
+
+
 def _candidate_business_risk_level(severity: str | None, title: str | None) -> str:
     if severity in ("critical", "high"):
         return severity
     risk_tag = _candidate_risk_tag(title)
     if risk_tag in HIGH_IMPACT_RISK_SIGNAL_CATEGORIES:
         return "high"
+    if _candidate_capability_risk_tag(title):
+        return "high" if severity == "high" else "unknown"
     return "unknown"
 
 
@@ -2166,14 +2660,50 @@ def _ensure_code_index(snapshot: SourceSnapshot) -> None:
             (snapshot.id, snapshot.id, snapshot.id),
         ).fetchone()["count"]
         if existing:
+            _ensure_snapshot_capabilities(conn, snapshot, root)
             _ensure_snapshot_audit_candidates(conn, snapshot, root)
             _ensure_business_graph_seed(conn, snapshot.id)
             return
         files = _load_code_files(conn, snapshot.id)
         code_index = extract_code_index(snapshot.id, root, files)
         _insert_code_index(conn, code_index)
+        _insert_code_capabilities(conn, snapshot.id, files, root=root, code_index=code_index)
         _insert_audit_candidates_from_index(conn, snapshot.id, files, code_index, root=root)
         _ensure_business_graph_seed(conn, snapshot.id)
+
+
+def _ensure_snapshot_capabilities(conn, snapshot: SourceSnapshot, root: Path) -> None:
+    existing = conn.execute(
+        "SELECT COUNT(*) AS count FROM code_capabilities WHERE snapshot_id = ?",
+        (snapshot.id,),
+    ).fetchone()["count"]
+    capability_candidates = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM audit_candidates
+        WHERE snapshot_id = ?
+          AND source = 'index'
+          AND candidate_type = 'capability_chain'
+        """,
+        (snapshot.id,),
+    ).fetchone()["count"]
+    high_capabilities = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM code_capabilities
+        WHERE snapshot_id = ?
+          AND risk_level IN ('critical', 'high')
+        """,
+        (snapshot.id,),
+    ).fetchone()["count"]
+    if existing and (capability_candidates or not high_capabilities):
+        return
+    files = _load_code_files(conn, snapshot.id)
+    code_index = extract_code_index(snapshot.id, root, files)
+    if not existing:
+        _insert_code_capabilities(conn, snapshot.id, files, root=root, code_index=code_index)
+    if not capability_candidates:
+        _insert_audit_candidates_from_index(conn, snapshot.id, files, code_index, root=root)
 
 
 def _ensure_snapshot_audit_candidates(conn, snapshot: SourceSnapshot, root: Path) -> None:
@@ -2185,6 +2715,7 @@ def _ensure_snapshot_audit_candidates(conn, snapshot: SourceSnapshot, root: Path
         return
     files = _load_code_files(conn, snapshot.id)
     code_index = extract_code_index(snapshot.id, root, files)
+    _insert_code_capabilities(conn, snapshot.id, files, root=root, code_index=code_index)
     _insert_audit_candidates_from_index(conn, snapshot.id, files, code_index, root=root)
     _ensure_business_graph_seed(conn, snapshot.id)
 

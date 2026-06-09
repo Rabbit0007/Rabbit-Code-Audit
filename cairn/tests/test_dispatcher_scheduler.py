@@ -193,6 +193,37 @@ business_graph:
     assert "biz_1" in intents[0]["description"]
 
 
+def test_reason_parse_fallback_prioritizes_high_risk_unresolved_candidates():
+    intents = _fallback_intents_from_graph(
+        """
+audit_candidates:
+  coverage:
+    high_risk_unresolved:
+      - id: cand_capability
+        candidate_type: capability_chain
+        title: "审计能力链: 归档解压/展开能力 apps/ops/api/playbook.py:14"
+        file_path: apps/ops/api/playbook.py
+        line_start: 14
+        entry_point: /playbook/<uuid:pk>/file/
+    open_required:
+      - id: cand_generic
+        title: generic route
+        file_path: urls.py
+business_graph:
+  coverage:
+    total_nodes: 0
+""",
+        ["origin", "f001"],
+        max_intents=1,
+    )
+
+    assert len(intents) == 1
+    assert "cand_capability" in intents[0]["description"]
+    assert "cand_generic" not in intents[0]["description"]
+    assert "不得仅确认路由" in intents[0]["description"]
+    assert "apps/ops/api/playbook.py" in intents[0]["description"]
+
+
 def test_report_rate_limit_cooldown_blocks_only_that_task_type():
     loop = _scheduler_loop()
     loop.futures = {}

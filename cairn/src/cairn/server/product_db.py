@@ -233,6 +233,28 @@ CREATE INDEX IF NOT EXISTS idx_code_relationships_snapshot
 CREATE INDEX IF NOT EXISTS idx_code_relationships_target
     ON code_relationships(snapshot_id, to_path, relation);
 
+CREATE TABLE IF NOT EXISTS code_capabilities (
+    id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    symbol TEXT,
+    category TEXT NOT NULL,
+    title TEXT NOT NULL,
+    line_start INTEGER,
+    line_end INTEGER,
+    evidence TEXT,
+    risk_level TEXT NOT NULL DEFAULT 'unknown'
+        CHECK(risk_level IN ('critical', 'high', 'medium', 'low', 'info', 'unknown')),
+    risk_tags_json TEXT NOT NULL DEFAULT '[]',
+    confidence REAL NOT NULL DEFAULT 0.65,
+    source TEXT NOT NULL DEFAULT 'heuristic'
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_capabilities_snapshot
+    ON code_capabilities(snapshot_id, path, category);
+CREATE INDEX IF NOT EXISTS idx_code_capabilities_risk
+    ON code_capabilities(snapshot_id, risk_level, category);
+
 CREATE TABLE IF NOT EXISTS dependency_manifests (
     id TEXT PRIMARY KEY,
     snapshot_id TEXT NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
@@ -536,6 +558,14 @@ CODE_ENTRYPOINT_COLUMNS: dict[str, str] = {
     "source": "TEXT NOT NULL DEFAULT 'heuristic'",
 }
 
+CODE_CAPABILITY_COLUMNS: dict[str, str] = {
+    "symbol": "TEXT",
+    "line_end": "INTEGER",
+    "risk_tags_json": "TEXT NOT NULL DEFAULT '[]'",
+    "confidence": "REAL NOT NULL DEFAULT 0.65",
+    "source": "TEXT NOT NULL DEFAULT 'heuristic'",
+}
+
 WORKER_TASK_HISTORY_COLUMNS: dict[str, str] = {
     "error_type": "TEXT",
     "error_detail": "TEXT",
@@ -597,6 +627,7 @@ def configure_product_db() -> None:
         _ensure_columns(conn, "business_edges", BUSINESS_EDGE_COLUMNS)
         _ensure_columns(conn, "code_symbols", CODE_SYMBOL_COLUMNS)
         _ensure_columns(conn, "code_entrypoints", CODE_ENTRYPOINT_COLUMNS)
+        _ensure_columns(conn, "code_capabilities", CODE_CAPABILITY_COLUMNS)
         _ensure_columns(conn, "worker_task_history", WORKER_TASK_HISTORY_COLUMNS)
         _ensure_columns(conn, "report_enrichment_tasks", REPORT_ENRICHMENT_COLUMNS)
         _ensure_columns(conn, "review_tasks", REVIEW_TASK_COLUMNS)

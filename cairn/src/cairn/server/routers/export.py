@@ -17,6 +17,7 @@ from cairn.server.services import (
 from cairn.server.source_service import list_snapshots, snapshot_container_path
 from cairn.server.source_service import (
     get_source_index_summary,
+    list_code_capabilities,
     list_code_entrypoints,
     list_code_files,
     list_code_relationships,
@@ -415,6 +416,7 @@ def _load_audit_candidates(
     by_status: dict[str, int] = {}
     by_severity: dict[str, int] = {}
     open_required: list[dict] = []
+    high_risk_unresolved: list[dict] = []
     invalid_conclusions: list[dict] = []
     for row in rows:
         by_status[row["status"]] = by_status.get(row["status"], 0) + 1
@@ -422,6 +424,8 @@ def _load_audit_candidates(
         is_required = row["severity"] in ("critical", "high", "unknown")
         if is_required and row["status"] in ("candidate", "investigating"):
             open_required.append(_audit_candidate_export_row(row))
+        if _is_high_risk_unresolved_candidate(row):
+            high_risk_unresolved.append(_audit_candidate_export_row(row))
         reason = _audit_candidate_conclusion_blocker_reason(row)
         if is_required and reason is not None:
             item = _audit_candidate_export_row(row)
@@ -439,6 +443,7 @@ def _load_audit_candidates(
             "by_status": by_status,
             "by_severity": by_severity,
             "open_required": open_required[:200],
+            "high_risk_unresolved": high_risk_unresolved[:200],
             "invalid_conclusions": invalid_conclusions[:200],
             "pending_high_findings": [dict(row) for row in pending_high_findings],
         },
@@ -497,6 +502,18 @@ def _select_audit_candidate_rows(rows, *, profile: str, focus_candidate_ids: set
         if len(selected) >= REASON_CANDIDATE_LIMIT:
             break
     return selected
+
+
+def _is_high_risk_unresolved_candidate(row) -> bool:
+    if row["candidate_type"] not in {"data_flow", "capability_chain"}:
+        return False
+    if row["severity"] not in ("critical", "high", "unknown"):
+        return False
+    if row["status"] in ("candidate", "investigating"):
+        return is_high_impact_audit_candidate_row(row) or row["candidate_type"] == "capability_chain"
+    if row["status"] == "needs_more_evidence":
+        return _audit_candidate_conclusion_blocker_reason(row) is not None
+    return False
 
 
 def _audit_candidate_conclusion_blocker_reason(row) -> str | None:
@@ -611,6 +628,7 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
             index_limit = _code_index_limit(profile)
             entrypoints = list_code_entrypoints(project_id, ready_source.id, limit=index_limit)
             relationships = list_code_relationships(project_id, ready_source.id, limit=index_limit)
+            capabilities = list_code_capabilities(project_id, ready_source.id, limit=index_limit)
             manifests = list_dependency_manifests(project_id, ready_source.id, limit=index_limit)
             symbols = list_code_symbols(project_id, ready_source.id, limit=index_limit)
             data["code_index"] = {
@@ -620,11 +638,13 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
                     "limit": index_limit,
                     "entrypoints_included": len(entrypoints),
                     "relationships_included": len(relationships),
+                    "capabilities_included": len(capabilities),
                     "symbols_included": len(symbols),
                     "manifests_included": len(manifests),
                 },
                 "entrypoints": [item.model_dump() for item in entrypoints],
                 "relationships": [item.model_dump() for item in relationships],
+                "capabilities": [item.model_dump() for item in capabilities],
                 "dependency_manifests": [item.model_dump() for item in manifests],
                 "symbols_sample": [item.model_dump() for item in symbols],
             }

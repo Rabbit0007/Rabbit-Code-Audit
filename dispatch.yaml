@@ -1,4 +1,4 @@
-server: http://127.0.0.1:8765
+server: http://rabbit-audit-server:8000
 runtime:
   max_workers: 8
   max_running_projects: 3
@@ -27,9 +27,11 @@ tasks:
     tools: []
     max_running: 1
 container:
-  image: rabbit-code-audit-worker:latest
-  network_mode: bridge
+  image: rabbit-code-audit-worker:audit
+  network_mode: rabbit-audit-net
   completed_action: stop
+  name_prefix: rabbit-audit-dispatch-
+  startup_name_prefix: rabbit-audit-startup-healthcheck-
   cap_add: []
   artifact_volume: null
   artifact_host_path: /Users/rabbit/.rabbit-code-audit-preview

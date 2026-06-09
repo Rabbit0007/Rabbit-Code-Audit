@@ -400,7 +400,8 @@ def _fallback_intents_from_graph(export_yaml: str, allowed_fact_ids: list[str], 
         return intents[:max_intents]
 
     candidate_items = (
-        _item_list(audit_coverage.get("open_required"))
+        _item_list(audit_coverage.get("high_risk_unresolved"))
+        or _item_list(audit_coverage.get("open_required"))
         or _item_list(audit_coverage.get("invalid_conclusions"))
     )
     if candidate_items:
@@ -414,6 +415,7 @@ def _fallback_intents_from_graph(export_yaml: str, allowed_fact_ids: list[str], 
                     "闭环仍需证据的审计候选项。"
                     f" candidate_ids: {', '.join(candidate_ids)}。"
                     f" source_targets: {targets}。"
+                    " 不得仅确认路由；必须读取实现链、认证/权限、对象查询、能力调用和后续加载/执行点。"
                     " 请读取源码后输出 findings 或 candidate_conclusions。"
                 ),
             }

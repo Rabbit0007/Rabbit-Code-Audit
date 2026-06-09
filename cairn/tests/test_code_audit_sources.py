@@ -645,6 +645,155 @@ class User(models.Model):
     assert len(edge_ids) == len(set(edge_ids))
 
 
+def test_source_index_builds_control_plane_capability_chains(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/apps/ops/__init__.py": b"",
+            "demo/apps/ops/urls/api_urls.py": b"""
+from django.urls import path
+from .. import api
+
+urlpatterns = [
+    path("playbook/<uuid:pk>/file/", api.PlaybookFileBrowserAPIView.as_view(), name="playbook-file"),
+]
+""",
+            "demo/apps/ops/api/__init__.py": b"""
+from .playbook import PlaybookFileBrowserAPIView, PlaybookViewSet
+""",
+            "demo/apps/ops/api/playbook.py": b"""
+import os
+import shutil
+import zipfile
+from django.conf import settings
+from django.shortcuts import get_object_or_404
+from rest_framework.views import APIView
+
+from apps.ops.models.playbook import Playbook
+
+def safe_join(*parts):
+    return os.path.join(*parts)
+
+def unzip_playbook(src, dist):
+    fz = zipfile.ZipFile(src, 'r')
+    for file in fz.namelist():
+        fz.extract(file, dist)
+
+class PlaybookViewSet(APIView):
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        if 'multipart/form-data' in self.request.headers['Content-Type']:
+            src_path = safe_join(settings.MEDIA_ROOT, instance.path.name)
+            dest_path = safe_join(settings.DATA_DIR, "ops", "playbook", instance.id.__str__())
+            unzip_playbook(src_path, dest_path)
+
+class PlaybookFileBrowserAPIView(APIView):
+    permission_classes = (object,)
+    rbac_perms = {'GET': 'ops.change_playbook', 'POST': 'ops.change_playbook'}
+
+    def get(self, request, **kwargs):
+        playbook_id = kwargs.get('pk')
+        file_key = request.query_params.get('key')
+        playbook = get_object_or_404(Playbook, id=playbook_id)
+        file_path = safe_join(settings.DATA_DIR, "ops", "playbook", str(playbook.id), file_key)
+        with open(file_path, 'r') as f:
+            return f.read()
+
+    def post(self, request, **kwargs):
+        playbook_id = kwargs.get('pk')
+        file_key = request.data.get('key')
+        content = request.data.get('content')
+        new_file_path = safe_join(settings.DATA_DIR, "ops", "playbook", str(playbook_id), file_key)
+        with open(new_file_path, 'w') as f:
+            f.write(content)
+
+    def delete(self, request, **kwargs):
+        file_path = request.data.get('path')
+        if os.path.isdir(file_path):
+            shutil.rmtree(file_path)
+        else:
+            os.remove(file_path)
+""",
+            "demo/apps/ops/models/__init__.py": b"",
+            "demo/apps/ops/models/playbook.py": b"""
+class Playbook:
+    entry = "main.yml"
+
+    def check_dangerous_keywords(self):
+        return True
+""",
+            "demo/apps/ops/models/job.py": b"""
+from apps.ops.models.playbook import Playbook
+
+class PlaybookRunner:
+    def start(self):
+        return True
+
+class Job:
+    def get_runner(self, playbook: Playbook):
+        return PlaybookRunner(playbook.entry)
+""",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("control-plane.zip", payload, "application/zip")},
+    ).json()
+
+    relationships = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/relationships").json()
+    relationship_pairs = {
+        (item["from_path"], item["relation"], item["to_path"], item["to_symbol"], item["source"])
+        for item in relationships
+    }
+    assert (
+        "apps/ops/urls/api_urls.py",
+        "calls",
+        "apps/ops/api/playbook.py",
+        "PlaybookFileBrowserAPIView",
+        "heuristic:django_handler",
+    ) in relationship_pairs
+
+    capabilities = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/capabilities").json()
+    capability_categories = {item["category"] for item in capabilities}
+    assert {"archive_extract", "file_write", "file_read", "task_execution"} <= capability_categories
+    assert any(
+        item["category"] == "archive_extract"
+        and item["risk_level"] == "high"
+        and "控制面" in item["risk_tags"]
+        for item in capabilities
+    )
+
+    candidates = client.get(f"/api/projects/{project_id}/audit-candidates").json()
+    capability_candidates = [item for item in candidates if item["candidate_type"] == "capability_chain"]
+    assert capability_candidates
+    assert any("归档解压/展开能力" in item["title"] for item in capability_candidates)
+    assert any("文件写入/删除能力" in item["title"] for item in capability_candidates)
+    assert all("不是漏洞类型判断" in item["description"] for item in capability_candidates)
+    assert any(
+        item["file_path"] == "apps/ops/api/playbook.py"
+        and item["entry_point"] == "/playbook/<uuid:pk>/file/"
+        for item in capability_candidates
+    )
+
+    graph = client.get(f"/api/projects/{project_id}/business-graph").json()
+    risk_nodes = [node for node in graph["nodes"] if node["node_type"] == "risk"]
+    assert any("待审计能力链" in node["title"] and node["risk_level"] == "high" for node in risk_nodes)
+
+    reason_export = client.get(
+        f"/projects/{project_id}/export",
+        params={"format": "yaml", "profile": "reason"},
+    )
+    reason_data = yaml.safe_load(reason_export.text)
+    assert reason_data["code_index"]["capabilities"]
+    high_risk_ids = {
+        item["id"] for item in reason_data["audit_candidates"]["coverage"]["high_risk_unresolved"]
+    }
+    assert {item["id"] for item in capability_candidates} & high_risk_ids
+
+
 def test_source_import_indexes_satrda_routes_and_seeds_business_graph(temp_db, monkeypatch, tmp_path):
     monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
     client = _client(temp_db)

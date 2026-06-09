@@ -1,29 +1,31 @@
-name: rabbit-code-audit
+name: rabbit-audit
 
-volumes:
-  rabbit-code-audit-data:
-    name: rabbit-code-audit-data
+networks:
+  default:
+    name: rabbit-audit-net
 
 services:
-  rabbit-code-audit-worker-image:
+  audit-worker-image:
     build:
       context: ./container
       dockerfile: Dockerfile
-    image: rabbit-code-audit-worker:latest
+    image: rabbit-code-audit-worker:audit
     command: ["true"]
 
-  cairn-server:
+  audit-server:
     build:
       context: .
       dockerfile: Dockerfile
-    image: cairn-app
-    container_name: rabbit-code-audit-server
+    image: rabbit-code-audit-app:audit
+    container_name: rabbit-audit-server
     ports:
-      - "8000:8000"
+      - "8765:8000"
     volumes:
-      - rabbit-code-audit-data:/root/.local/share/cairn/
+      - /Users/rabbit/.local/share/cairn:/root/.local/share/cairn/
+      - /Users/rabbit/.rabbit-code-audit-preview:/Users/rabbit/.rabbit-code-audit-preview
     environment:
-      CAIRN_DISPATCHER_INTERNAL_URL: "http://cairn-dispatcher:8989"
+      CAIRN_DISPATCHER_INTERNAL_URL: "http://rabbit-audit-dispatcher:8989"
+      CAIRN_ARTIFACT_ROOT: "/Users/rabbit/.rabbit-code-audit-preview/artifacts"
       # Timeout (seconds) for the longer-running worker connectivity test and
       # config read/write proxy calls to the dispatcher internal API. Independent
       # of CAIRN_DISPATCHER_INTERNAL_TIMEOUT (status polling, default 2.0s).
@@ -41,24 +43,23 @@ services:
       start_period: 3s
     restart: unless-stopped
     command: ["uv", "run", "cairn", "serve", "--host", "0.0.0.0", "--no-access-log"]
-  cairn-dispatcher:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: cairn-app
-    container_name: rabbit-code-audit-dispatcher
+  audit-dispatcher:
+    image: rabbit-code-audit-app:audit
+    pull_policy: never
+    container_name: rabbit-audit-dispatcher
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./dispatch.yaml:/cairn/dispatch.yaml
-      - rabbit-code-audit-data:/root/.local/share/cairn/
+      - /Users/rabbit/.rabbit-code-audit-preview:/Users/rabbit/.rabbit-code-audit-preview
+      - /Users/rabbit/.local/share/cairn:/root/.local/share/cairn/
     environment:
       CAIRN_DISPATCHER_INTERNAL_API: "1"
       CAIRN_DISPATCHER_INTERNAL_HOST: "0.0.0.0"
       CAIRN_DISPATCHER_INTERNAL_PORT: "8989"
     depends_on:
-      rabbit-code-audit-worker-image:
+      audit-worker-image:
         condition: service_completed_successfully
-      cairn-server:
+      audit-server:
         condition: service_healthy
     restart: unless-stopped
     command: ["uv", "run", "cairn", "dispatch", "--config", "dispatch.yaml"]

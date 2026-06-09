@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from cairn.server.source_models import (
+    CodeCapability,
     CodeEntrypoint,
     CodeFile,
     CodeRelationship,
@@ -21,6 +22,7 @@ from cairn.server.source_service import (
     get_source_index_summary,
     import_git_source,
     import_zip_source,
+    list_code_capabilities,
     list_code_entrypoints,
     list_code_files,
     list_code_relationships,
@@ -130,6 +132,16 @@ def get_source_relationships(project_id: str, snapshot_id: str, limit: int = 100
         raise HTTPException(400, "limit must be between 1 and 20000")
     try:
         return list_code_relationships(project_id, snapshot_id, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.get("/{snapshot_id}/capabilities", response_model=list[CodeCapability])
+def get_source_capabilities(project_id: str, snapshot_id: str, limit: int = 1000):
+    if limit < 1 or limit > 20_000:
+        raise HTTPException(400, "limit must be between 1 and 20000")
+    try:
+        return list_code_capabilities(project_id, snapshot_id, limit=limit)
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
 

@@ -985,7 +985,17 @@ def _extract_relationships(
             data_objects_by_path.setdefault(symbol.path, []).append(symbol)
 
     for file, text in readable:
-        relationships.extend(_entrypoint_handler_relationships(snapshot_id, file, entrypoints_by_path.get(file.path, [])))
+        relationships.extend(
+            _entrypoint_handler_relationships(
+                snapshot_id,
+                file,
+                text,
+                entrypoints_by_path.get(file.path, []),
+                paths,
+                module_map,
+                symbols_by_name,
+            )
+        )
         relationships.extend(_import_relationships(snapshot_id, file, text, paths, module_map, unique_symbols))
         relationships.extend(_call_relationships(snapshot_id, file, text, unique_symbols))
         relationships.extend(_data_object_use_relationships(snapshot_id, file, data_objects_by_path.get(file.path, [])))
@@ -995,9 +1005,14 @@ def _extract_relationships(
 def _entrypoint_handler_relationships(
     snapshot_id: str,
     file: CodeFile,
+    text: str,
     entrypoints: list[CodeEntrypointRecord],
+    paths: set[str],
+    module_map: dict[str, str],
+    symbols_by_name: dict[str, list[CodeSymbolRecord]],
 ) -> list[CodeRelationshipRecord]:
     relationships: list[CodeRelationshipRecord] = []
+    import_aliases = _python_import_aliases(file.path, text, paths, module_map) if file.language == "Python" else {}
     for entrypoint in entrypoints:
         if not entrypoint.handler:
             continue
@@ -1006,6 +1021,31 @@ def _entrypoint_handler_relationships(
             continue
         handler = handler_text.split(".")[-1].strip()
         if not handler:
+            continue
+        resolved = _resolve_python_handler_target(
+            entrypoint.path,
+            handler_text,
+            import_aliases,
+            paths,
+            module_map,
+            symbols_by_name,
+        )
+        if resolved is not None:
+            target_path, target_symbol = resolved
+            relationships.append(
+                _relationship(
+                    snapshot_id,
+                    from_path=entrypoint.path,
+                    from_symbol=_entrypoint_label(entrypoint.method, entrypoint.route),
+                    to_path=target_path,
+                    to_symbol=target_symbol,
+                    relation="calls",
+                    evidence=entrypoint.evidence,
+                    confidence=min(0.9, max(0.58, entrypoint.confidence)),
+                    source="heuristic:django_handler",
+                    line_start=entrypoint.line_start,
+                )
+            )
             continue
         relationships.append(
             _relationship(
@@ -1022,6 +1062,137 @@ def _entrypoint_handler_relationships(
             )
         )
     return relationships
+
+
+def _python_import_aliases(
+    current_path: str,
+    text: str,
+    paths: set[str],
+    module_map: dict[str, str],
+) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    from_pattern = re.compile(
+        r"^\s*from\s+([.\w]+)\s+import\s+([A-Za-z_][\w]*(?:\s+as\s+[A-Za-z_][\w]*)?(?:\s*,\s*[A-Za-z_][\w]*(?:\s+as\s+[A-Za-z_][\w]*)?)*)",
+        re.MULTILINE,
+    )
+    for match in from_pattern.finditer(text):
+        module = match.group(1)
+        imported_items = _python_import_items(match.group(2))
+        module_path = _resolve_module_import(current_path, module, paths, module_map)
+        for imported_name, alias in imported_items:
+            target = None
+            if module_path:
+                target = _resolve_imported_child(module_path, imported_name, paths) or module_path
+            if target is None:
+                target = _resolve_module_import(current_path, f"{module}.{imported_name}", paths, module_map)
+            if target:
+                aliases[alias or imported_name] = target
+    import_pattern = re.compile(r"^\s*import\s+([A-Za-z_][\w.]*)((?:\s+as\s+)([A-Za-z_][\w]*))?", re.MULTILINE)
+    for match in import_pattern.finditer(text):
+        module = match.group(1)
+        target = _resolve_module_import(current_path, module, paths, module_map)
+        if not target:
+            continue
+        alias = match.group(3) or module.split(".")[-1]
+        aliases[alias] = target
+    return aliases
+
+
+def _python_import_items(value: str) -> list[tuple[str, str | None]]:
+    items: list[tuple[str, str | None]] = []
+    for part in value.split(","):
+        text = part.strip()
+        if not text:
+            continue
+        match = re.fullmatch(r"([A-Za-z_][\w]*)(?:\s+as\s+([A-Za-z_][\w]*))?", text)
+        if match:
+            items.append((match.group(1), match.group(2)))
+    return items
+
+
+def _resolve_imported_child(module_path: str, imported_name: str, paths: set[str]) -> str | None:
+    pure_path = PurePosixPath(module_path)
+    if pure_path.name == "__init__.py":
+        base = pure_path.parent / imported_name
+        return _resolve_path_candidates(base.as_posix(), paths)
+    if pure_path.suffix == ".py":
+        sibling = pure_path.parent / imported_name
+        return _resolve_path_candidates(sibling.as_posix(), paths)
+    return None
+
+
+def _resolve_python_handler_target(
+    current_path: str,
+    handler_text: str,
+    import_aliases: dict[str, str],
+    paths: set[str],
+    module_map: dict[str, str],
+    symbols_by_name: dict[str, list[CodeSymbolRecord]],
+) -> tuple[str, str] | None:
+    target = _python_handler_reference(handler_text)
+    if not target:
+        return None
+    parts = [part for part in target.split(".") if part]
+    if not parts:
+        return None
+    symbol_name = parts[-1]
+    if symbol_name in {"as_view", "view"} and len(parts) >= 2:
+        symbol_name = parts[-2]
+    scope_path = None
+    if len(parts) >= 2:
+        alias = parts[0]
+        scope_path = import_aliases.get(alias)
+        if scope_path is None:
+            scope_path = _resolve_module_import(current_path, ".".join(parts[:-1]), paths, module_map)
+    return _find_symbol_target(symbol_name, scope_path, symbols_by_name)
+
+
+def _python_handler_reference(handler_text: str) -> str | None:
+    text = handler_text.strip()
+    if not text:
+        return None
+    text = text.split("#", 1)[0].strip()
+    as_view = re.search(r"\.as_view\s*\(", text)
+    if as_view:
+        text = text[: as_view.start()]
+    else:
+        call = text.find("(")
+        if call >= 0:
+            text = text[:call]
+    text = text.strip().strip("'\"")
+    match = re.search(r"([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)*)$", text)
+    return match.group(1) if match else None
+
+
+def _find_symbol_target(
+    symbol_name: str,
+    scope_path: str | None,
+    symbols_by_name: dict[str, list[CodeSymbolRecord]],
+) -> tuple[str, str] | None:
+    candidates = symbols_by_name.get(symbol_name) or []
+    if not candidates:
+        return None
+    if scope_path:
+        scoped = [symbol for symbol in candidates if symbol.path == scope_path]
+        if len(scoped) == 1:
+            return scoped[0].path, scoped[0].name
+        scope = PurePosixPath(scope_path)
+        if scope.name == "__init__.py":
+            prefix = scope.parent.as_posix().rstrip("/") + "/"
+            scoped = [symbol for symbol in candidates if symbol.path.startswith(prefix)]
+            if len({symbol.path for symbol in scoped}) == 1:
+                symbol = scoped[0]
+                return symbol.path, symbol.name
+        parent_prefix = scope.parent.as_posix().rstrip("/") + "/"
+        scoped = [symbol for symbol in candidates if symbol.path.startswith(parent_prefix)]
+        if len({symbol.path for symbol in scoped}) == 1:
+            symbol = scoped[0]
+            return symbol.path, symbol.name
+        return None
+    if len({symbol.path for symbol in candidates}) == 1:
+        symbol = candidates[0]
+        return symbol.path, symbol.name
+    return None
 
 
 def _import_relationships(
