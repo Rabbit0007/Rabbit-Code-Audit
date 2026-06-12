@@ -153,9 +153,9 @@ def test_complete_rejects_open_required_audit_candidates(temp_db):
                 status, created_by, created_at, updated_at
             )
             VALUES (
-                'cand_1', ?, 'snap_1', 'index', 'web_entrypoint', 'unknown',
-                '审计 Web 脚本: login.php', '需要审计入口参数和权限控制',
-                'login.php', 1, '/login.php', 'candidate',
+                'cand_1', ?, 'snap_1', 'index', 'data_flow', 'high',
+                '审计数据流: 外部输入到文件写入 app.js:9', 'filename from request reaches writeFile',
+                'app.js', 9, 'POST /upload', 'candidate',
                 'source_index', '2026-01-01T00:00:01Z', '2026-01-01T00:00:01Z'
             )
             """,
@@ -173,6 +173,47 @@ def test_complete_rejects_open_required_audit_candidates(temp_db):
         "Critical, high, or unknown audit candidates require closure before completion"
     )
     assert detail["audit_candidates"][0]["id"] == "cand_1"
+
+
+def test_complete_allows_index_entrypoint_navigation_candidate(temp_db):
+    client = _client()
+    project_id = _create_project(client)
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO source_snapshots (
+                id, project_id, source_type, status, file_count, total_bytes,
+                detected_languages_json, created_at
+            )
+            VALUES ('snap_1', ?, 'zip', 'ready', 1, 10, '{}', '2026-01-01T00:00:00Z')
+            """,
+            (project_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_candidates (
+                id, project_id, snapshot_id, source, candidate_type, severity,
+                title, description, file_path, line_start, entry_point,
+                status, created_by, created_at, updated_at
+            )
+            VALUES (
+                'cand_nav', ?, 'snap_1', 'index', 'web_entrypoint', 'unknown',
+                '审计 Web 脚本: login.php', '需要审计入口参数和权限控制',
+                'login.php', 1, '/login.php', 'candidate',
+                'source_index', '2026-01-01T00:00:01Z', '2026-01-01T00:00:01Z'
+            )
+            """,
+            (project_id,),
+        )
+
+    complete = client.post(
+        f"/projects/{project_id}/complete",
+        json={"from": ["origin"], "description": "done", "worker": "worker-1"},
+    )
+
+    assert complete.status_code == 200
+    assert complete.json()["to"] == "goal"
 
 
 def test_complete_rejects_high_impact_candidate_needing_more_evidence(temp_db):

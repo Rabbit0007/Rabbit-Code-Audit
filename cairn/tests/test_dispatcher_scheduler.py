@@ -5,11 +5,11 @@ import time
 from concurrent.futures import Future
 from types import SimpleNamespace
 
-from cairn.dispatcher.models import RunningTask, TaskOutcome
+from cairn.dispatcher.models import ReasonCheckpoint, RunningTask, TaskOutcome
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
 from cairn.dispatcher.config import WorkerConfig
 from cairn.dispatcher.scheduler.loop import (
-    AUTO_COMPLETE_WORKER,
+    COMPLETION_CHECK_TRIGGER,
     EXPLORE_PARSE_FAILURE_LIMIT,
     REASON_PARSE_FAILURE_LIMIT,
     DispatcherLoop,
@@ -19,11 +19,18 @@ from cairn.dispatcher.tasks.reason import _fallback_intents_from_graph
 
 def _scheduler_loop() -> DispatcherLoop:
     loop = DispatcherLoop.__new__(DispatcherLoop)
+    loop.futures = {}
+    loop.report_futures = {}
     loop.reason_failure_state = {}
     loop.reason_checkpoints = {}
+    loop.completion_checkpoints = {}
     loop.explore_failure_state = {}
     loop.explore_worker_retry_blocked_until = {}
     loop.explore_worker_parse_blocked_until = loop.explore_worker_retry_blocked_until
+    loop.worker_unhealthy_until = {}
+    loop.worker_rejected_until = {}
+    loop.worker_rate_limited_until = {}
+    loop.source_preflight_blocked_until = {}
     loop._log_state = {}
     return loop
 
@@ -128,7 +135,7 @@ def test_fallback_timeout_cools_down_repeated_bad_intent():
     assert loop._explore_parse_cooldown("proj_1", "i001") is True
 
 
-def test_reason_parse_failure_limit_checkpoints_current_graph_state():
+def test_reason_parse_failure_limit_does_not_checkpoint_failed_graph_state():
     loop = _scheduler_loop()
     for _ in range(REASON_PARSE_FAILURE_LIMIT - 1):
         assert loop._record_reason_parse_failure("proj_1", "facts:2->3") is False
@@ -157,13 +164,10 @@ def test_reason_parse_failure_limit_checkpoints_current_graph_state():
 
     loop._reap_futures()
 
-    checkpoint = loop.reason_checkpoints["proj_1"]
-    assert checkpoint.fact_count == 3
-    assert checkpoint.hint_count == 0
-    assert checkpoint.open_intent_count == 0
+    assert "proj_1" not in loop.reason_checkpoints
     assert loop._reason_trigger(
         SimpleNamespace(project=SimpleNamespace(id="proj_1"), facts=[1, 2, 3], hints=[], intents=[])
-    ) is None
+    ) == "initial"
 
 
 def test_reason_parse_fallback_derives_intents_from_coverage():
@@ -317,11 +321,13 @@ def _review_dispatch_loop(workers: list[WorkerConfig]) -> DispatcherLoop:
     return loop
 
 
-class _AutoCompleteClient:
-    def __init__(self, project, *, active_report_statuses: set[str] | None = None):
+class _CompletionCheckClient:
+    def __init__(self, project, *, pending_reports: list[dict] | None = None):
         self.project = project
-        self.active_report_statuses = active_report_statuses or set()
         self.completed: list[tuple[str, list[str], str, str]] = []
+        self.reason_claims: list[tuple[str, str, str]] = []
+        self.report_claims: list[tuple[str, str]] = []
+        self.pending_reports = pending_reports or []
 
     def get_project(self, project_id: str):
         assert project_id == self.project.project.id
@@ -331,26 +337,58 @@ class _AutoCompleteClient:
         return []
 
     def list_pending_report_enrichments(self, project_id: str, limit: int = 10):
-        return []
+        return self.pending_reports[:limit]
 
-    def list_report_enrichments(self, project_id: str, status: str | None = None):
-        if status in self.active_report_statuses:
-            return [{"id": f"rpt_{status}", "status": status}]
-        return []
+    def export_project(self, project_id: str, profile: str, intent_id: str | None = None):
+        assert project_id == self.project.project.id
+        assert profile in {"reason", "explore"}
+        return "facts: []"
+
+    def claim_reason(self, project_id: str, worker: str, trigger: str):
+        self.reason_claims.append((project_id, worker, trigger))
+        return SimpleNamespace(ok=True, status_code=200, text="")
 
     def complete(self, project_id: str, from_ids: list[str], description: str, worker: str):
         self.completed.append((project_id, from_ids, description, worker))
         return SimpleNamespace(ok=True, status_code=200, text="")
 
+    def record_worker_task_history(self, payload: dict):
+        return SimpleNamespace(ok=True, status_code=200, text="")
 
-def _auto_complete_loop(project, *, active_report_statuses: set[str] | None = None) -> DispatcherLoop:
+    def claim_report_enrichment(self, task_id: str, worker: str):
+        self.report_claims.append((task_id, worker))
+        return SimpleNamespace(ok=True, status_code=200, text="", data={"id": task_id, "finding_id": "finding_1"})
+
+    def release_report_enrichment(self, task_id: str, worker: str):
+        return SimpleNamespace(ok=True, status_code=200, text="")
+
+
+def _completion_check_loop(
+    project,
+    *,
+    pending_reports: list[dict] | None = None,
+    reason_checkpointed: bool = True,
+) -> DispatcherLoop:
     loop = _scheduler_loop()
+    if reason_checkpointed:
+        loop.reason_checkpoints[project.project.id] = ReasonCheckpoint(
+            fact_count=len(project.facts),
+            hint_count=len(project.hints),
+            open_intent_count=0,
+        )
     loop.futures = {}
     loop.runtime_project_ids = {project.project.id}
     loop._cleanup_pending = set()
-    loop.config = SimpleNamespace(runtime=SimpleNamespace(max_project_workers=4))
+    loop.task_history = None
+    loop._config_lock = threading.RLock()
+    loop.config = SimpleNamespace(
+        runtime=SimpleNamespace(max_project_workers=4),
+        workers=[_worker("reason-worker", task_types=["reason"])],
+    )
+    loop.executor = _FakeExecutor()
+    loop.report_executor = _FakeExecutor()
     loop.container_manager = SimpleNamespace(container_name=lambda project_id: f"cairn-{project_id}")
-    loop.client = _AutoCompleteClient(project, active_report_statuses=active_report_statuses)
+    loop.client = _CompletionCheckClient(project, pending_reports=pending_reports)
     return loop
 
 
@@ -378,28 +416,130 @@ def _finished_project():
     )
 
 
-def test_idle_finished_project_auto_completes_without_reason_dispatch():
+def _project_with_open_intent():
+    return SimpleNamespace(
+        project=SimpleNamespace(id="proj_1", status="active", reason=None),
+        facts=[
+            SimpleNamespace(id="origin"),
+            SimpleNamespace(id="goal"),
+            SimpleNamespace(id="f001"),
+        ],
+        hints=[],
+        intents=[
+            SimpleNamespace(
+                id="i002",
+                from_=["f001"],
+                to=None,
+                description="audit upload flow",
+                creator="reason-worker",
+                worker=None,
+                created_at="2026-01-02T00:00:00Z",
+            )
+        ],
+        sources=[SimpleNamespace(status="ready")],
+    )
+
+
+def test_idle_finished_project_dispatches_reason_completion_check():
     project = _finished_project()
-    loop = _auto_complete_loop(project)
+    loop = _completion_check_loop(project)
 
     assert loop._try_dispatch_project(SimpleNamespace(id="proj_1", status="active")) is True
 
-    assert loop.client.completed
-    project_id, from_ids, description, worker = loop.client.completed[0]
-    assert project_id == "proj_1"
-    assert from_ids == ["origin", "f001"]
-    assert description
-    assert worker == AUTO_COMPLETE_WORKER
-    assert "proj_1" not in loop.runtime_project_ids
+    assert loop.client.completed == []
+    assert loop.client.reason_claims == [("proj_1", "reason-worker", COMPLETION_CHECK_TRIGGER)]
+    running = list(loop.futures.values())[0]
+    assert running.task_type == "reason"
+    assert running.reason_trigger == COMPLETION_CHECK_TRIGGER
 
 
-def test_auto_complete_waits_for_active_report_enrichment_tasks():
+def test_pending_report_enrichment_does_not_block_reason_completion_check():
     project = _finished_project()
-    loop = _auto_complete_loop(project, active_report_statuses={"running"})
+    loop = _completion_check_loop(project, pending_reports=[{"id": "rpt_1", "finding_id": "finding_1"}])
 
-    assert loop._try_dispatch_project(SimpleNamespace(id="proj_1", status="active")) is False
+    assert loop._try_dispatch_project(SimpleNamespace(id="proj_1", status="active")) is True
 
     assert loop.client.completed == []
+    assert loop.client.reason_claims == [("proj_1", "reason-worker", COMPLETION_CHECK_TRIGGER)]
+
+
+def test_running_report_enrichment_does_not_count_against_project_worker_limit():
+    project = _project_with_open_intent()
+    loop = _completion_check_loop(project)
+    loop.config.runtime.max_project_workers = 1
+    loop.report_futures[Future()] = RunningTask(
+        "proj_1",
+        "report_enrichment",
+        "report-worker",
+        TaskCancellation(),
+        intent_id="rpt_1",
+    )
+    attempted: list[str] = []
+
+    def fake_dispatch_explore(project_detail, export_yaml, intent):  # noqa: ARG001
+        attempted.append(intent.id)
+        return True
+
+    loop._dispatch_explore = fake_dispatch_explore
+
+    assert loop._try_dispatch_project(SimpleNamespace(id="proj_1", status="active")) is True
+    assert attempted == ["i002"]
+
+
+def test_report_enrichment_dispatch_uses_background_pool_not_core_futures():
+    project = _finished_project()
+    loop = _completion_check_loop(project, pending_reports=[{"id": "rpt_1", "finding_id": "finding_1"}])
+    loop.config.workers = [_worker("report-worker", task_types=["report_enrichment"])]
+    loop.runtime_project_ids = set()
+    loop.reason_checkpoints[project.project.id] = ReasonCheckpoint(
+        fact_count=len(project.facts),
+        hint_count=len(project.hints),
+        open_intent_count=0,
+    )
+    loop.completion_checkpoints[project.project.id] = ReasonCheckpoint(
+        fact_count=len(project.facts),
+        hint_count=len(project.hints),
+        open_intent_count=0,
+    )
+
+    assert loop._try_dispatch_project(SimpleNamespace(id="proj_1", status="active")) is True
+
+    assert loop.futures == {}
+    assert len(loop.report_futures) == 1
+    assert loop.runtime_project_ids == set()
+    assert loop.client.report_claims == [("rpt_1", "report-worker")]
+
+
+def test_successful_completion_check_does_not_repeat_for_same_graph_state():
+    project = _finished_project()
+    loop = _completion_check_loop(project)
+
+    assert loop._try_dispatch_project(SimpleNamespace(id="proj_1", status="active")) is True
+    future = next(iter(loop.futures))
+    future.set_result(TaskOutcome(status="success"))
+    loop._reap_futures()
+
+    assert loop._try_dispatch_project(SimpleNamespace(id="proj_1", status="active")) is False
+    assert loop.client.reason_claims == [("proj_1", "reason-worker", COMPLETION_CHECK_TRIGGER)]
+
+    project.facts.append(SimpleNamespace(id="f002"))
+    assert loop._try_dispatch_project(SimpleNamespace(id="proj_1", status="active")) is True
+    assert loop.client.reason_claims[-1] == ("proj_1", "reason-worker", "facts:3->4")
+
+
+def test_successful_initial_reason_with_no_open_intents_does_not_immediately_completion_check():
+    project = _finished_project()
+    loop = _completion_check_loop(project, reason_checkpointed=False)
+
+    assert loop._try_dispatch_project(SimpleNamespace(id="proj_1", status="active")) is True
+    assert loop.client.reason_claims == [("proj_1", "reason-worker", "initial")]
+
+    future = next(iter(loop.futures))
+    future.set_result(TaskOutcome(status="success"))
+    loop._reap_futures()
+
+    assert loop._try_dispatch_project(SimpleNamespace(id="proj_1", status="active")) is False
+    assert loop.client.reason_claims == [("proj_1", "reason-worker", "initial")]
 
 
 def test_review_task_dispatch_excludes_discoverer_and_uses_review_worker():

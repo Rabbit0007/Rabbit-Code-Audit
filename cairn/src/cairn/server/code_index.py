@@ -351,7 +351,11 @@ def _data_object_symbols(snapshot_id: str, file: CodeFile, text: str) -> list[Co
 
     for pattern in DATA_OBJECT_SQL_PATTERNS:
         for match in pattern.finditer(text):
-            add(match.group(1), match.start(), _line_at(text, _line_no(text, match.start())), 0.82, "heuristic:sql")
+            line_start = _line_no(text, match.start())
+            line = _line_at(text, line_start)
+            if _looks_like_language_import_line(line):
+                continue
+            add(match.group(1), match.start(), line, 0.82, "heuristic:sql")
 
     for match in re.finditer(r"__tablename__\s*=\s*['\"]([^'\"]+)['\"]", text):
         add(match.group(1), match.start(), _line_at(text, _line_no(text, match.start())), 0.88, "heuristic:orm")
@@ -390,6 +394,20 @@ def _clean_data_object_name(value: str) -> str | None:
     if text.startswith("$") or text.startswith(":"):
         return None
     return text[:120]
+
+
+def _looks_like_language_import_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    lower = stripped.lower()
+    if re.match(r"^(?:from\s+[a-zA-Z_][\w.]*\s+import\b|import\s+)", stripped):
+        return True
+    if re.match(r"^(?:import|export)\s+.+\s+from\s+['\"]", stripped):
+        return True
+    if lower.startswith(("package ", "using ", "require ", "include ")):
+        return True
+    return False
 
 
 def _extract_entrypoints(

@@ -536,16 +536,50 @@ function TopNav({ route, user, theme, onToggleTheme, onLogout, onPassword, onSet
         ? "审计日志"
         : activeNav?.[1] || APP_NAME;
   const reportSubnav = [
-    ["overview", "报告总览"],
-    ["critical", "严重漏洞"],
-    ["high", "高危漏洞"],
-    ["medium", "中危漏洞"],
-    ["low", "低危漏洞"],
-    ["confirmed", "已确认漏洞"],
-    ["ignored", "已忽略漏洞"],
-    ["export-records", "导出记录"],
+    { title: null, items: [["overview", "报告总览"]] },
+    {
+      title: "按严重程度",
+      items: [
+        ["critical", "严重漏洞"],
+        ["high", "高危漏洞"],
+        ["medium", "中危漏洞"],
+        ["low", "低危漏洞"],
+      ],
+    },
+    {
+      title: "按处理状态",
+      items: [
+        ["confirmed", "已确认漏洞"],
+        ["ignored", "已忽略漏洞"],
+      ],
+    },
+    { title: null, items: [["export-records", "导出记录"]] },
   ];
+  const vulnRouteActive = route.page === "vulnerabilities";
+  const [reportExpanded, setReportExpanded] = useState(vulnRouteActive);
+  const [reportManual, setReportManual] = useState(false);
   const activeView = route.page === "vulnerabilities" ? route.view || "overview" : null;
+
+  useEffect(() => {
+    if (vulnRouteActive) {
+      if (!reportManual) setReportExpanded(true);
+      return;
+    }
+    setReportExpanded(false);
+    setReportManual(false);
+  }, [reportManual, vulnRouteActive]);
+
+  const toggleVulnerabilityNav = () => {
+    if (!vulnRouteActive) {
+      setReportManual(false);
+      setReportExpanded(true);
+      go("#/vulnerabilities");
+      return;
+    }
+    setReportManual(true);
+    setReportExpanded((prev) => !prev);
+  };
+
   return (
     <>
       <header className="top-utility">
@@ -553,7 +587,7 @@ function TopNav({ route, user, theme, onToggleTheme, onLogout, onPassword, onSet
           <span className="brand-mark">
             <img src="/static/rabbit-icon.png" alt="Rabbit" />
           </span>
-          <span>{APP_NAME}</span>
+          <span className="brand-word">Rabbit</span>
         </button>
         <div className="top-section-label">{sectionLabel}</div>
         <GlobalSearch setToast={setToast} />
@@ -590,27 +624,35 @@ function TopNav({ route, user, theme, onToggleTheme, onLogout, onPassword, onSet
           {mainNav.map(([key, label, Icon]) => {
             const active = route.page === key || (key === "projects" && route.page === "project");
             return (
-              <div key={key} className={cn("nav-group", active && "active")}>
+              <div key={key} className={cn("nav-group", active && "active", key === "vulnerabilities" && reportExpanded && "expanded")}>
                 <button
-                  className={cn("nav-tab", active && "active")}
+                  className={cn("nav-tab", active && key !== "vulnerabilities" && "active", key === "vulnerabilities" && active && "module-open")}
                   type="button"
-                  onClick={() => go(key === "projects" ? "#/projects" : `#/${key}`)}
+                  onClick={() => (key === "vulnerabilities" ? toggleVulnerabilityNav() : go(key === "projects" ? "#/projects" : `#/${key}`))}
                 >
                   <Icon size={17} />
                   {label}
                   {key === "vulnerabilities" && <ChevronDown className="nav-caret" size={14} />}
                 </button>
-                {key === "vulnerabilities" && active && (
+                {key === "vulnerabilities" && reportExpanded && (
                   <div className="sub-nav">
-                    {reportSubnav.map(([view, label]) => (
-                      <button
-                        key={view}
-                        className={cn(activeView === view && "active")}
-                        type="button"
-                        onClick={() => go(view === "overview" ? "#/vulnerabilities" : `#/vulnerabilities/${view}`)}
-                      >
-                        {label}
-                      </button>
+                    {reportSubnav.map((group, index) => (
+                      <div key={group.title || `group-${index}`} className="sub-nav-group">
+                        {group.title && <span className="sub-nav-group-label">{group.title}</span>}
+                        <div className="sub-nav-list">
+                          {group.items.map(([view, label]) => (
+                            <button
+                              key={view}
+                              className={cn(activeView === view && "active")}
+                              type="button"
+                              onClick={() => go(view === "overview" ? "#/vulnerabilities" : `#/vulnerabilities/${view}`)}
+                            >
+                              <span className="sub-nav-indicator" />
+                              {label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
                     ))}
                   </div>
                 )}
@@ -1386,6 +1428,10 @@ function AuthPage({ onAuthed, setToast }) {
               </button>
             </div>
           )}
+          <div className="auth-security-note">
+            <ShieldCheck size={16} />
+            <span>验证码校验、失败次数限制和安全 Session 已启用</span>
+          </div>
           {formError && (
             <div className="auth-form-alert" role="alert">
               <AlertCircle size={17} />
@@ -1582,6 +1628,7 @@ function MiniStat({ label, value }) {
 function DashboardPage({ runAction, setToast }) {
   const [vulnerabilities, setVulnerabilities] = useState([]);
   const [projects, setProjects] = useState([]);
+  const [workers, setWorkers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [lastUpdated, setLastUpdated] = useState(null);
   const [newOpen, setNewOpen] = useState(false);
@@ -1589,12 +1636,14 @@ function DashboardPage({ runAction, setToast }) {
   const load = useCallback(async ({ silent = false } = {}) => {
     if (!silent) setLoading(true);
     try {
-      const [vulnList, projectList] = await Promise.all([
+      const [vulnList, projectList, workerList] = await Promise.all([
         apiRequest("/api/vulnerabilities"),
         apiRequest("/projects"),
+        apiRequest("/api/workers").catch(() => []),
       ]);
       setVulnerabilities(Array.isArray(vulnList) ? vulnList : []);
       setProjects(Array.isArray(projectList) ? projectList : []);
+      setWorkers(Array.isArray(workerList) ? workerList : []);
       setLastUpdated(new Date());
     } catch (error) {
       if (!silent) setToast({ type: "danger", message: error.message || "仪表盘数据加载失败" });
@@ -1612,7 +1661,6 @@ function DashboardPage({ runAction, setToast }) {
     return () => window.clearInterval(timer);
   }, [load]);
 
-  const severitySummary = useMemo(() => summarizeSeverity(vulnerabilities), [vulnerabilities]);
   const statusDistribution = useMemo(() => buildStatusDistribution(vulnerabilities), [vulnerabilities]);
   const trendData = useMemo(() => buildVulnerabilityTrend(vulnerabilities), [vulnerabilities]);
   const recentActivity = useMemo(
@@ -1630,6 +1678,20 @@ function DashboardPage({ runAction, setToast }) {
     return { total, active, completed };
   }, [projects]);
 
+  const workerCounts = useMemo(() => {
+    return workers.reduce(
+      (acc, worker) => {
+        const status = worker.status || (worker.enabled === false ? "disabled" : "offline");
+        acc.total += 1;
+        if (status === "busy" || status === "running") acc.running += 1;
+        if (["idle", "busy", "running", "online", "ready"].includes(status)) acc.online += 1;
+        else acc.offline += 1;
+        return acc;
+      },
+      { total: 0, online: 0, running: 0, offline: 0 },
+    );
+  }, [workers]);
+
   const quickActions = [
     { key: "new", label: "新建项目", desc: "导入源码并定义审计目标", icon: Plus, onClick: () => setNewOpen(true) },
     { key: "vulns", label: "审计报告", desc: "查看已确认的安全发现", icon: AlertTriangle, onClick: () => go("#/vulnerabilities") },
@@ -1642,7 +1704,7 @@ function DashboardPage({ runAction, setToast }) {
       <PageHeader
         icon={Home}
         title="仪表盘"
-        subtitle="代码审计全局概览：已确认发现、趋势与最近活动"
+        subtitle="代码审计全局概览：项目、发现、Worker 与最近活动"
         actions={
           <>
             <div className="status-pill">
@@ -1661,22 +1723,17 @@ function DashboardPage({ runAction, setToast }) {
           <EmptyState icon={Loader2} title="正在加载仪表盘" />
         ) : (
           <>
-            <div className="metric-grid severity">
-              {["critical", "high", "medium", "low"].map((level) => (
-                <MetricCard
-                  key={level}
-                  label={`${SEVERITY_META[level].label}漏洞`}
-                  value={severitySummary[level] || 0}
-                  tone={level}
-                />
-              ))}
-              <MetricCard label="已确认" value={statusDistribution.confirmed || 0} tone="success" />
-            </div>
-            <div className="metric-grid">
-              <MetricCard label="全部项目" value={projectCounts.total} tone="info" />
-              <MetricCard label="运行中项目" value={projectCounts.active} tone="success" />
-              <MetricCard label="已完成项目" value={projectCounts.completed} tone="muted" />
-              <MetricCard label="漏洞总数" value={statusDistribution.total || 0} tone="info" />
+            <div className="metric-grid dashboard-summary-grid">
+              <MetricCard label="全部项目" value={projectCounts.total} tone="info" icon={Folder} description="所有审计项目" />
+              <MetricCard label="运行中项目" value={projectCounts.active} tone="success" icon={Play} description="当前正在执行" />
+              <MetricCard label="审计发现" value={statusDistribution.total || 0} tone="high" icon={ShieldAlert} description="候选与确认发现" />
+              <MetricCard
+                label="在线 Worker"
+                value={workerCounts.online}
+                tone="success"
+                icon={Monitor}
+                description={`${workerCounts.running} 个运行中`}
+              />
             </div>
             <div className="dashboard-grid">
               <VulnerabilityTrend data={trendData} />
@@ -1899,15 +1956,23 @@ function ProjectsPage({ runAction, setToast, confirmAction }) {
   );
 }
 
-function MetricCard({ label, value, tone }) {
+function MetricCard({ label, value, tone, icon: Icon, description, onClick }) {
+  const Component = onClick ? "button" : "div";
   return (
-    <div className={cn("metric-card", tone)}>
-      <span className="metric-dot" />
+    <Component className={cn("metric-card", tone, onClick && "interactive")} type={onClick ? "button" : undefined} onClick={onClick}>
+      {Icon ? (
+        <span className="metric-icon">
+          <Icon size={22} />
+        </span>
+      ) : (
+        <span className="metric-dot" />
+      )}
       <div>
         <span>{label}</span>
         <strong>{value}</strong>
+        {description && <small>{description}</small>}
       </div>
-    </div>
+    </Component>
   );
 }
 

@@ -153,6 +153,14 @@ class SourceIndexQuality(BaseModel):
     orphan_entrypoints: list[CodeEntrypoint] = Field(default_factory=list)
     data_object_count: int = 0
     entrypoints_with_data_paths: int = 0
+    candidate_count: int = 0
+    high_impact_candidate_count: int = 0
+    candidate_status_counts: dict[str, int] = Field(default_factory=dict)
+    candidate_type_counts: dict[str, int] = Field(default_factory=dict)
+    candidate_file_count: int = 0
+    candidate_density_per_code_file: float = 0.0
+    business_graph_node_count: int = 0
+    business_graph_edge_count: int = 0
     issues: list[SourceIndexQualityIssue] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
 
@@ -166,6 +174,7 @@ FindingStatus = Literal[
     "needs_more_evidence",
 ]
 Severity = Literal["critical", "high", "medium", "low", "info"]
+EvidenceLevel = Literal["L0", "L1", "L2", "L3", "L4", "L5"]
 CandidateSeverity = Literal["critical", "high", "medium", "low", "info", "unknown"]
 CandidateStatus = Literal[
     "candidate",
@@ -222,6 +231,7 @@ class AuditFinding(BaseModel):
     category: str
     severity: Severity
     status: FindingStatus
+    evidence_level: EvidenceLevel = "L0"
     cwe: str | None = None
     file_path: str | None = None
     line_start: int | None = None

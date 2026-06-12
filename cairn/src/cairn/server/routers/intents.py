@@ -1,3 +1,6 @@
+import json
+import sqlite3
+
 from fastapi import APIRouter, HTTPException
 
 from cairn.server.db import get_conn
@@ -5,12 +8,14 @@ from cairn.server.models import (
     ConcludeRequest,
     ConcludeResponse,
     CreateIntentRequest,
-    Fact,
     HeartbeatRequest,
     Intent,
 )
 from cairn.server.services import (
+    build_intent_fingerprint,
     check_project_active,
+    fact_to_model,
+    get_equivalent_open_intent,
     get_claimable_open_intent_or_404,
     get_releasable_open_intent_or_404,
     intent_to_model,
@@ -36,38 +41,82 @@ def create_intent(project_id: str, body: CreateIntentRequest):
         validate_goal_not_in_sources(body.from_)
         validate_intent_creator_worker(body.creator, body.worker)
 
+        fingerprint = build_intent_fingerprint(
+            body.from_,
+            body.description,
+            target_kind=body.target_kind,
+            target_id=body.target_id,
+            objective=body.objective,
+            evidence_gap=body.evidence_gap,
+        )
+        existing = get_equivalent_open_intent(conn, project_id, fingerprint)
+        if existing is not None:
+            if (
+                body.worker is not None
+                and existing["worker"] is None
+                and existing["status"] == "open"
+            ):
+                now = utcnow()
+                conn.execute(
+                    """
+                    UPDATE intents
+                    SET worker = ?, last_heartbeat_at = ?, status = 'claimed'
+                    WHERE id = ? AND project_id = ? AND worker IS NULL AND to_fact_id IS NULL
+                    """,
+                    (body.worker, now, existing["id"], project_id),
+                )
+                existing = conn.execute(
+                    "SELECT * FROM intents WHERE id = ? AND project_id = ?",
+                    (existing["id"], project_id),
+                ).fetchone()
+            return intent_to_model(conn, existing, project_id)
+
         now = utcnow()
         iid = next_intent_id(conn, project_id)
         claimed = body.worker is not None
-        conn.execute(
-            "INSERT INTO intents (id, project_id, to_fact_id, description, creator, worker, last_heartbeat_at, created_at, concluded_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, NULL)",
-            (
-                iid,
-                project_id,
-                body.description,
-                body.creator,
-                body.worker,
-                now if claimed else None,
-                now,
-            ),
-        )
+        try:
+            conn.execute(
+                """
+                INSERT INTO intents (
+                    id, project_id, to_fact_id, description, creator, worker,
+                    last_heartbeat_at, created_at, concluded_at, fingerprint, status,
+                    target_kind, target_id, objective, evidence_gap
+                )
+                VALUES (?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    iid,
+                    project_id,
+                    body.description,
+                    body.creator,
+                    body.worker,
+                    now if claimed else None,
+                    now,
+                    fingerprint,
+                    "claimed" if claimed else "open",
+                    body.target_kind,
+                    body.target_id,
+                    body.objective,
+                    body.evidence_gap,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            existing = get_equivalent_open_intent(conn, project_id, fingerprint)
+            if existing is None:
+                raise
+            return intent_to_model(conn, existing, project_id)
         for fid in body.from_:
             conn.execute(
                 "INSERT INTO intent_sources (intent_id, project_id, fact_id) VALUES (?, ?, ?)",
                 (iid, project_id, fid),
             )
 
-        return Intent(
-            id=iid,
-            **{"from": body.from_},
-            to=None,
-            description=body.description,
-            creator=body.creator,
-            worker=body.worker,
-            last_heartbeat_at=now if claimed else None,
-            created_at=now,
-            concluded_at=None,
-        )
+        created = conn.execute(
+            "SELECT * FROM intents WHERE id = ? AND project_id = ?",
+            (iid, project_id),
+        ).fetchone()
+        assert created is not None
+        return intent_to_model(conn, created, project_id)
 
 
 @router.post(
@@ -83,7 +132,7 @@ def heartbeat(project_id: str, intent_id: str, body: HeartbeatRequest):
         updated_count = conn.execute(
             """
             UPDATE intents
-            SET worker = ?, last_heartbeat_at = ?
+            SET worker = ?, last_heartbeat_at = ?, status = 'claimed'
             WHERE id = ?
               AND project_id = ?
               AND to_fact_id IS NULL
@@ -118,7 +167,7 @@ def release(project_id: str, intent_id: str, body: HeartbeatRequest):
 
         if row["worker"] == body.worker:
             conn.execute(
-                "UPDATE intents SET worker = NULL WHERE id = ? AND project_id = ?",
+                "UPDATE intents SET worker = NULL, status = 'open' WHERE id = ? AND project_id = ?",
                 (intent_id, project_id),
             )
             row = conn.execute(
@@ -140,11 +189,20 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
 
         now = utcnow()
         fid = next_fact_id(conn, project_id)
+        source_rows = conn.execute(
+            "SELECT fact_id FROM intent_sources WHERE intent_id = ? AND project_id = ? ORDER BY rowid",
+            (intent_id, project_id),
+        ).fetchall()
+        source_ids = [row["fact_id"] for row in source_rows]
 
         updated_count = conn.execute(
             """
             UPDATE intents
-            SET to_fact_id = ?, worker = ?, last_heartbeat_at = ?, concluded_at = ?
+            SET to_fact_id = ?,
+                worker = ?,
+                last_heartbeat_at = ?,
+                concluded_at = ?,
+                status = 'completed'
             WHERE id = ?
               AND project_id = ?
               AND to_fact_id IS NULL
@@ -165,15 +223,32 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
                 raise HTTPException(409, f"Intent is currently claimed by {updated['worker']}")
             raise HTTPException(409, "Intent conclude was updated by another worker")
         conn.execute(
-            "INSERT INTO facts (id, project_id, description) VALUES (?, ?, ?)",
-            (fid, project_id, body.description),
+            """
+            INSERT INTO facts (
+                id, project_id, description, fact_type, source, confidence,
+                parent_fact_ids_json
+            )
+            VALUES (?, ?, ?, 'observation', ?, 0.7, ?)
+            """,
+            (
+                fid,
+                project_id,
+                body.description,
+                body.worker,
+                json.dumps(source_ids, ensure_ascii=False),
+            ),
         )
 
         updated = conn.execute(
             "SELECT * FROM intents WHERE id = ? AND project_id = ?",
             (intent_id, project_id),
         ).fetchone()
+        fact = conn.execute(
+            "SELECT * FROM facts WHERE id = ? AND project_id = ?",
+            (fid, project_id),
+        ).fetchone()
+        assert fact is not None
         return ConcludeResponse(
-            fact=Fact(id=fid, description=body.description),
+            fact=fact_to_model(fact),
             intent=intent_to_model(conn, updated, project_id),
         )

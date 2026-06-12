@@ -1,3 +1,5 @@
+import json
+
 from fastapi import APIRouter, HTTPException
 
 from cairn.server.activity_service import record_audit, record_notification
@@ -19,12 +21,14 @@ from cairn.server.models import (
     UpdateProjectStatusRequest,
 )
 from cairn.server.services import (
+    build_intent_fingerprint,
     build_intents,
     check_project_completed,
     check_project_active,
     clear_project_reason,
     expire_reason_leases,
     expire_workers,
+    fact_to_model,
     get_completion_intent_or_409,
     get_project_or_404,
     intent_to_model,
@@ -87,11 +91,21 @@ def create_project(body: CreateProjectRequest):
             (pid, body.title, now),
         )
         conn.execute(
-            "INSERT INTO facts (id, project_id, description) VALUES (?, ?, ?)",
+            """
+            INSERT INTO facts (
+                id, project_id, description, fact_type, source, confidence
+            )
+            VALUES (?, ?, ?, 'origin', 'user', 1.0)
+            """,
             ("origin", pid, body.origin),
         )
         conn.execute(
-            "INSERT INTO facts (id, project_id, description) VALUES (?, ?, ?)",
+            """
+            INSERT INTO facts (
+                id, project_id, description, fact_type, source, confidence
+            )
+            VALUES (?, ?, ?, 'goal', 'user', 1.0)
+            """,
             ("goal", pid, body.goal),
         )
 
@@ -100,18 +114,47 @@ def create_project(body: CreateProjectRequest):
             for h in body.hints:
                 hid = next_hint_id(conn, pid)
                 conn.execute(
-                    "INSERT INTO hints (id, project_id, content, creator, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (hid, pid, h.content, h.creator, now),
+                    """
+                    INSERT INTO hints (
+                        id, project_id, content, creator, created_at,
+                        hint_type, target, priority, expires_at, max_uses
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        hid,
+                        pid,
+                        h.content,
+                        h.creator,
+                        now,
+                        h.hint_type,
+                        h.target,
+                        h.priority,
+                        h.expires_at,
+                        h.max_uses,
+                    ),
                 )
-                hints.append(Hint(id=hid, content=h.content, creator=h.creator, created_at=now))
+                hints.append(
+                    Hint(
+                        id=hid,
+                        content=h.content,
+                        creator=h.creator,
+                        created_at=now,
+                        hint_type=h.hint_type,
+                        target=h.target,
+                        priority=h.priority,
+                        expires_at=h.expires_at,
+                        max_uses=h.max_uses,
+                    )
+                )
 
         record_audit("project.create", f"创建项目 {body.title}", target_type="project", target_id=pid, conn=conn)
         record_notification(f"新建项目：{body.title}", level="info", link="#/projects", conn=conn)
         return ProjectDetail(
             project=ProjectMeta(id=pid, title=body.title, status="active", created_at=now, reason=None),
             facts=[
-                Fact(id="origin", description=body.origin),
-                Fact(id="goal", description=body.goal),
+                Fact(id="origin", description=body.origin, fact_type="origin", source="user", confidence=1.0),
+                Fact(id="goal", description=body.goal, fact_type="goal", source="user", confidence=1.0),
             ],
             intents=[],
             hints=hints,
@@ -136,7 +179,7 @@ def get_project(project_id: str):
 
         return ProjectDetail(
             project=project_meta_from_row(row),
-            facts=[Fact(**dict(f)) for f in facts],
+            facts=[fact_to_model(f) for f in facts],
             intents=build_intents(conn, project_id),
             hints=[Hint(**dict(h)) for h in hints],
             sources=list_snapshots(project_id),
@@ -184,7 +227,7 @@ def update_project_status(project_id: str, body: UpdateProjectStatusRequest):
         )
         if body.status == "stopped":
             conn.execute(
-                "UPDATE intents SET worker = NULL WHERE project_id = ? AND concluded_at IS NULL",
+                "UPDATE intents SET worker = NULL, status = 'open' WHERE project_id = ? AND concluded_at IS NULL",
                 (project_id,),
             )
             clear_project_reason(conn, project_id)
@@ -283,10 +326,34 @@ def complete_project(project_id: str, body: CompleteRequest):
 
         now = utcnow()
         iid = next_intent_id(conn, project_id)
+        fingerprint = build_intent_fingerprint(
+            body.from_,
+            body.description,
+            target_kind="project",
+            target_id="goal",
+            objective="complete",
+        )
 
         conn.execute(
-            "INSERT INTO intents (id, project_id, to_fact_id, description, creator, worker, last_heartbeat_at, created_at, concluded_at) VALUES (?, ?, 'goal', ?, ?, ?, ?, ?, ?)",
-            (iid, project_id, body.description, body.worker, body.worker, now, now, now),
+            """
+            INSERT INTO intents (
+                id, project_id, to_fact_id, description, creator, worker,
+                last_heartbeat_at, created_at, concluded_at, fingerprint, status,
+                target_kind, target_id, objective
+            )
+            VALUES (?, ?, 'goal', ?, ?, ?, ?, ?, ?, ?, 'completed', 'project', 'goal', 'complete')
+            """,
+            (
+                iid,
+                project_id,
+                body.description,
+                body.worker,
+                body.worker,
+                now,
+                now,
+                now,
+                fingerprint,
+            ),
         )
         for fid in body.from_:
             conn.execute(
@@ -305,17 +372,12 @@ def complete_project(project_id: str, body: CompleteRequest):
             """,
             (project_id,),
         )
-        return Intent(
-            id=iid,
-            **{"from": body.from_},
-            to="goal",
-            description=body.description,
-            creator=body.worker,
-            worker=body.worker,
-            last_heartbeat_at=now,
-            created_at=now,
-            concluded_at=now,
-        )
+        completed_intent = conn.execute(
+            "SELECT * FROM intents WHERE id = ? AND project_id = ?",
+            (iid, project_id),
+        ).fetchone()
+        assert completed_intent is not None
+        return intent_to_model(conn, completed_intent, project_id)
 
 
 @router.post("/projects/{project_id}/reopen", response_model=ReopenResponse)
@@ -344,12 +406,50 @@ def reopen_project(project_id: str, body: ReopenRequest):
             (completion["id"], project_id),
         )
         conn.execute(
-            "INSERT INTO facts (id, project_id, description) VALUES (?, ?, ?)",
-            (fact_id, project_id, description),
+            """
+            INSERT INTO facts (
+                id, project_id, description, fact_type, source, confidence,
+                parent_fact_ids_json
+            )
+            VALUES (?, ?, ?, 'feedback', ?, 0.9, ?)
+            """,
+            (
+                fact_id,
+                project_id,
+                description,
+                creator,
+                json.dumps(source_ids, ensure_ascii=False),
+            ),
+        )
+        fingerprint = build_intent_fingerprint(
+            source_ids,
+            "external_feedback",
+            target_kind="fact",
+            target_id=fact_id,
+            objective="reopen",
         )
         conn.execute(
-            "INSERT INTO intents (id, project_id, to_fact_id, description, creator, worker, last_heartbeat_at, created_at, concluded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (intent_id, project_id, fact_id, "external_feedback", creator, creator, now, now, now),
+            """
+            INSERT INTO intents (
+                id, project_id, to_fact_id, description, creator, worker,
+                last_heartbeat_at, created_at, concluded_at, fingerprint, status,
+                target_kind, target_id, objective
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', 'fact', ?, 'reopen')
+            """,
+            (
+                intent_id,
+                project_id,
+                fact_id,
+                "external_feedback",
+                creator,
+                creator,
+                now,
+                now,
+                now,
+                fingerprint,
+                fact_id,
+            ),
         )
         for source_id in source_ids:
             conn.execute(
@@ -370,6 +470,13 @@ def reopen_project(project_id: str, body: ReopenRequest):
         assert updated_intent is not None
         return ReopenResponse(
             project=project_meta_from_row(updated_project),
-            fact=Fact(id=fact_id, description=description),
+            fact=Fact(
+                id=fact_id,
+                description=description,
+                fact_type="feedback",
+                source=creator,
+                confidence=0.9,
+                parent_fact_ids=source_ids,
+            ),
             intent=intent_to_model(conn, updated_intent, project_id),
         )

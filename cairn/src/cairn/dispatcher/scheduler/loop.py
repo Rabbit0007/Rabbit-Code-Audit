@@ -48,11 +48,7 @@ EXPLORE_RETRYABLE_FAILURE_TYPES = frozenset(
 )
 BOOTSTRAP_INTENT_DESCRIPTION = "bootstrap"
 BOOTSTRAP_INTENT_CREATOR = "dispatcher.bootstrap"
-AUTO_COMPLETE_WORKER = "dispatcher.auto_complete"
-AUTO_COMPLETE_DESCRIPTION = (
-    "自动完成：所有审计意图、独立复核和报告材料任务均已收口，服务器完成校验已通过。"
-)
-AUTO_COMPLETE_BLOCKED_TRIGGER = "completion_blocked"
+COMPLETION_CHECK_TRIGGER = "completion_check"
 FINDING_ID_RE = re.compile(r"\bfinding_[0-9a-fA-F]{8,32}\b")
 REVIEW_INTENT_MARKERS = ("确认", "复核", "review", "reviews", "pending_review")
 
@@ -90,12 +86,15 @@ class DispatcherLoop:
         self.client = CairnClient(self.config.server)
         self.container_manager = ContainerManager(self.config.container)
         self.executor = ThreadPoolExecutor(max_workers=self.config.runtime.max_workers)
+        self.report_executor = ThreadPoolExecutor(max_workers=max(1, self.config.runtime.max_workers))
         self.cleanup_executor = ThreadPoolExecutor(max_workers=max(1, min(8, self.config.runtime.max_workers)))
         self.tool_scan_executor = ThreadPoolExecutor(max_workers=self.config.tasks.tool_scan.max_running)
         self.futures: dict[Future[str | TaskOutcome], RunningTask] = {}
+        self.report_futures: dict[Future[TaskOutcome], RunningTask] = {}
         self.tool_scan_futures: dict[Future[TaskOutcome], RunningTask] = {}
         self.cleanup_futures: dict[Future[bool], tuple[str, str | None, str | None]] = {}
         self.reason_checkpoints: dict[str, ReasonCheckpoint] = {}
+        self.completion_checkpoints: dict[str, ReasonCheckpoint] = {}
         self.runtime_project_ids: set[str] = set()
         self.worker_unhealthy_until: dict[str, float] = {}
         self.worker_rate_limited_until: dict[tuple[str, str], float] = {}
@@ -237,13 +236,17 @@ class DispatcherLoop:
         return TaskOutcome(status=value)
 
     def close(self) -> None:
-        if self.futures:
+        report_futures = getattr(self, "report_futures", {})
+        if self.futures or report_futures:
             LOG.info(
-                "dispatcher shutting down waiting_for_tasks=%s running_projects=%s",
+                "dispatcher shutting down waiting_for_tasks=%s report_tasks=%s running_projects=%s",
                 len(self.futures),
-                sorted({task.project_id for task in self.futures.values()}),
+                len(report_futures),
+                sorted({task.project_id for task in [*self.futures.values(), *report_futures.values()]}),
             )
         self.executor.shutdown(wait=True)
+        if hasattr(self, "report_executor"):
+            self.report_executor.shutdown(wait=True)
         self.tool_scan_executor.shutdown(wait=True)
         self.cleanup_executor.shutdown(wait=True)
         self.container_manager.close()
@@ -579,18 +582,13 @@ class DispatcherLoop:
             for task in self.client.list_pending_review_tasks(summary.id, limit=10)
             if isinstance(task, dict) and str(task.get("id") or "") not in running_review_tasks
         ]
-        if pending_review_tasks:
-            for task in pending_review_tasks:
-                if self._dispatch_review_task(project, task):
-                    return True
         running_report_tasks = self._project_running_report_enrichment_tasks(summary.id)
         pending_report_tasks = [
             task
             for task in self.client.list_pending_report_enrichments(summary.id, limit=10)
             if isinstance(task, dict) and task.get("id") not in running_report_tasks
         ]
-        if pending_report_tasks:
-            return self._dispatch_report_enrichment(project, pending_report_tasks[0])
+        reason_trigger: str | None = None
         if project.project.reason is not None:
             self._log_changed(
                 f"{skip_scope}:reason_claimed",
@@ -599,25 +597,30 @@ class DispatcherLoop:
                 summary.id,
                 project.project.reason.worker,
             )
-            return False
-        completion = "not_attempted"
-        if self._project_can_attempt_auto_complete(
-            project,
-            running_intent_ids=running_intent_ids,
-            running_review_tasks=running_review_tasks,
-            pending_review_tasks=pending_review_tasks,
-            running_report_tasks=running_report_tasks,
-            pending_report_tasks=pending_report_tasks,
-        ):
-            completion = self._try_auto_complete_project(project)
-            if completion == "completed":
+        else:
+            reason_trigger = self._reason_trigger(project)
+            if reason_trigger is None and self._project_can_request_completion_check(
+                project,
+                running_intent_ids=running_intent_ids,
+                running_review_tasks=running_review_tasks,
+                pending_review_tasks=pending_review_tasks,
+            ):
+                reason_trigger = COMPLETION_CHECK_TRIGGER
+            if reason_trigger is not None:
+                if not self._reason_parse_cooldown(project.project.id, reason_trigger):
+                    export_yaml = self.client.export_project(summary.id, profile="reason")
+                    if self._dispatch_reason(project, export_yaml, reason_trigger):
+                        return True
+
+        if pending_review_tasks:
+            for task in pending_review_tasks:
+                if self._dispatch_review_task(project, task):
+                    return True
+        if pending_report_tasks:
+            if self._dispatch_report_enrichment(project, pending_report_tasks[0]):
                 return True
-            if completion == "waiting":
-                return False
-        reason_trigger = self._reason_trigger(project)
-        if completion == "blocked" and reason_trigger is None:
-            reason_trigger = AUTO_COMPLETE_BLOCKED_TRIGGER
-        if reason_trigger is None:
+
+        if reason_trigger is None and project.project.reason is None:
             self._log_changed(
                 f"{skip_scope}:graph_unchanged",
                 logging.DEBUG,
@@ -628,87 +631,24 @@ class DispatcherLoop:
                 self._project_open_intent_count(project),
                 len(project.intents),
             )
-            return False
-        if reason_trigger == AUTO_COMPLETE_BLOCKED_TRIGGER:
-            LOG.info(
-                "project completion guards blocked auto complete; dispatching reason project=%s",
-                project.project.id,
-            )
-        if self._reason_parse_cooldown(project.project.id, reason_trigger):
-            return False
-        export_yaml = self.client.export_project(summary.id, profile="reason")
-        return self._dispatch_reason(project, export_yaml, reason_trigger)
+        return False
 
-    def _project_can_attempt_auto_complete(
+    def _project_can_request_completion_check(
         self,
         project: ProjectDetail,
         *,
         running_intent_ids: set[str],
         running_review_tasks: set[str],
         pending_review_tasks: list[dict],
-        running_report_tasks: set[str],
-        pending_report_tasks: list[dict],
     ) -> bool:
         if self._project_open_intent_count(project) > 0:
             return False
         if running_intent_ids or running_review_tasks or pending_review_tasks:
             return False
-        if running_report_tasks or pending_report_tasks:
+        checkpoint = self.completion_checkpoints.get(project.project.id)
+        if checkpoint is not None and self._reason_checkpoint_matches(project, checkpoint):
             return False
         return True
-
-    def _try_auto_complete_project(self, project: ProjectDetail) -> str:
-        project_id = project.project.id
-        if self._project_has_active_report_enrichment_tasks(project_id):
-            self._log_changed(
-                f"project:{project_id}:auto_complete:report_active",
-                logging.INFO,
-                "skip auto complete project=%s because report enrichment tasks are still active",
-                project_id,
-            )
-            return "waiting"
-        from_ids = [fact.id for fact in project.facts if fact.id != "goal"]
-        if not from_ids:
-            LOG.warning("skip auto complete project=%s because no non-goal facts are available", project_id)
-            return "skipped"
-        response = self.client.complete(
-            project_id,
-            from_ids,
-            AUTO_COMPLETE_DESCRIPTION,
-            AUTO_COMPLETE_WORKER,
-        )
-        if response.ok:
-            self.runtime_project_ids.discard(project_id)
-            self._clear_project_log_state(project_id)
-            LOG.info("auto completed project=%s facts=%s", project_id, len(from_ids))
-            return "completed"
-        if response.status_code == 403:
-            self.runtime_project_ids.discard(project_id)
-            LOG.info("auto complete skipped because project became inactive project=%s", project_id)
-            return "completed"
-        if response.status_code == 409:
-            self._log_changed(
-                f"project:{project_id}:auto_complete:blocked",
-                logging.INFO,
-                "auto complete blocked by server guards project=%s body=%s",
-                project_id,
-                response.text,
-            )
-            return "blocked"
-        LOG.warning(
-            "auto complete failed project=%s status=%s body=%s",
-            project_id,
-            response.status_code,
-            response.text,
-        )
-        return "skipped"
-
-    def _project_has_active_report_enrichment_tasks(self, project_id: str) -> bool:
-        for status in ("pending", "running"):
-            tasks = self.client.list_report_enrichments(project_id, status=status)
-            if any(isinstance(task, dict) for task in tasks):
-                return True
-        return False
 
     def _dispatch_initial_project(self, project: ProjectDetail) -> bool:
         intent = self._get_bootstrap_intent(project)
@@ -1092,7 +1032,7 @@ class DispatcherLoop:
             )
             return False
         try:
-            future = self.executor.submit(
+            future = self.report_executor.submit(
                 run_report_enrichment_task,
                 self.config,
                 self.client,
@@ -1106,8 +1046,7 @@ class DispatcherLoop:
             LOG.exception("failed to submit report enrichment task project=%s task=%s worker=%s", project.project.id, task_id, worker.name)
             self.client.release_report_enrichment(task_id, worker.name)
             return False
-        self.futures[future] = RunningTask(project.project.id, "report_enrichment", worker.name, cancellation, intent_id=task_id)
-        self.runtime_project_ids.add(project.project.id)
+        self.report_futures[future] = RunningTask(project.project.id, "report_enrichment", worker.name, cancellation, intent_id=task_id)
         self._clear_project_log_state(project.project.id)
         LOG.info("dispatched report enrichment project=%s task=%s finding=%s worker=%s", project.project.id, task_id, finding_id, worker.name)
         return True
@@ -1210,7 +1149,7 @@ class DispatcherLoop:
 
     def _worker_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
-        for task in self.futures.values():
+        for task in [*self.futures.values(), *getattr(self, "report_futures", {}).values()]:
             counts[task.worker_name] = counts.get(task.worker_name, 0) + 1
         return counts
 
@@ -1242,7 +1181,7 @@ class DispatcherLoop:
     def _project_running_report_enrichment_tasks(self, project_id: str) -> set[str]:
         return {
             task.intent_id
-            for task in self.futures.values()
+            for task in getattr(self, "report_futures", {}).values()
             if task.project_id == project_id and task.task_type == "report_enrichment" and task.intent_id is not None
         }
 
@@ -1373,6 +1312,13 @@ class DispatcherLoop:
         if not changes:
             return None
         return ",".join(changes)
+
+    def _reason_checkpoint_matches(self, project: ProjectDetail, checkpoint: ReasonCheckpoint) -> bool:
+        return (
+            checkpoint.fact_count == len(project.facts)
+            and checkpoint.hint_count == len(project.hints)
+            and checkpoint.open_intent_count == self._project_open_intent_count(project)
+        )
 
     def _reason_parse_cooldown(self, project_id: str, trigger: str) -> bool:
         state = self.reason_failure_state.get(project_id)
@@ -1531,9 +1477,11 @@ class DispatcherLoop:
         return blocked_until
 
     def _reap_futures(self) -> None:
-        done = [future for future in self.futures if future.done()]
-        for future in done:
-            task = self.futures.pop(future)
+        done = [(self.futures, future) for future in self.futures if future.done()]
+        report_futures = getattr(self, "report_futures", {})
+        done.extend((report_futures, future) for future in report_futures if future.done())
+        for task_futures, future in done:
+            task = task_futures.pop(future)
             try:
                 outcome = self._coerce_task_outcome(future.result())
                 self._record_task_history(task, outcome)
@@ -1606,26 +1554,7 @@ class DispatcherLoop:
                     if status == "success":
                         self.reason_failure_state.pop(task.project_id, None)
                     elif outcome.error_type == "parse_failed" and task.reason_trigger:
-                        limit_reached = self._record_reason_parse_failure(task.project_id, task.reason_trigger)
-                        if (
-                            limit_reached
-                            and task.fact_count is not None
-                            and task.hint_count is not None
-                            and task.open_intent_count is not None
-                        ):
-                            self.reason_checkpoints[task.project_id] = ReasonCheckpoint(
-                                fact_count=task.fact_count,
-                                hint_count=task.hint_count,
-                                open_intent_count=task.open_intent_count,
-                            )
-                            LOG.warning(
-                                "reason parse failures reached limit; checkpointing current graph state project=%s trigger=%s facts=%s hints=%s open_intents=%s",
-                                task.project_id,
-                                task.reason_trigger,
-                                task.fact_count,
-                                task.hint_count,
-                                task.open_intent_count,
-                            )
+                        self._record_reason_parse_failure(task.project_id, task.reason_trigger)
                 if task.task_type == "explore" and task.intent_id:
                     if status == "success":
                         self._clear_explore_parse_failure(task.project_id, task.intent_id)
@@ -1645,6 +1574,19 @@ class DispatcherLoop:
                         hint_count=task.hint_count,
                         open_intent_count=task.open_intent_count,
                     )
+                    if task.open_intent_count == 0:
+                        self.completion_checkpoints[task.project_id] = ReasonCheckpoint(
+                            fact_count=task.fact_count,
+                            hint_count=task.hint_count,
+                            open_intent_count=task.open_intent_count,
+                        )
+                        LOG.debug(
+                            "completion check checkpoint updated project=%s facts=%s hints=%s open_intents=%s",
+                            task.project_id,
+                            task.fact_count,
+                            task.hint_count,
+                            task.open_intent_count,
+                        )
                     LOG.debug(
                         "reason checkpoint updated project=%s facts=%s hints=%s open_intents=%s",
                         task.project_id,
@@ -1736,6 +1678,9 @@ class DispatcherLoop:
         for project_id in list(self.reason_failure_state):
             if project_id not in active_ids:
                 self.reason_failure_state.pop(project_id, None)
+        for project_id in list(self.completion_checkpoints):
+            if project_id not in active_ids:
+                self.completion_checkpoints.pop(project_id, None)
         for key in list(self.explore_failure_state):
             if key[0] not in active_ids:
                 self.explore_failure_state.pop(key, None)
@@ -1751,7 +1696,11 @@ class DispatcherLoop:
 
     def _cancel_inactive_tasks(self, summaries: list[ProjectSummary]) -> None:
         status_by_project = {summary.id: summary.status for summary in summaries}
-        running_tasks = list(self.futures.values()) + list(self.tool_scan_futures.values())
+        running_tasks = (
+            list(self.futures.values())
+            + list(getattr(self, "report_futures", {}).values())
+            + list(self.tool_scan_futures.values())
+        )
         for task in running_tasks:
             status = status_by_project.get(task.project_id, "deleted")
             if status != "active" and task.cancellation.cancel(status):

@@ -115,16 +115,17 @@ def create_audit_finding(project_id: str, body: CreateAuditFindingRequest):
         if inferred_business_node_id and not body.business_node_id:
             body = body.model_copy(update={"business_node_id": inferred_business_node_id})
         _validate_audit_finding_quality(conn, project_id, body)
+        evidence_level = _infer_evidence_level(body)
         conn.execute(
             """
             INSERT INTO audit_findings (
                 id, project_id, snapshot_id, title, category, severity, status,
-                cwe, file_path, line_start, line_end, symbol, entry_point,
+                evidence_level, cwe, file_path, line_start, line_end, symbol, entry_point,
                 business_node_id, description, impact, evidence,
                 proof_packets_json, reproduction_poc_json, remediation,
                 discovered_by, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 finding_id,
@@ -134,6 +135,7 @@ def create_audit_finding(project_id: str, body: CreateAuditFindingRequest):
                 body.category,
                 body.severity,
                 initial_status,
+                evidence_level,
                 body.cwe,
                 body.file_path,
                 body.line_start,
@@ -310,10 +312,16 @@ def _apply_audit_finding_review(
     conn.execute(
         """
         UPDATE audit_findings
-        SET status = ?, reviewed_by = ?, reviewed_at = ?
+        SET status = ?,
+            reviewed_by = ?,
+            reviewed_at = ?,
+            evidence_level = CASE
+                WHEN ? = 'confirmed' THEN 'L5'
+                ELSE evidence_level
+            END
         WHERE id = ? AND project_id = ?
         """,
-        (decision, reviewer, reviewed_at, finding_id, project_id),
+        (decision, reviewer, reviewed_at, decision, finding_id, project_id),
     )
     _sync_reportable_finding(conn, finding_id)
     if decision == "confirmed":
@@ -579,6 +587,18 @@ def _validate_audit_finding_quality(conn, project_id: str, body: CreateAuditFind
             422,
             "High or critical audit findings require concrete code evidence: " + ", ".join(missing),
         )
+
+
+def _infer_evidence_level(body: CreateAuditFindingRequest) -> str:
+    if _has_complete_proof_packet(body.proof_packets) or _has_complete_reproduction_poc(
+        body.reproduction_poc
+    ):
+        return "L3"
+    if body.evidence and body.file_path and (body.line_start is not None or body.symbol):
+        if body.entry_point:
+            return "L2"
+        return "L1"
+    return "L0"
 
 
 def _audit_finding_from_row(row) -> AuditFinding:

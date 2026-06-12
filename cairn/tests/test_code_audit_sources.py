@@ -627,13 +627,55 @@ class User(models.Model):
     graph = client.get(f"/api/projects/{project_id}/business-graph").json()
     node_types = {item["node_type"] for item in graph["nodes"]}
     assert {"feature", "endpoint", "control", "data_object", "risk"} <= node_types
+    assert any(item["title"] == "业务模块 services" for item in graph["nodes"])
     assert any(item["title"] == "业务功能 users" for item in graph["nodes"])
     assert any(item["title"] == "处理逻辑 lock_user" for item in graph["nodes"])
     assert any(item["title"] == "处理逻辑 UserService" for item in graph["nodes"])
     assert any(item["title"] == "数据对象 User" for item in graph["nodes"])
+    assert not any(item["title"] == "数据对象 flask" for item in graph["nodes"])
     assert any(item["source_snapshot_id"] == snapshot["id"] for item in graph["nodes"])
     assert all(0 < item["confidence"] <= 1 for item in graph["nodes"])
-    assert {"exposes", "calls", "uses", "risk_of"} <= {item["relation"] for item in graph["edges"]}
+    assert {"contains", "exposes", "calls", "uses", "risk_of"} <= {item["relation"] for item in graph["edges"]}
+
+    data_flow = next(
+        item
+        for item in client.get(f"/api/projects/{project_id}/audit-candidates").json()
+        if item["candidate_type"] == "data_flow" and item["file_path"] == "app/services.py"
+    )
+    intent = client.post(
+        f"/projects/{project_id}/intents",
+        json={
+            "from": ["origin"],
+            "description": f"审计候选 {data_flow['id']} 的跨文件 SQL 数据流。",
+            "creator": "reason-worker",
+            "worker": None,
+        },
+    ).json()
+    exported = client.get(
+        f"/projects/{project_id}/export",
+        params={"format": "yaml", "profile": "explore", "intent_id": intent["id"]},
+    )
+    data = yaml.safe_load(exported.text)
+    audit_context = data["code_index"]["audit_context"]
+    assert "业务理解索引上下文" in audit_context["purpose"]
+    assert any(
+        summary["title"] == "业务模块 services"
+        and summary["child_counts"].get("control", 0) >= 1
+        and summary["risk_threads"]
+        for summary in audit_context["module_summaries"]
+    )
+    assert any(
+        trace["entry_point"] == "POST /api/users/{user_id}/lock"
+        and trace["path_chain"][:2] == ["app/api.py", "app/services.py"]
+        for trace in audit_context["business_flow_traces"]
+    )
+    traces = audit_context["candidate_entrypoint_traces"]
+    assert any(
+        trace["candidate_id"] == data_flow["id"]
+        and trace["path_chain"][:2] == ["app/api.py", "app/services.py"]
+        for trace in traces
+    )
+    assert audit_context["entrypoint_traces"] == audit_context["candidate_entrypoint_traces"]
 
     reindexed = client.post(f"/api/projects/{project_id}/sources/{snapshot['id']}/reindex")
     assert reindexed.status_code == 200
@@ -781,6 +823,18 @@ class Job:
     graph = client.get(f"/api/projects/{project_id}/business-graph").json()
     risk_nodes = [node for node in graph["nodes"] if node["node_type"] == "risk"]
     assert any("待审计能力链" in node["title"] and node["risk_level"] == "high" for node in risk_nodes)
+    assert any(
+        node["node_type"] == "control" and "权限边界" in node["title"]
+        for node in graph["nodes"]
+    )
+    assert any(
+        node["node_type"] == "asset" and "文件生命周期" in node["title"]
+        for node in graph["nodes"]
+    )
+    assert any(
+        edge["relation"] in {"guards", "uses", "risk_of"}
+        for edge in graph["edges"]
+    )
 
     reason_export = client.get(
         f"/projects/{project_id}/export",
@@ -792,6 +846,88 @@ class Job:
         item["id"] for item in reason_data["audit_candidates"]["coverage"]["high_risk_unresolved"]
     }
     assert {item["id"] for item in capability_candidates} & high_risk_ids
+
+
+def test_source_index_extracts_multilanguage_upload_file_facts(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/app/views.py": b"""
+from django.core.files.storage import default_storage
+
+def upload_view(request):
+    uploaded = request.FILES["file"]
+    tenant_id = request.query_params.get("tenant_id")
+    path = request.query_params.get("path")
+    return default_storage.save(path, uploaded)
+""",
+            "demo/src/main/java/demo/UploadController.java": b"""
+package demo;
+
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.multipart.MultipartFile;
+
+class UploadController {
+    void upload(HttpServletRequest request, @RequestParam MultipartFile file) {
+        String name = request.getParameter("name");
+        Files.copy(file.getInputStream(), Paths.get(name));
+    }
+}
+""",
+            "demo/server/upload.go": b"""
+package main
+
+func upload(c *gin.Context) {
+    file, _ := c.FormFile("file")
+    dst := c.Query("path")
+    c.SaveUploadedFile(file, dst)
+}
+""",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("uploads.zip", payload, "application/zip")},
+    ).json()
+
+    candidates = client.get(f"/api/projects/{project_id}/audit-candidates").json()
+    file_flows = [
+        item
+        for item in candidates
+        if item["candidate_type"] == "data_flow"
+        and "外部输入到文件读写/加载能力" in item["title"]
+    ]
+    assert {item["file_path"] for item in file_flows} >= {
+        "app/views.py",
+        "src/main/java/demo/UploadController.java",
+        "server/upload.go",
+    }
+    assert all("索引优先级" in item["description"] for item in file_flows)
+    assert all("不是漏洞类型判断" in item["description"] for item in file_flows)
+
+    quality = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/index-quality").json()
+    assert quality["candidate_count"] >= len(file_flows)
+    assert quality["high_impact_candidate_count"] >= len(file_flows)
+    assert quality["candidate_type_counts"]["data_flow"] >= len(file_flows)
+
+    capabilities = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/capabilities").json()
+    categories = {item["category"] for item in capabilities}
+    assert {"file_upload", "file_write", "object_scope_guard"} <= categories
+
+    graph = client.get(f"/api/projects/{project_id}/business-graph").json()
+    assert any(
+        node["node_type"] == "asset" and "文件生命周期" in node["title"]
+        for node in graph["nodes"]
+    )
+    assert any(
+        node["node_type"] == "asset" and "对象边界" in node["title"]
+        for node in graph["nodes"]
+    )
 
 
 def test_source_import_indexes_satrda_routes_and_seeds_business_graph(temp_db, monkeypatch, tmp_path):
@@ -1249,6 +1385,14 @@ $result=mysql_query($sql);
     assert data["validation_strategy"]["default_mode"] == "static_first"
     assert data["validation_strategy"]["dynamic_mode"] == "targeted_optional"
     assert data["validation_strategy"]["has_compose"] is True
+    audit_context = data["code_index"]["audit_context"]
+    assert audit_context["focused_candidate_ids"] == [focused["id"]]
+    assert audit_context["module_summaries"]
+    assert "business_flow_traces" in audit_context
+    assert audit_context["priority_candidates"][0]["id"] == focused["id"]
+    assert audit_context["priority_candidates"][0]["risk_score"] >= 70
+    assert audit_context["file_slices"]
+    assert audit_context["file_slices"][0]["path"] == "Less-1/index.php"
     included_ids = {item["id"] for item in data["audit_candidates"]["items"]}
     assert focused["id"] in included_ids
     assert all(

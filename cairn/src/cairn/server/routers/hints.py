@@ -19,7 +19,34 @@ def create_hint(project_id: str, body: CreateHintRequest):
         now = utcnow()
         hid = next_hint_id(conn, project_id)
         conn.execute(
-            "INSERT INTO hints (id, project_id, content, creator, created_at) VALUES (?, ?, ?, ?, ?)",
-            (hid, project_id, body.content, body.creator, now),
+            """
+            INSERT INTO hints (
+                id, project_id, content, creator, created_at,
+                hint_type, target, priority, expires_at, max_uses
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                hid,
+                project_id,
+                body.content,
+                body.creator,
+                now,
+                body.hint_type,
+                body.target,
+                body.priority,
+                body.expires_at,
+                body.max_uses,
+            ),
         )
-        return Hint(id=hid, content=body.content, creator=body.creator, created_at=now)
+        return Hint(
+            id=hid,
+            content=body.content,
+            creator=body.creator,
+            created_at=now,
+            hint_type=body.hint_type,
+            target=body.target,
+            priority=body.priority,
+            expires_at=body.expires_at,
+            max_uses=body.max_uses,
+        )

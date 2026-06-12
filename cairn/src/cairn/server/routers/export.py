@@ -1,3 +1,4 @@
+from collections import Counter
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from datetime import datetime
@@ -16,6 +17,7 @@ from cairn.server.services import (
 )
 from cairn.server.source_service import list_snapshots, snapshot_container_path
 from cairn.server.source_service import (
+    audit_candidate_priority,
     get_source_index_summary,
     list_code_capabilities,
     list_code_entrypoints,
@@ -53,10 +55,10 @@ def _load_project_data(conn, project_id: str):
     proj = get_project_or_404(conn, project_id)
 
     facts = conn.execute(
-        "SELECT id, description FROM facts WHERE project_id = ?", (project_id,)
+        "SELECT * FROM facts WHERE project_id = ?", (project_id,)
     ).fetchall()
     hints = conn.execute(
-        "SELECT content, creator, created_at FROM hints WHERE project_id = ? ORDER BY created_at",
+        "SELECT * FROM hints WHERE project_id = ? ORDER BY created_at",
         (project_id,),
     ).fetchall()
     intents = conn.execute(
@@ -471,14 +473,14 @@ def _select_audit_candidate_rows(rows, *, profile: str, focus_candidate_ids: set
             and row["file_path"] in focused_files
         ]
         if focused:
-            return (focused + related)[:EXPLORE_CANDIDATE_LIMIT]
+            return (_sort_candidate_rows(focused) + _sort_candidate_rows(related))[:EXPLORE_CANDIDATE_LIMIT]
         required = [
             row
             for row in rows
             if row["severity"] in ("critical", "high", "unknown")
             and row["status"] in ("candidate", "investigating")
         ]
-        return required[:EXPLORE_CANDIDATE_LIMIT]
+        return _sort_candidate_rows(required)[:EXPLORE_CANDIDATE_LIMIT]
     required = [
         row
         for row in rows
@@ -494,7 +496,7 @@ def _select_audit_candidate_rows(rows, *, profile: str, focus_candidate_ids: set
     ]
     selected: list = []
     seen: set[str] = set()
-    for row in [*required, *invalid]:
+    for row in [*_sort_candidate_rows(required), *_sort_candidate_rows(invalid)]:
         if row["id"] in seen:
             continue
         selected.append(row)
@@ -502,6 +504,42 @@ def _select_audit_candidate_rows(rows, *, profile: str, focus_candidate_ids: set
         if len(selected) >= REASON_CANDIDATE_LIMIT:
             break
     return selected
+
+
+def _sort_candidate_rows(rows) -> list:
+    return sorted(
+        rows,
+        key=lambda row: (
+            -_candidate_priority(row)["score"],
+            _candidate_status_rank(row["status"]),
+            row["created_at"] or "",
+            row["id"],
+        ),
+    )
+
+
+def _candidate_status_rank(status: str | None) -> int:
+    return {
+        "candidate": 0,
+        "investigating": 1,
+        "needs_more_evidence": 2,
+        "confirmed": 3,
+        "rejected": 4,
+    }.get(status or "", 9)
+
+
+def _candidate_priority(row) -> dict:
+    return audit_candidate_priority(
+        candidate_type=row["candidate_type"],
+        severity=row["severity"],
+        status=row["status"],
+        title=row["title"],
+        description=row["description"],
+        file_path=row["file_path"],
+        line_start=row["line_start"],
+        entry_point=row["entry_point"],
+        symbol=row["symbol"],
+    )
 
 
 def _is_high_risk_unresolved_candidate(row) -> bool:
@@ -540,6 +578,7 @@ def _audit_candidate_conclusion_blocker_reason(row) -> str | None:
 
 
 def _audit_candidate_export_row(row) -> dict:
+    priority = _candidate_priority(row)
     return {
         "id": row["id"],
         "snapshot_id": row["snapshot_id"],
@@ -565,6 +604,708 @@ def _audit_candidate_export_row(row) -> dict:
         "updated_at": format_export_timestamp(row["updated_at"]),
         "concluded_by": row["concluded_by"],
         "concluded_at": format_export_timestamp(row["concluded_at"]),
+        "risk_score": priority["score"],
+        "priority_reasons": priority["reasons"],
+        "cluster_key": priority["cluster_key"],
+    }
+
+
+def _load_code_index_audit_context(
+    conn,
+    project_id: str,
+    snapshot_id: str,
+    *,
+    profile: str,
+    focus_candidate_ids: set[str],
+) -> dict:
+    rows = conn.execute(
+        """
+        SELECT c.*, af.status AS audit_finding_status
+        FROM audit_candidates c
+        LEFT JOIN audit_findings af
+          ON af.id = c.audit_finding_id
+         AND af.project_id = c.project_id
+        WHERE c.project_id = ?
+          AND c.snapshot_id = ?
+          AND c.source = 'index'
+        ORDER BY c.created_at, c.id
+        """,
+        (project_id, snapshot_id),
+    ).fetchall()
+    selected = _select_audit_candidate_rows(
+        rows,
+        profile=profile,
+        focus_candidate_ids=focus_candidate_ids,
+    )
+    candidate_limit = 20 if profile == "explore" else 40 if profile == "reason" else 80
+    file_limit = 8 if profile == "explore" else 12 if profile == "reason" else 20
+    relationship_limit = 80 if profile == "explore" else 120 if profile == "reason" else 200
+    priority_candidates = _sort_candidate_rows(selected)[:candidate_limit]
+    paths = _ordered_candidate_paths(priority_candidates)[:file_limit]
+    path_set = set(paths)
+    if path_set:
+        path_set.update(_adjacent_paths(conn, snapshot_id, path_set, limit=file_limit * 2))
+    paths = [path for path in [*paths, *sorted(path_set - set(paths))] if path][:file_limit]
+
+    entrypoints = _index_rows_for_paths(
+        conn,
+        snapshot_id,
+        "code_entrypoints",
+        paths,
+        columns="id, path, method, route, handler, line_start, evidence, confidence, source",
+        order_by="path, COALESCE(line_start, 0), route, COALESCE(method, '')",
+        limit=80,
+    )
+    capabilities = _index_rows_for_paths(
+        conn,
+        snapshot_id,
+        "code_capabilities",
+        paths,
+        columns="id, path, symbol, category, title, line_start, evidence, risk_level, risk_tags_json, confidence, source",
+        order_by=(
+            "CASE risk_level WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, "
+            "path, COALESCE(line_start, 0), category"
+        ),
+        limit=120,
+    )
+    symbols = _index_rows_for_paths(
+        conn,
+        snapshot_id,
+        "code_symbols",
+        paths,
+        columns="id, path, kind, name, container, signature, line_start, line_end, confidence, source",
+        where_extra="AND kind IN ('data_object', 'class', 'function', 'method')",
+        order_by="path, kind, COALESCE(line_start, 0), name",
+        limit=120,
+    )
+    relationships = _relationship_rows_for_paths(conn, snapshot_id, paths, limit=relationship_limit)
+    entrypoint_traces = _candidate_entrypoint_traces(conn, snapshot_id, priority_candidates)
+    module_limit = 8 if profile == "explore" else 12 if profile == "reason" else 30
+    flow_limit = 10 if profile == "explore" else 18 if profile == "reason" else 40
+    module_summaries = _business_module_summaries(conn, project_id, snapshot_id, limit=module_limit)
+    business_flow_traces = _business_flow_traces(conn, snapshot_id, limit=flow_limit)
+
+    entrypoints_by_path = _group_by_path(entrypoints)
+    capabilities_by_path = _group_by_path(capabilities)
+    symbols_by_path = _group_by_path(symbols)
+    relationships_by_path: dict[str, list] = {}
+    for row in relationships:
+        relationships_by_path.setdefault(row["from_path"], []).append(row)
+        if row["to_path"] != row["from_path"]:
+            relationships_by_path.setdefault(row["to_path"], []).append(row)
+
+    return {
+        "purpose": (
+            "给当前 worker 的业务理解索引上下文。先用 module_summaries 和 business_flow_traces 建立模块、"
+            "入口、处理逻辑、数据对象、语义边界与依赖链，再用 priority_candidates 定位需要深入阅读的源码。"
+            "索引只做导航和事实压缩，不替代 worker 自己阅读源码与判断漏洞类型。"
+        ),
+        "priority_model": "risk_score 只用于排序：入口可达、高影响能力、输入符号、控制/校验线索和已有结论会改变分数。",
+        "focused_candidate_ids": sorted(focus_candidate_ids),
+        "module_summaries": module_summaries,
+        "business_flow_traces": business_flow_traces,
+        "priority_candidates": [_candidate_context_item(row) for row in priority_candidates],
+        "candidate_entrypoint_traces": entrypoint_traces,
+        "entrypoint_traces": entrypoint_traces,
+        "file_slices": [
+            {
+                "path": path,
+                "entrypoints": [_entrypoint_context_item(row) for row in entrypoints_by_path.get(path, [])[:12]],
+                "capabilities": [_capability_context_item(row) for row in capabilities_by_path.get(path, [])[:12]],
+                "symbols": [_symbol_context_item(row) for row in symbols_by_path.get(path, [])[:16]],
+                "relationships": [_relationship_context_item(row) for row in relationships_by_path.get(path, [])[:16]],
+            }
+            for path in paths
+        ],
+        "omitted": {
+            "candidate_count": max(0, len(selected) - len(priority_candidates)),
+            "path_count": max(0, len(path_set) - len(paths)),
+        },
+    }
+
+
+def _ordered_candidate_paths(rows) -> list[str]:
+    paths: list[str] = []
+    for row in rows:
+        path = row["file_path"]
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _candidate_entrypoint_traces(conn, snapshot_id: str, candidates, *, max_depth: int = 6, max_per_candidate: int = 3) -> list[dict]:
+    target_paths = {row["file_path"] for row in candidates if row["file_path"]}
+    if not target_paths:
+        return []
+    entrypoint_rows = conn.execute(
+        """
+        SELECT path, method, route, handler, line_start, confidence
+        FROM code_entrypoints
+        WHERE snapshot_id = ?
+        ORDER BY path, COALESCE(line_start, 0), route, COALESCE(method, '')
+        LIMIT 5000
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    entrypoints_by_path: dict[str, list] = {}
+    for row in entrypoint_rows:
+        entrypoints_by_path.setdefault(row["path"], []).append(row)
+    if not entrypoints_by_path:
+        return []
+    relationship_rows = conn.execute(
+        """
+        SELECT from_path, from_symbol, to_path, to_symbol, relation,
+               evidence, confidence, source, line_start
+        FROM code_relationships
+        WHERE snapshot_id = ?
+          AND relation IN ('calls', 'imports', 'uses')
+        ORDER BY
+            CASE relation WHEN 'calls' THEN 0 WHEN 'uses' THEN 1 WHEN 'imports' THEN 2 ELSE 3 END,
+            confidence DESC,
+            from_path,
+            to_path,
+            COALESCE(line_start, 0)
+        LIMIT 20000
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    reverse_adjacency: dict[str, list] = {}
+    for row in relationship_rows:
+        if row["from_path"] == row["to_path"]:
+            continue
+        reverse_adjacency.setdefault(row["to_path"], []).append(row)
+
+    traces: list[dict] = []
+    seen_trace_keys: set[tuple[str, str, tuple[str, ...]]] = set()
+    for candidate in candidates:
+        candidate_id = candidate["id"]
+        target_path = candidate["file_path"]
+        if not target_path:
+            continue
+        direct_entrypoints = entrypoints_by_path.get(target_path, [])
+        for entrypoint in direct_entrypoints[:max_per_candidate]:
+            item = _entrypoint_trace_item(candidate, entrypoint, [])
+            key = (item["candidate_id"], item["entry_point"], tuple(item["path_chain"]))
+            if key not in seen_trace_keys:
+                traces.append(item)
+                seen_trace_keys.add(key)
+            if len([trace for trace in traces if trace["candidate_id"] == candidate_id]) >= max_per_candidate:
+                break
+        if len([trace for trace in traces if trace["candidate_id"] == candidate_id]) >= max_per_candidate:
+            continue
+
+        queue: list[tuple[str, list, set[str]]] = [(target_path, [], {target_path})]
+        while queue:
+            current_path, edges, visited = queue.pop(0)
+            if len(edges) >= max_depth:
+                continue
+            incoming = reverse_adjacency.get(current_path, [])[:30]
+            for rel in incoming:
+                previous_path = rel["from_path"]
+                if not previous_path or previous_path in visited:
+                    continue
+                next_edges = [rel, *edges]
+                if previous_path in entrypoints_by_path:
+                    for entrypoint in entrypoints_by_path[previous_path][:2]:
+                        item = _entrypoint_trace_item(candidate, entrypoint, next_edges)
+                        key = (item["candidate_id"], item["entry_point"], tuple(item["path_chain"]))
+                        if key in seen_trace_keys:
+                            continue
+                        traces.append(item)
+                        seen_trace_keys.add(key)
+                        if len([trace for trace in traces if trace["candidate_id"] == candidate_id]) >= max_per_candidate:
+                            break
+                if len([trace for trace in traces if trace["candidate_id"] == candidate_id]) >= max_per_candidate:
+                    break
+                queue.append((previous_path, next_edges, visited | {previous_path}))
+            if len([trace for trace in traces if trace["candidate_id"] == candidate_id]) >= max_per_candidate:
+                break
+    return traces[: max(20, len(candidates) * max_per_candidate)]
+
+
+def _business_module_summaries(conn, project_id: str, snapshot_id: str, *, limit: int) -> list[dict]:
+    modules = conn.execute(
+        """
+        SELECT id, node_type, title, description, risk_level, review_status,
+               coverage_note, risk_tags_json, evidence_json, source_snapshot_id,
+               confidence, created_by
+        FROM business_nodes
+        WHERE project_id = ?
+          AND source_snapshot_id = ?
+          AND node_type = 'feature'
+          AND title LIKE '业务模块 %'
+        ORDER BY confidence DESC, title, id
+        LIMIT 400
+        """,
+        (project_id, snapshot_id),
+    ).fetchall()
+    if not modules:
+        return []
+
+    module_ids = [row["id"] for row in modules]
+    placeholders = ",".join("?" for _ in module_ids)
+    child_rows = conn.execute(
+        f"""
+        SELECT e.from_node_id AS module_id,
+               e.relation AS module_relation,
+               n.id, n.node_type, n.title, n.description, n.risk_level,
+               n.review_status, n.coverage_note, n.risk_tags_json,
+               n.evidence_json, n.source_snapshot_id, n.confidence,
+               n.created_by
+        FROM business_edges e
+        JOIN business_nodes n
+          ON n.id = e.to_node_id
+         AND n.project_id = e.project_id
+        WHERE e.project_id = ?
+          AND e.from_node_id IN ({placeholders})
+          AND e.relation = 'contains'
+        ORDER BY e.confidence DESC, n.node_type, n.title, n.id
+        """,
+        (project_id, *module_ids),
+    ).fetchall()
+
+    children_by_module: dict[str, list] = {}
+    for row in child_rows:
+        children_by_module.setdefault(row["module_id"], []).append(row)
+
+    scored_modules = sorted(
+        modules,
+        key=lambda row: (
+            -_business_module_score(row, children_by_module.get(row["id"], [])),
+            row["title"],
+            row["id"],
+        ),
+    )[:limit]
+
+    summaries: list[dict] = []
+    for module in scored_modules:
+        children = children_by_module.get(module["id"], [])
+        counts = Counter(row["node_type"] for row in children)
+        semantic_boundaries = [row for row in children if _is_semantic_boundary_node(row)]
+        control_points = [
+            row
+            for row in children
+            if row["node_type"] == "control" and not _is_semantic_boundary_node(row)
+        ]
+        child_ids = [row["id"] for row in children]
+        internal_edges = _business_module_internal_edges(conn, project_id, child_ids, limit=28)
+        relation_counts = Counter(row["relation"] for row in internal_edges)
+        summaries.append(
+            {
+                "id": module["id"],
+                "title": module["title"],
+                "risk_level": module["risk_level"],
+                "review_status": module["review_status"],
+                "confidence": module["confidence"],
+                "risk_tags": _decode_json_list(module["risk_tags_json"]),
+                "evidence": _decode_json_list(module["evidence_json"]),
+                "child_counts": dict(sorted(counts.items())),
+                "entrypoints": [
+                    _business_node_brief(row)
+                    for row in children
+                    if row["node_type"] == "endpoint"
+                ][:6],
+                "control_points": [_business_node_brief(row) for row in control_points[:8]],
+                "data_objects": [
+                    _business_node_brief(row)
+                    for row in children
+                    if row["node_type"] == "data_object"
+                ][:8],
+                "semantic_boundaries": [_business_node_brief(row) for row in semantic_boundaries[:8]],
+                "risk_threads": [
+                    _business_node_brief(row)
+                    for row in children
+                    if row["node_type"] == "risk"
+                ][:8],
+                "internal_relations": {
+                    "relation_counts": dict(sorted(relation_counts.items())),
+                    "edges": [_business_edge_brief(row) for row in internal_edges[:12]],
+                },
+            }
+        )
+    return summaries
+
+
+def _business_module_score(module, children: list) -> float:
+    counts = Counter(row["node_type"] for row in children)
+    boundary_count = sum(1 for row in children if _is_semantic_boundary_node(row))
+    high_risk_count = sum(1 for row in children if row["risk_level"] in {"critical", "high", "unknown"})
+    return (
+        counts["endpoint"] * 6
+        + counts["control"] * 3
+        + counts["data_object"] * 3
+        + counts["asset"] * 4
+        + counts["external_system"] * 4
+        + counts["risk"] * 5
+        + boundary_count * 4
+        + high_risk_count * 2
+        + float(module["confidence"] or 0) * 2
+    )
+
+
+def _business_module_internal_edges(conn, project_id: str, child_ids: list[str], *, limit: int) -> list:
+    if len(child_ids) < 2:
+        return []
+    usable_ids = child_ids[:300]
+    placeholders = ",".join("?" for _ in usable_ids)
+    return conn.execute(
+        f"""
+        SELECT id, from_node_id, to_node_id, relation, description, confidence, created_by
+        FROM business_edges
+        WHERE project_id = ?
+          AND relation != 'contains'
+          AND from_node_id IN ({placeholders})
+          AND to_node_id IN ({placeholders})
+        ORDER BY
+            CASE relation WHEN 'calls' THEN 0 WHEN 'uses' THEN 1 WHEN 'guards' THEN 2 WHEN 'depends_on' THEN 3 ELSE 4 END,
+            confidence DESC,
+            from_node_id,
+            to_node_id
+        LIMIT ?
+        """,
+        (project_id, *usable_ids, *usable_ids, limit),
+    ).fetchall()
+
+
+def _is_semantic_boundary_node(row) -> bool:
+    tags = set(_decode_json_list(row["risk_tags_json"]))
+    if row["node_type"] in {"asset", "external_system"}:
+        return True
+    return bool(
+        tags
+        & {
+            "权限边界",
+            "对象边界",
+            "文件生命周期",
+            "执行边界",
+            "敏感资产",
+            "外部系统",
+        }
+    )
+
+
+def _business_node_brief(row) -> dict:
+    return {
+        "id": row["id"],
+        "type": row["node_type"],
+        "title": row["title"],
+        "risk_level": row["risk_level"],
+        "review_status": row["review_status"],
+        "risk_tags": _decode_json_list(row["risk_tags_json"]),
+        "evidence": _decode_json_list(row["evidence_json"])[:3],
+        "confidence": row["confidence"],
+    }
+
+
+def _business_edge_brief(row) -> dict:
+    return {
+        "id": row["id"],
+        "from": row["from_node_id"],
+        "to": row["to_node_id"],
+        "relation": row["relation"],
+        "description": row["description"],
+        "confidence": row["confidence"],
+    }
+
+
+def _business_flow_traces(conn, snapshot_id: str, *, limit: int, max_depth: int = 4, max_per_entrypoint: int = 2) -> list[dict]:
+    entrypoint_rows = conn.execute(
+        """
+        SELECT path, method, route, handler, line_start, evidence, confidence, source
+        FROM code_entrypoints
+        WHERE snapshot_id = ?
+        ORDER BY path, COALESCE(line_start, 0), route, COALESCE(method, '')
+        LIMIT 3000
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    if not entrypoint_rows:
+        return []
+    relationship_rows = conn.execute(
+        """
+        SELECT from_path, from_symbol, to_path, to_symbol, relation,
+               evidence, confidence, source, line_start
+        FROM code_relationships
+        WHERE snapshot_id = ?
+          AND relation IN ('calls', 'imports', 'uses')
+        ORDER BY
+            CASE relation WHEN 'calls' THEN 0 WHEN 'uses' THEN 1 WHEN 'imports' THEN 2 ELSE 3 END,
+            confidence DESC,
+            from_path,
+            to_path,
+            COALESCE(line_start, 0)
+        LIMIT 20000
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    adjacency: dict[str, list] = {}
+    for row in relationship_rows:
+        if not row["from_path"] or not row["to_path"] or row["from_path"] == row["to_path"]:
+            continue
+        adjacency.setdefault(row["from_path"], []).append(row)
+
+    traces: list[dict] = []
+    seen_trace_keys: set[tuple[str, tuple[str, ...]]] = set()
+    for entrypoint in entrypoint_rows:
+        emitted = 0
+        queue: list[tuple[str, list, set[str]]] = [(entrypoint["path"], [], {entrypoint["path"]})]
+        while queue and len(traces) < limit and emitted < max_per_entrypoint:
+            current_path, edges, visited = queue.pop(0)
+            if len(edges) >= max_depth:
+                continue
+            for rel in adjacency.get(current_path, [])[:24]:
+                next_path = rel["to_path"]
+                if not next_path or next_path in visited:
+                    continue
+                next_edges = [*edges, rel]
+                item = _business_flow_trace_item(entrypoint, next_edges)
+                key = (item["entry_point"], tuple(item["path_chain"]))
+                if key not in seen_trace_keys:
+                    traces.append(item)
+                    seen_trace_keys.add(key)
+                    emitted += 1
+                    if len(traces) >= limit or emitted >= max_per_entrypoint:
+                        break
+                queue.append((next_path, next_edges, visited | {next_path}))
+            if len(traces) >= limit or emitted >= max_per_entrypoint:
+                break
+    return traces
+
+
+def _business_flow_trace_item(entrypoint, edges: list) -> dict:
+    label = _entrypoint_label(entrypoint["method"], entrypoint["route"])
+    path_chain = [entrypoint["path"]]
+    hops = []
+    confidence_values = [float(entrypoint["confidence"] or 0.65)]
+    for edge in edges:
+        if edge["to_path"] and edge["to_path"] != path_chain[-1]:
+            path_chain.append(edge["to_path"])
+        confidence_values.append(float(edge["confidence"] or 0.5))
+        hops.append(
+            {
+                "from_path": edge["from_path"],
+                "from_symbol": edge["from_symbol"],
+                "relation": edge["relation"],
+                "to_path": edge["to_path"],
+                "to_symbol": edge["to_symbol"],
+                "line_start": edge["line_start"],
+                "evidence": edge["evidence"],
+                "confidence": edge["confidence"],
+                "source": edge["source"],
+            }
+        )
+    return {
+        "entry_point": label,
+        "handler": entrypoint["handler"],
+        "start_path": entrypoint["path"],
+        "start_line": entrypoint["line_start"],
+        "path_chain": path_chain,
+        "hops": hops,
+        "confidence": round(min(confidence_values), 3) if confidence_values else 0.0,
+    }
+
+
+def _entrypoint_trace_item(candidate, entrypoint, edges: list) -> dict:
+    label = _entrypoint_label(entrypoint["method"], entrypoint["route"])
+    path_chain = [entrypoint["path"]]
+    hops = []
+    confidence_values = [float(entrypoint["confidence"] or 0.65)]
+    for edge in edges:
+        if edge["to_path"] and edge["to_path"] != path_chain[-1]:
+            path_chain.append(edge["to_path"])
+        elif edge["to_path"] and edge["to_path"] == path_chain[-1]:
+            pass
+        confidence_values.append(float(edge["confidence"] or 0.5))
+        hops.append(
+            {
+                "from_path": edge["from_path"],
+                "from_symbol": edge["from_symbol"],
+                "relation": edge["relation"],
+                "to_path": edge["to_path"],
+                "to_symbol": edge["to_symbol"],
+                "line_start": edge["line_start"],
+                "evidence": edge["evidence"],
+                "confidence": edge["confidence"],
+                "source": edge["source"],
+            }
+        )
+    if not edges and candidate["file_path"] and candidate["file_path"] != path_chain[-1]:
+        path_chain.append(candidate["file_path"])
+    return {
+        "candidate_id": candidate["id"],
+        "entry_point": label,
+        "target_path": candidate["file_path"],
+        "target_line": candidate["line_start"],
+        "path_chain": path_chain,
+        "hops": hops,
+        "confidence": round(min(confidence_values), 3) if confidence_values else 0.0,
+    }
+
+
+def _entrypoint_label(method: str | None, route: str) -> str:
+    route_text = route.strip() or "/"
+    return f"{method} {route_text}" if method else route_text
+
+
+def _adjacent_paths(conn, snapshot_id: str, paths: set[str], *, limit: int) -> set[str]:
+    if not paths:
+        return set()
+    placeholders = ",".join("?" for _ in paths)
+    rows = conn.execute(
+        f"""
+        SELECT from_path, to_path
+        FROM code_relationships
+        WHERE snapshot_id = ?
+          AND (from_path IN ({placeholders}) OR to_path IN ({placeholders}))
+        ORDER BY confidence DESC, from_path, to_path
+        LIMIT ?
+        """,
+        (snapshot_id, *sorted(paths), *sorted(paths), limit),
+    ).fetchall()
+    result: set[str] = set()
+    for row in rows:
+        if row["from_path"]:
+            result.add(row["from_path"])
+        if row["to_path"]:
+            result.add(row["to_path"])
+    return result
+
+
+def _index_rows_for_paths(
+    conn,
+    snapshot_id: str,
+    table: str,
+    paths: list[str],
+    *,
+    columns: str,
+    order_by: str,
+    limit: int,
+    where_extra: str = "",
+):
+    if not paths:
+        return []
+    placeholders = ",".join("?" for _ in paths)
+    return conn.execute(
+        f"""
+        SELECT {columns}
+        FROM {table}
+        WHERE snapshot_id = ?
+          AND path IN ({placeholders})
+          {where_extra}
+        ORDER BY {order_by}
+        LIMIT ?
+        """,
+        (snapshot_id, *paths, limit),
+    ).fetchall()
+
+
+def _relationship_rows_for_paths(conn, snapshot_id: str, paths: list[str], *, limit: int):
+    if not paths:
+        return []
+    placeholders = ",".join("?" for _ in paths)
+    return conn.execute(
+        f"""
+        SELECT id, from_path, from_symbol, to_path, to_symbol, relation,
+               evidence, confidence, source, line_start
+        FROM code_relationships
+        WHERE snapshot_id = ?
+          AND (from_path IN ({placeholders}) OR to_path IN ({placeholders}))
+        ORDER BY
+            CASE relation WHEN 'calls' THEN 0 WHEN 'uses' THEN 1 WHEN 'imports' THEN 2 ELSE 3 END,
+            confidence DESC,
+            from_path,
+            to_path,
+            COALESCE(line_start, 0)
+        LIMIT ?
+        """,
+        (snapshot_id, *paths, *paths, limit),
+    ).fetchall()
+
+
+def _group_by_path(rows) -> dict[str, list]:
+    result: dict[str, list] = {}
+    for row in rows:
+        result.setdefault(row["path"], []).append(row)
+    return result
+
+
+def _candidate_context_item(row) -> dict:
+    item = _audit_candidate_export_row(row)
+    return {
+        key: item[key]
+        for key in (
+            "id",
+            "candidate_type",
+            "severity",
+            "status",
+            "risk_score",
+            "priority_reasons",
+            "cluster_key",
+            "title",
+            "file_path",
+            "line_start",
+            "line_end",
+            "entry_point",
+            "symbol",
+            "business_node_id",
+        )
+    }
+
+
+def _entrypoint_context_item(row) -> dict:
+    return {
+        "id": row["id"],
+        "method": row["method"],
+        "route": row["route"],
+        "handler": row["handler"],
+        "line_start": row["line_start"],
+        "evidence": row["evidence"],
+        "confidence": row["confidence"],
+        "source": row["source"],
+    }
+
+
+def _capability_context_item(row) -> dict:
+    return {
+        "id": row["id"],
+        "symbol": row["symbol"],
+        "category": row["category"],
+        "title": row["title"],
+        "line_start": row["line_start"],
+        "evidence": row["evidence"],
+        "risk_level": row["risk_level"],
+        "risk_tags": _decode_json_list(row["risk_tags_json"]),
+        "confidence": row["confidence"],
+        "source": row["source"],
+    }
+
+
+def _symbol_context_item(row) -> dict:
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "name": row["name"],
+        "container": row["container"],
+        "signature": row["signature"],
+        "line_start": row["line_start"],
+        "line_end": row["line_end"],
+        "confidence": row["confidence"],
+        "source": row["source"],
+    }
+
+
+def _relationship_context_item(row) -> dict:
+    return {
+        "id": row["id"],
+        "from_path": row["from_path"],
+        "from_symbol": row["from_symbol"],
+        "to_path": row["to_path"],
+        "to_symbol": row["to_symbol"],
+        "relation": row["relation"],
+        "evidence": row["evidence"],
+        "line_start": row["line_start"],
+        "confidence": row["confidence"],
+        "source": row["source"],
     }
 
 
@@ -591,6 +1332,7 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
         "profile": profile,
         "intent_id": intent_id,
         "focused_candidate_ids": sorted(focus_candidate_ids),
+        "budgets": _profile_budgets(profile),
         "note": (
             "This export is intentionally scoped for the current audit phase. "
             "Use database-backed coverage sections as the source of truth; omitted graph items remain stored server-side."
@@ -648,6 +1390,13 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
                 "dependency_manifests": [item.model_dump() for item in manifests],
                 "symbols_sample": [item.model_dump() for item in symbols],
             }
+            data["code_index"]["audit_context"] = _load_code_index_audit_context(
+                conn,
+                project_id,
+                ready_source.id,
+                profile=profile,
+                focus_candidate_ids=focus_candidate_ids,
+            )
 
     tool_findings = conn.execute(
         """
@@ -666,7 +1415,7 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
         """
         SELECT id, snapshot_id, title, category, severity, status, cwe, file_path,
                line_start, line_end, symbol, entry_point, business_node_id,
-               description, impact, evidence, proof_packets_json,
+               evidence_level, description, impact, evidence, proof_packets_json,
                reproduction_poc_json, remediation,
                discovered_by, reviewed_by
         FROM audit_findings
@@ -710,18 +1459,38 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
     if hints:
         data["hints"] = [
             {
+                "id": h["id"],
                 "content": h["content"],
                 "creator": h["creator"],
                 "created_at": format_export_timestamp(h["created_at"]),
+                "hint_type": h["hint_type"],
+                "target": h["target"],
+                "priority": h["priority"],
+                "expires_at": format_export_timestamp(h["expires_at"]),
+                "max_uses": h["max_uses"],
+                "use_count": h["use_count"],
             }
             for h in hints
         ]
 
-    data["facts"] = [{"id": f["id"], "description": f["description"]} for f in facts]
+    data["facts"] = [
+        {
+            "id": f["id"],
+            "description": f["description"],
+            "fact_type": f["fact_type"],
+            "source": f["source"],
+            "confidence": f["confidence"],
+            "evidence_refs": _decode_json_list(f["evidence_refs_json"]),
+            "parent_fact_ids": _decode_json_list(f["parent_fact_ids_json"]),
+            "fingerprint": f["fingerprint"],
+        }
+        for f in facts
+    ]
 
     intent_list = []
     for i in intents:
         entry: dict = {
+            "id": i["id"],
             "from": sources_by_intent.get(i["id"], []),
             "to": i["to_fact_id"],
             "description": i["description"],
@@ -729,6 +1498,13 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
             "worker": i["worker"],
             "created_at": format_export_timestamp(i["created_at"]),
             "concluded_at": format_export_timestamp(i["concluded_at"]),
+            "fingerprint": i["fingerprint"],
+            "status": i["status"],
+            "superseded_by": i["superseded_by"],
+            "target_kind": i["target_kind"],
+            "target_id": i["target_id"],
+            "objective": i["objective"],
+            "evidence_gap": i["evidence_gap"],
         }
         intent_list.append(entry)
 
@@ -744,6 +1520,26 @@ def _code_index_limit(profile: str) -> int:
     if profile == "reason":
         return 500
     return 1000
+
+
+def _profile_budgets(profile: str) -> dict[str, int | None]:
+    if profile == "explore":
+        return {
+            "audit_candidate_limit": EXPLORE_CANDIDATE_LIMIT,
+            "business_graph_node_limit": EXPLORE_GRAPH_NODE_LIMIT,
+            "code_index_limit": _code_index_limit(profile),
+        }
+    if profile == "reason":
+        return {
+            "audit_candidate_limit": REASON_CANDIDATE_LIMIT,
+            "business_graph_node_limit": REASON_GRAPH_NODE_LIMIT,
+            "code_index_limit": _code_index_limit(profile),
+        }
+    return {
+        "audit_candidate_limit": FULL_CANDIDATE_LIMIT,
+        "business_graph_node_limit": None,
+        "code_index_limit": _code_index_limit(profile),
+    }
 
 
 def _validation_strategy(source, files) -> dict:

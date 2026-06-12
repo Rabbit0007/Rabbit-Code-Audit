@@ -21,6 +21,16 @@ class RuntimeInfo(BaseModel):
 class Fact(BaseModel):
     id: str
     description: str
+    fact_type: str = "observation"
+    source: str = "worker"
+    confidence: float = 0.7
+    evidence_refs: list[str] = Field(default_factory=list)
+    parent_fact_ids: list[str] = Field(default_factory=list)
+    fingerprint: str | None = None
+
+
+HintType = Literal["focus", "avoid", "priority", "assumption", "scope", "stop_condition"]
+IntentStatus = Literal["open", "claimed", "completed", "blocked", "superseded", "cooldown"]
 
 
 class Intent(BaseModel):
@@ -33,6 +43,13 @@ class Intent(BaseModel):
     last_heartbeat_at: str | None = None
     created_at: str
     concluded_at: str | None = None
+    fingerprint: str | None = None
+    status: IntentStatus = "open"
+    superseded_by: str | None = None
+    target_kind: str | None = None
+    target_id: str | None = None
+    objective: str | None = None
+    evidence_gap: str | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -42,6 +59,12 @@ class Hint(BaseModel):
     content: str
     creator: str
     created_at: str
+    hint_type: HintType = "focus"
+    target: str | None = None
+    priority: int = 0
+    expires_at: str | None = None
+    max_uses: int | None = None
+    use_count: int = 0
 
 
 class ProjectReason(BaseModel):
@@ -78,6 +101,11 @@ class ProjectDetail(BaseModel):
 class CreateHintInline(BaseModel):
     content: str
     creator: str
+    hint_type: HintType = "focus"
+    target: str | None = None
+    priority: int = 0
+    expires_at: str | None = None
+    max_uses: int | None = None
 
     @field_validator("content", "creator")
     @classmethod
@@ -86,6 +114,21 @@ class CreateHintInline(BaseModel):
         if not text:
             raise ValueError("must not be empty")
         return text
+
+    @field_validator("target", "expires_at")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        return text or None
+
+    @field_validator("max_uses")
+    @classmethod
+    def validate_max_uses(cls, value: int | None) -> int | None:
+        if value is not None and value < 1:
+            raise ValueError("max_uses must be positive")
+        return value
 
 
 class CreateProjectRequest(BaseModel):
@@ -106,6 +149,11 @@ class CreateProjectRequest(BaseModel):
 class CreateHintRequest(BaseModel):
     content: str
     creator: str
+    hint_type: HintType = "focus"
+    target: str | None = None
+    priority: int = 0
+    expires_at: str | None = None
+    max_uses: int | None = None
 
     @field_validator("content", "creator")
     @classmethod
@@ -115,16 +163,43 @@ class CreateHintRequest(BaseModel):
             raise ValueError("must not be empty")
         return text
 
+    @field_validator("target", "expires_at")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        return text or None
+
+    @field_validator("max_uses")
+    @classmethod
+    def validate_max_uses(cls, value: int | None) -> int | None:
+        if value is not None and value < 1:
+            raise ValueError("max_uses must be positive")
+        return value
+
 
 class CreateIntentRequest(BaseModel):
     from_: list[str] = Field(alias="from", min_length=1)
     description: str
     creator: str
     worker: str | None = None
+    target_kind: str | None = None
+    target_id: str | None = None
+    objective: str | None = None
+    evidence_gap: str | None = None
 
     model_config = {"populate_by_name": True}
 
-    @field_validator("description", "creator", "worker")
+    @field_validator(
+        "description",
+        "creator",
+        "worker",
+        "target_kind",
+        "target_id",
+        "objective",
+        "evidence_gap",
+    )
     @classmethod
     def validate_non_empty_text(cls, value: str | None) -> str | None:
         if value is None:

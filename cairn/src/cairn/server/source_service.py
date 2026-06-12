@@ -88,6 +88,7 @@ MAX_SIGNAL_FRAGMENT_CHARS = 140
 MAX_AUDIT_CANDIDATE_DESCRIPTION_CHARS = 1600
 MAX_CODE_CAPABILITIES_PER_FILE = 20
 MAX_CAPABILITY_CHAIN_CANDIDATES = 120
+MAX_PRIORITY_REASON_COUNT = 6
 HIGH_IMPACT_RISK_SIGNAL_CATEGORIES = {
     "文件读写/加载能力",
     "系统进程能力",
@@ -95,6 +96,7 @@ HIGH_IMPACT_RISK_SIGNAL_CATEGORIES = {
 }
 HIGH_IMPACT_CAPABILITY_CATEGORIES = {
     "archive_extract",
+    "file_upload",
     "file_write",
     "process_execution",
     "task_execution",
@@ -102,23 +104,31 @@ HIGH_IMPACT_CAPABILITY_CATEGORIES = {
 }
 CAPABILITY_CATEGORY_TITLES = {
     "archive_extract": "归档解压/展开能力",
+    "file_upload": "文件上传入口/接收能力",
     "file_read": "文件读取能力",
     "file_write": "文件写入/删除能力",
     "process_execution": "系统进程/命令执行能力",
     "task_execution": "后台任务/Runner 执行能力",
     "template_render": "模板/YAML/解释器能力",
     "credential_access": "凭据/令牌访问能力",
+    "auth_guard": "认证/权限边界",
+    "object_scope_guard": "对象归属/租户边界",
+    "external_system": "外部系统/基础设施调用能力",
     "websocket_boundary": "WebSocket/长连接边界",
     "object_id_lookup": "对象 ID 查询/资源定位能力",
 }
 CAPABILITY_TAGS_BY_CATEGORY = {
     "archive_extract": ["文件能力", "归档展开"],
+    "file_upload": ["文件能力", "上传入口"],
     "file_read": ["文件能力", "读取"],
     "file_write": ["文件能力", "写入"],
     "process_execution": ["执行能力", "进程"],
     "task_execution": ["执行能力", "后台任务"],
     "template_render": ["解释器能力", "模板"],
     "credential_access": ["敏感资产", "凭据"],
+    "auth_guard": ["权限边界", "认证授权"],
+    "object_scope_guard": ["对象边界", "租户/归属"],
+    "external_system": ["外部系统", "基础设施"],
     "websocket_boundary": ["入口边界", "长连接"],
     "object_id_lookup": ["对象边界", "资源定位"],
 }
@@ -194,11 +204,11 @@ class SinkPattern:
 
 INPUT_SOURCE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("HTTP 参数/请求体", re.compile(r"\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\b|php://input")),
-    ("HTTP 请求对象", re.compile(r"\b(?:req|request|ctx)\.(?:query|body|params|headers|cookies)\b")),
+    ("HTTP 请求对象", re.compile(r"\b(?:req|request|ctx)\.(?:query|body|params|headers|cookies|file|files)\b")),
     ("SatRDA 请求对象", re.compile(r"\br\.(?:jsonBody|body|formValue|url\.query\.get|url\.rawQuery)\b|\bUrlUtils\.queryParams\s*\(\s*r\.url\.rawQuery\s*\)")),
-    ("Python Web 请求", re.compile(r"\brequest\.(?:args|form|json|data|cookies|headers|GET|POST)\b")),
-    ("Java Web 参数", re.compile(r"\b(?:getParameter|getHeader|getCookies)\s*\(|@(RequestParam|PathVariable|RequestBody)\b")),
-    ("Go Web 参数", re.compile(r"\b(?:URL\.Query|FormValue|PostFormValue|Param)\s*\(")),
+    ("Python Web 请求", re.compile(r"\brequest\.(?:args|form|json|data|cookies|headers|GET|POST|FILES|files|query_params)\b")),
+    ("Java Web 参数", re.compile(r"\b(?:getParameter|getHeader|getCookies|getPart|getParts|getInputStream)\s*\(|@(RequestParam|PathVariable|RequestBody|RequestPart)\b|\bMultipartFile\b")),
+    ("Go Web 参数", re.compile(r"\b(?:URL\.Query|FormValue|PostFormValue|Param|Query|PostForm|FormFile|MultipartReader)\s*\(")),
 )
 CONTROL_SIGNAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
@@ -221,11 +231,11 @@ CONTROL_SIGNAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 INPUT_VARIABLE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\$([A-Za-z_][\w]*)\s*=\s*.*(?:\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\b|php://input)"),
-    re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*.*\b(?:req|request|ctx)\.(?:query|body|params|headers|cookies)\b"),
+    re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*.*\b(?:req|request|ctx)\.(?:query|body|params|headers|cookies|file|files)\b"),
     re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*.*(?:\br\.(?:jsonBody|body|formValue|url\.query\.get|url\.rawQuery)\b|\bUrlUtils\.queryParams\s*\(\s*r\.url\.rawQuery\s*\))"),
-    re.compile(r"\b([A-Za-z_][\w]*)\s*=\s*request\.(?:args|form|json|data|cookies|headers|GET|POST)\b"),
-    re.compile(r"\b(?:String|var)\s+([A-Za-z_][\w]*)\s*=\s*[^;]*\b(?:getParameter|getHeader)\s*\("),
-    re.compile(r"\b([A-Za-z_][\w]*)\s*:=\s*[^;\n]*\b(?:URL\.Query|FormValue|PostFormValue|Param)\s*\("),
+    re.compile(r"\b([A-Za-z_][\w]*)\s*=\s*request\.(?:args|form|json|data|cookies|headers|GET|POST|FILES|files|query_params)\b"),
+    re.compile(r"\b(?:String|var|Part|MultipartFile|InputStream)\s+([A-Za-z_][\w]*)\s*=\s*[^;]*\b(?:getParameter|getHeader|getPart|getInputStream)\s*\("),
+    re.compile(r"\b([A-Za-z_][\w]*)\s*:=\s*[^;\n]*\b(?:URL\.Query|FormValue|PostFormValue|Param|Query|PostForm|FormFile|MultipartReader)\s*\("),
 )
 JS_DESTRUCTURING_PATTERN = re.compile(r"\b(?:const|let|var)\s*\{([^}]+)\}\s*=\s*([A-Za-z_$][\w$]*)")
 JS_DERIVED_VARIABLE_PATTERN = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(.+)")
@@ -262,8 +272,11 @@ SINK_PATTERNS: tuple[SinkPattern, ...] = (
         re.compile(
             r"\b(?:include|require|include_once|require_once)\s*\(?"
             r"|\b(?:file_get_contents|readfile|fopen|unlink|copy|move_uploaded_file)\s*\("
-            r"|\bfs\.(?:readFile|writeFile|unlink|createReadStream)\s*\("
+            r"|\bfs\.(?:readFile|writeFile|unlink|createReadStream|createWriteStream)\s*\("
             r"|\b(?:satrda\.(?:writeFile|fileOpen)|ctx\.(?:serveContent|saveMultipartFile))\s*\("
+            r"|\b(?:default_storage|FileSystemStorage\([^)]*\)|storage)\.save\s*\("
+            r"|\b(?:shutil\.copyfileobj|Files\.(?:copy|write|move)|FileOutputStream|FileInputStream)\b"
+            r"|\b(?:transferTo|SaveUploadedFile|io\.Copy)\s*\("
             r"|\bopen\s*\([^;\n]*(?:request\.|req\.|\$_)",
             re.IGNORECASE,
         ),
@@ -301,6 +314,17 @@ SINK_PATTERNS: tuple[SinkPattern, ...] = (
 )
 CAPABILITY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
+        "file_upload",
+        re.compile(
+            r"\b(?:request\.FILES|UploadedFile|FileField|ImageField|MultiPartParser|multipart/form-data)\b"
+            r"|\b(?:MultipartFile|@RequestPart|getPart|getParts)\b"
+            r"|\b(?:FormFile|MultipartReader|SaveUploadedFile)\s*\("
+            r"|\b(?:multer|busboy|formidable)\b"
+            r"|\b(?:move_uploaded_file|saveMultipartFile)\s*\(",
+            re.IGNORECASE,
+        ),
+    ),
+    (
         "archive_extract",
         re.compile(
             r"\bzipfile\.ZipFile\b|\.extract(?:all)?\s*\(|\bZipArchive\b|->extractTo\s*\("
@@ -314,10 +338,11 @@ CAPABILITY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(
             r"\bopen\s*\([^;\n]*(?:['\"][wax]\+?['\"]|mode\s*=\s*['\"][wax]\+?['\"])"
             r"|\b(?:os\.(?:rename|remove|unlink)|shutil\.rmtree|Path\([^)]*\)\.write_text|Path\([^)]*\)\.write_bytes)\s*\("
+            r"|\b(?:default_storage|FileSystemStorage\([^)]*\)|storage)\.save\s*\(|\bshutil\.copyfileobj\s*\("
             r"|\b(?:file_put_contents|move_uploaded_file|unlink|rename|copy)\s*\("
             r"|\bfs\.(?:writeFile|unlink|rm|rename|createWriteStream)\s*\("
-            r"|\b(?:os|ioutil)\.WriteFile\s*\(|\bFiles\.(?:write|delete|move)\s*\("
-            r"|\bFileOutputStream\s*\(",
+            r"|\b(?:os|ioutil)\.WriteFile\s*\(|\bFiles\.(?:write|delete|move|copy)\s*\("
+            r"|\bFileOutputStream\s*\(|\b(?:transferTo|SaveUploadedFile|io\.Copy)\s*\(",
             re.IGNORECASE,
         ),
     ),
@@ -347,9 +372,10 @@ CAPABILITY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "task_execution",
         re.compile(
-            r"\b(?:Celery|shared_task|AsyncResult)\b|\.apply_async\s*\(|\.delay\s*\("
+            r"\b(?:Celery|celery_app\.task|shared_task|AsyncResult|background_task)\b|\.apply_async\s*\(|\.delay\s*\("
             r"|\b[A-Za-z_][\w]*Runner\s*\(|\brunner\.(?:run|start)\s*\("
-            r"|\b(?:queue|dispatch|enqueue|schedule)\s*\(",
+            r"|\b(?:queue|dispatch|enqueue|schedule)\s*\("
+            r"|\b(?:rq|dramatiq|huey|apscheduler|bull|sidekiq)\b",
             re.IGNORECASE,
         ),
     ),
@@ -367,6 +393,37 @@ CAPABILITY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(
             r"\b(?:secret|token|credential|password|passwd|private_key|access_key|api_key|session_key)\b"
             r"|settings\.[A-Z_]*(?:SECRET|TOKEN|KEY|PASSWORD)[A-Z_]*",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "auth_guard",
+        re.compile(
+            r"\b(?:permission_classes|authentication_classes|IsAuthenticated|BasePermission|has_permission|"
+            r"has_object_permission|check_object_permissions|rbac_perms|required_permissions|has_perm|"
+            r"user\.has_perm|login_required|permission_required|authenticate|authorize|policy|"
+            r"requireAuth|require_auth|current_user|request\.user|principal)\b"
+            r"|@(?:PreAuthorize|RolesAllowed|Secured)\b"
+            r"|\b(?:middleware|can|Gate::allows)\s*\(",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "object_scope_guard",
+        re.compile(
+            r"\b(?:tenant|tenant_id|org_id|organization_id|account_id|workspace_id|owner_id|user_id|"
+            r"asset_id|resource_id|project_id)\b"
+            r"|\b(?:filter|where|get_queryset|scoped_queryset)\s*\([^;\n]*(?:user|owner|tenant|org|account|workspace)"
+            r"|\bhas_object_permission\b|\bcheck_object_permissions\s*\(",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "external_system",
+        re.compile(
+            r"\b(?:ldap|LDAP|kubernetes|Kubernetes|k8s|boto3|paramiko|ansible|docker|DockerClient|"
+            r"redis|RabbitMQ|Kafka|Elasticsearch|S3|Vault|Consul)\b"
+            r"|\b(?:requests|httpx|urllib\.request|axios|fetch|http\.Get|curl_exec)\b",
             re.IGNORECASE,
         ),
     ),
@@ -651,9 +708,57 @@ def get_source_index_quality(project_id: str, snapshot_id: str) -> SourceIndexQu
             """,
             (snapshot_id,),
         ).fetchall()
+        candidate_rows = conn.execute(
+            """
+            SELECT candidate_type, severity, status, title, description,
+                   file_path, line_start, entry_point, symbol
+            FROM audit_candidates
+            WHERE snapshot_id = ?
+              AND source = 'index'
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        business_graph_size = conn.execute(
+            """
+            SELECT
+                (SELECT COUNT(*)
+                 FROM business_nodes
+                 WHERE source_snapshot_id = ?) AS nodes,
+                (SELECT COUNT(*)
+                 FROM business_edges e
+                 JOIN business_nodes n
+                   ON n.id = e.from_node_id
+                  AND n.project_id = e.project_id
+                 WHERE n.source_snapshot_id = ?) AS edges
+            """,
+            (snapshot_id, snapshot_id),
+        ).fetchone()
 
     data_object_count = symbol_kind_counts.get("data_object", 0)
     entrypoints_with_data_paths = _entrypoints_with_data_paths(entrypoints, relationships, data_objects)
+    candidate_count = len(candidate_rows)
+    high_impact_candidate_count = sum(
+        1
+        for row in candidate_rows
+        if _candidate_priority_from_values(
+            candidate_type=row["candidate_type"],
+            severity=row["severity"],
+            status=row["status"],
+            title=row["title"],
+            description=row["description"],
+            file_path=row["file_path"],
+            line_start=row["line_start"],
+            entry_point=row["entry_point"],
+            symbol=row["symbol"],
+        )["score"]
+        >= 75
+    )
+    candidate_status_counts = _count_rows_from_values(row["status"] for row in candidate_rows)
+    candidate_type_counts = _count_rows_from_values(row["candidate_type"] for row in candidate_rows)
+    candidate_file_count = len({row["file_path"] for row in candidate_rows if row["file_path"]})
+    candidate_density = round(candidate_count / max(1, code_file_count), 3)
+    business_graph_node_count = int((business_graph_size or {})["nodes"] or 0)
+    business_graph_edge_count = int((business_graph_size or {})["edges"] or 0)
     issues: list[SourceIndexQualityIssue] = []
     recommendations: list[str] = []
     score = 100
@@ -746,6 +851,36 @@ def get_source_index_quality(project_id: str, snapshot_id: str) -> SourceIndexQu
             4,
             "补充项目构建文件适配，或确认快照是否缺少依赖清单。",
         )
+    if candidate_count > max(180, code_file_count * 3):
+        add_issue(
+            "warning",
+            "candidate_noise_high",
+            "候选线索密度偏高",
+            "索引候选相对代码文件数量过多，worker 容易在重复或低价值线索上消耗轮次。",
+            candidate_count,
+            8,
+            "继续按风险链签名聚类候选，并优先调度高分候选的紧凑上下文包。",
+        )
+    if high_impact_candidate_count > max(60, max(1, summary.entrypoint_count) * 2):
+        add_issue(
+            "warning",
+            "high_impact_candidate_noise",
+            "高优先级候选偏多",
+            "大量候选都被标成高优先级，会削弱排序信号，需要进一步区分入口可达性、权限边界和真实能力影响。",
+            high_impact_candidate_count,
+            8,
+            "为候选保留可解释优先级原因，让 worker 先处理入口可达且含高影响能力的路径。",
+        )
+    if business_graph_node_count > max(500, code_file_count * 4):
+        add_issue(
+            "warning",
+            "business_graph_too_large",
+            "业务图规模偏大",
+            "业务图节点数量相对源码规模偏大，直接投喂给模型会增加噪声。",
+            business_graph_node_count,
+            6,
+            "在 explore/reason 上下文中只导出聚焦候选相邻节点，完整业务图留在服务端作为可视化和覆盖状态。",
+        )
 
     score = max(0, min(100, score))
     if score >= 80:
@@ -774,6 +909,14 @@ def get_source_index_quality(project_id: str, snapshot_id: str) -> SourceIndexQu
         orphan_entrypoints=[CodeEntrypoint(**dict(row)) for row in orphan_rows],
         data_object_count=data_object_count,
         entrypoints_with_data_paths=entrypoints_with_data_paths,
+        candidate_count=candidate_count,
+        high_impact_candidate_count=high_impact_candidate_count,
+        candidate_status_counts=candidate_status_counts,
+        candidate_type_counts=candidate_type_counts,
+        candidate_file_count=candidate_file_count,
+        candidate_density_per_code_file=candidate_density,
+        business_graph_node_count=business_graph_node_count,
+        business_graph_edge_count=business_graph_edge_count,
         issues=issues,
         recommendations=list(dict.fromkeys(recommendations)),
     )
@@ -786,6 +929,16 @@ def _count_rows(rows) -> dict[str, int]:
         if not key:
             continue
         result[key] = int(row["count"] or 0)
+    return result
+
+
+def _count_rows_from_values(values) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for value in values:
+        key = str(value or "").strip()
+        if not key:
+            continue
+        result[key] = result.get(key, 0) + 1
     return result
 
 
@@ -803,6 +956,163 @@ def _low_confidence_count(conn, table: str, snapshot_id: str, threshold: float) 
         (snapshot_id, threshold),
     ).fetchone()
     return int(row["count"] or 0)
+
+
+def audit_candidate_priority(
+    *,
+    candidate_type: str | None,
+    severity: str | None,
+    status: str | None,
+    title: str | None,
+    description: str | None,
+    file_path: str | None,
+    line_start: int | None,
+    entry_point: str | None,
+    symbol: str | None,
+) -> dict[str, object]:
+    return _candidate_priority_from_values(
+        candidate_type=candidate_type,
+        severity=severity,
+        status=status,
+        title=title,
+        description=description,
+        file_path=file_path,
+        line_start=line_start,
+        entry_point=entry_point,
+        symbol=symbol,
+    )
+
+
+def _candidate_priority_from_values(
+    *,
+    candidate_type: str | None,
+    severity: str | None,
+    status: str | None,
+    title: str | None,
+    description: str | None,
+    file_path: str | None,
+    line_start: int | None,
+    entry_point: str | None,
+    symbol: str | None,
+) -> dict[str, object]:
+    text = f"{title or ''}\n{description or ''}".lower()
+    reasons: list[str] = []
+    candidate_type = candidate_type or "unknown"
+    severity = severity or "unknown"
+
+    score = {
+        "critical": 88,
+        "high": 76,
+        "medium": 58,
+        "low": 38,
+        "info": 24,
+        "unknown": 42,
+    }.get(severity, 42)
+
+    if candidate_type == "capability_chain":
+        score += 8
+        reasons.append("高影响源码能力链")
+    elif candidate_type == "data_flow":
+        score += 6
+        reasons.append("外部输入相关数据流")
+    elif candidate_type in {"entrypoint", "web_entrypoint"}:
+        score = max(score, 34)
+        reasons.append("可审计入口")
+
+    if any(marker in text for marker in ("文件读写/加载能力", "文件写入", "归档解压", "upload", "上传", "路径穿越", "任意文件")):
+        score += 10
+        reasons.append("文件/上传影响面")
+    if any(marker in text for marker in ("数据库执行能力", "数据库查询", "sql", "query", "execute")):
+        score += 10
+        reasons.append("数据库影响面")
+    if any(marker in text for marker in ("系统进程能力", "命令", "process", "runner", "后台任务", "task_execution")):
+        score += 12
+        reasons.append("执行/任务影响面")
+    if any(marker in text for marker in ("对象反序列化", "unserialize", "pickle", "yaml.load", "objectinputstream")):
+        score += 10
+        reasons.append("反序列化影响面")
+    if any(marker in text for marker in ("credential", "secret", "token", "password", "凭据", "令牌")):
+        score += 7
+        reasons.append("敏感资产相关")
+    if any(marker in text for marker in ("认证/权限边界", "权限边界", "rbac", "permission", "authorize", "policy")):
+        score += 6
+        reasons.append("权限边界相关")
+    if any(marker in text for marker in ("对象归属", "租户边界", "对象边界", "tenant", "owner", "workspace")):
+        score += 6
+        reasons.append("对象/租户边界相关")
+    if any(marker in text for marker in ("外部系统", "基础设施", "kubernetes", "ldap", "ansible", "docker")):
+        score += 5
+        reasons.append("外部系统相关")
+    if entry_point:
+        score += 6
+        reasons.append("入口可达")
+    if symbol:
+        score += 3
+        reasons.append("含输入/处理符号")
+    if "控制/校验：邻近片段未抽取到明显控制语句" in (description or ""):
+        score += 5
+        reasons.append("邻近未见控制/校验")
+    if status in {"confirmed", "rejected"}:
+        score -= 35
+        reasons.append("已有结论")
+    elif status == "needs_more_evidence":
+        score -= 10
+        reasons.append("需要补证")
+
+    score = max(0, min(100, score))
+    deduped_reasons = list(dict.fromkeys(reasons))[:MAX_PRIORITY_REASON_COUNT]
+    return {
+        "score": score,
+        "reasons": deduped_reasons,
+        "cluster_key": audit_candidate_cluster_key(
+            candidate_type=candidate_type,
+            severity=severity,
+            title=title,
+            file_path=file_path,
+            line_start=line_start,
+            entry_point=entry_point,
+            symbol=symbol,
+        ),
+    }
+
+
+def audit_candidate_cluster_key(
+    *,
+    candidate_type: str | None,
+    severity: str | None,
+    title: str | None,
+    file_path: str | None,
+    line_start: int | None,
+    entry_point: str | None,
+    symbol: str | None,
+) -> str:
+    category = _candidate_category_from_title(title)
+    if candidate_type in {"data_flow", "capability_chain"}:
+        parts = [
+            candidate_type or "unknown",
+            file_path or "unknown_path",
+            entry_point or "unknown_entry",
+            category or severity or "unknown_risk",
+            symbol or "unknown_symbol",
+        ]
+    else:
+        parts = [
+            candidate_type or "unknown",
+            file_path or "unknown_path",
+            entry_point or "unknown_entry",
+            str(line_start or 0),
+        ]
+    return hashlib.sha1("\0".join(parts).lower().encode("utf-8")).hexdigest()[:16]
+
+
+def _candidate_category_from_title(title: str | None) -> str | None:
+    if not title:
+        return None
+    for prefix in ("审计数据流: 外部输入到", "审计能力链:"):
+        if title.startswith(prefix):
+            rest = title[len(prefix) :].strip()
+            return rest.split()[0] if rest else None
+    return None
 
 
 def _entrypoints_with_data_paths(entrypoints, relationships, data_objects) -> int:
@@ -1492,10 +1802,11 @@ def _insert_audit_candidates_from_index(
         entry_point: str | None = None,
         symbol: str | None = None,
         severity: str = "unknown",
+        dedupe_key: tuple[object, ...] | None = None,
     ) -> None:
         if len(candidates) >= MAX_SOURCE_INDEX_CANDIDATES:
             return
-        key = (candidate_type, file_path, line_start, entry_point)
+        key = dedupe_key or (candidate_type, file_path, line_start, entry_point)
         if key in seen:
             return
         seen.add(key)
@@ -1606,6 +1917,7 @@ def _insert_audit_candidates_from_index(
                 entry_point=entry_point,
                 symbol=signal.symbol,
                 severity=severity,
+                dedupe_key=_risk_signal_candidate_key(file.path, entry_point, signal),
             )
 
     reachable_entrypoints = _entrypoint_labels_by_target_path(code_index)
@@ -1642,6 +1954,7 @@ def _insert_audit_candidates_from_index(
             entry_point=entry_point,
             symbol=capability["symbol"],
             severity=capability["risk_level"],
+            dedupe_key=_capability_candidate_key(capability, entry_point),
         )
 
     if not candidates:
@@ -1686,7 +1999,28 @@ def _load_existing_index_candidate_ids(conn, snapshot_id: str) -> dict[tuple[str
     return result
 
 
+def _risk_signal_candidate_key(file_path: str, entry_point: str | None, signal: RiskSignal) -> tuple[object, ...]:
+    return (
+        "data_flow",
+        file_path,
+        entry_point or "",
+        signal.category,
+        signal.symbol or "",
+    )
+
+
+def _capability_candidate_key(capability, entry_point: str | None) -> tuple[object, ...]:
+    return (
+        "capability_chain",
+        capability["path"],
+        entry_point or "",
+        capability["category"],
+        capability["symbol"] or "",
+    )
+
+
 def _audit_candidate_signal_description(file_path: str, entry_point: str | None, signal: RiskSignal) -> str:
+    priority = _risk_signal_priority(signal, entry_point)
     parts = [
         (
             f"事实：{file_path}:{signal.line_start} 的外部输入数据流进入 `{signal.title}`。"
@@ -1694,6 +2028,7 @@ def _audit_candidate_signal_description(file_path: str, entry_point: str | None,
         f"入口：{entry_point or '未从索引确定具体入口'}。",
         f"输入：{signal.source_summary}。",
         f"能力证据：第 {signal.line_start} 行 `{signal.evidence}`。",
+        _priority_summary(priority),
     ]
     if signal.context_summary:
         parts.append(f"局部代码切片：{signal.context_summary}。")
@@ -1717,15 +2052,63 @@ def _audit_candidate_signal_description(file_path: str, entry_point: str | None,
 
 def _capability_chain_candidate_description(capability, tags: list[str], entrypoints: list[str]) -> str:
     location = f"{capability['path']}:{capability['line_start']}"
+    priority = _capability_priority(capability, tags, entrypoints)
     parts = [
         f"事实：{location} 存在 `{capability['title']}`。",
         f"能力证据：`{capability['evidence'] or '未提供'}`。",
         f"入口可达：{'; '.join(entrypoints[:5]) if entrypoints else '索引未直接确定入口，需要先从路由、调用关系或任务入口定位可达性'}。",
         f"风险标签：{', '.join(tags[:8]) if tags else '未标注'}。",
+        _priority_summary(priority),
         "审计要求：不得仅确认路由或能力调用存在；必须读取实现链、认证/权限、对象查询、路径/内容控制、落盘位置和后续加载/执行点。",
         "该候选是源码能力链事实，不是漏洞类型判断；worker 需要基于可达性、控制边界和真实影响自行归纳漏洞类型，并输出 findings 或 candidate_conclusions。",
     ]
     return _clip_text(" ".join(parts), MAX_AUDIT_CANDIDATE_DESCRIPTION_CHARS)
+
+
+def _risk_signal_priority(signal: RiskSignal, entry_point: str | None) -> dict[str, object]:
+    description = " ".join(
+        part
+        for part in (
+            signal.source_summary,
+            signal.control_summary,
+            signal.context_summary,
+            signal.evidence,
+        )
+        if part
+    )
+    return _candidate_priority_from_values(
+        candidate_type="data_flow",
+        severity=_risk_signal_candidate_severity(signal),
+        status="candidate",
+        title=f"审计数据流: 外部输入到{signal.category}",
+        description=description,
+        file_path=None,
+        line_start=signal.line_start,
+        entry_point=entry_point,
+        symbol=signal.symbol,
+    )
+
+
+def _capability_priority(capability, tags: list[str], entrypoints: list[str]) -> dict[str, object]:
+    return _candidate_priority_from_values(
+        candidate_type="capability_chain",
+        severity=capability["risk_level"],
+        status="candidate",
+        title=f"审计能力链: {capability['title']}",
+        description=" ".join([capability["evidence"] or "", " ".join(tags)]),
+        file_path=capability["path"],
+        line_start=capability["line_start"],
+        entry_point=entrypoints[0] if entrypoints else None,
+        symbol=capability["symbol"],
+    )
+
+
+def _priority_summary(priority: dict[str, object]) -> str:
+    reasons = priority.get("reasons")
+    reason_text = "、".join(str(item) for item in reasons) if isinstance(reasons, list) else ""
+    if not reason_text:
+        reason_text = "基础排序信号"
+    return f"索引优先级：{priority.get('score', 0)}/100（{reason_text}）。该分数只用于审计排序，不代表漏洞结论。"
 
 
 def _risk_signal_candidate_severity(signal: RiskSignal) -> str:
@@ -1809,10 +2192,16 @@ def _capability_risk_tags(
         _append_unique(tags, "入口可达")
     if UPLOAD_CONTEXT_RE.search(haystack):
         _append_unique(tags, "上传持久化")
+    if category in {"file_upload", "file_write", "archive_extract"} and any(
+        marker in lower for marker in ("media_root", "upload", "uploads", "tmp", "data_dir", "storage", "static")
+    ):
+        _append_unique(tags, "文件生命周期")
     if re.search(r"\b(?:rbac|permission|authorize|auth|role|policy|is_authenticated)\b", haystack, re.IGNORECASE):
         _append_unique(tags, "权限边界")
-    if re.search(r"\b(?:id|pk|uuid|object_id|resource_id)\b", haystack, re.IGNORECASE):
+    if re.search(r"\b(?:id|pk|uuid|object_id|resource_id|tenant|org|owner|account|workspace)\b", haystack, re.IGNORECASE):
         _append_unique(tags, "对象边界")
+    if category == "external_system":
+        _append_unique(tags, "外部依赖")
     return tags
 
 
@@ -1829,6 +2218,8 @@ def _capability_risk_level(
     )
     if category in {"process_execution", "task_execution"}:
         return "high"
+    if category == "file_upload":
+        return "high" if high_context else "medium"
     if category == "archive_extract":
         return "high" if high_context else "medium"
     if category == "file_write":
@@ -1844,6 +2235,12 @@ def _capability_risk_level(
         return "high" if {"控制面", "入口可达", "对象边界"} <= set(tags) else "medium"
     if category in {"template_render", "websocket_boundary"}:
         return "high" if high_context else "medium"
+    if category == "auth_guard":
+        return "medium" if reachable_entrypoints or "控制面" in tags else "low"
+    if category == "object_scope_guard":
+        return "medium" if reachable_entrypoints or "权限边界" in tags else "low"
+    if category == "external_system":
+        return "medium" if {"控制面", "入口可达", "权限边界"} & set(tags) else "low"
     if category == "object_id_lookup":
         return "medium" if reachable_entrypoints or "控制面" in tags else "unknown"
     return "unknown"
@@ -1880,6 +2277,9 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
     controls_by_path: dict[str, list[str]] = {}
     data_by_ref: dict[tuple[str, str], str] = {}
     data_by_path: dict[str, list[str]] = {}
+    semantic_by_path: dict[str, list[str]] = {}
+    module_by_key: dict[str, str] = {}
+    modules_by_path: dict[str, list[str]] = {}
 
     entrypoints = conn.execute(
         """
@@ -1910,6 +2310,65 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
         """,
         (snapshot_id,),
     ).fetchall()
+    capabilities = conn.execute(
+        """
+        SELECT path, symbol, category, title, line_start, line_end, evidence,
+               risk_level, risk_tags_json, confidence, source
+        FROM code_capabilities
+        WHERE snapshot_id = ?
+        ORDER BY
+            CASE risk_level
+                WHEN 'critical' THEN 0
+                WHEN 'high' THEN 1
+                WHEN 'medium' THEN 2
+                WHEN 'low' THEN 3
+                ELSE 4
+            END,
+            path,
+            category,
+            COALESCE(line_start, 0)
+        """,
+        (snapshot_id,),
+    ).fetchall()
+
+    def ensure_module(path: str | None, route: str | None = None, evidence_text: str | None = None, line_start: int | None = None) -> str | None:
+        module_key = _business_module_key(path, route)
+        if module_key is None:
+            return None
+        existing = module_by_key.get(module_key)
+        if existing is not None:
+            if path:
+                modules = modules_by_path.setdefault(path, [])
+                if existing not in modules:
+                    modules.append(existing)
+            return existing
+        node_id = _stable_business_id("biz", snapshot_id, "module", module_key)
+        risk_level = "medium" if any(keyword in module_key.lower() for keyword in CONTROL_PLANE_KEYWORDS) else "unknown"
+        _insert_business_node_seed(
+            conn,
+            project_id,
+            snapshot_id=snapshot_id,
+            node_id=node_id,
+            node_type="feature",
+            title=f"业务模块 {_feature_title(module_key)}",
+            description=(
+                f"源码索引根据路径/路由归纳出的业务模块 {module_key}。"
+                "该节点用于把入口、处理逻辑、资产和风险链按模块聚合，帮助大项目审计先建立业务视角。"
+            ),
+            risk_level=risk_level,
+            review_status="unreviewed",
+            coverage_note="索引自动生成的模块聚合节点，供 worker 选择审计范围和理解业务边界。",
+            risk_tags=["业务模块"],
+            evidence=_business_evidence(path, line_start, evidence_text),
+            confidence=0.7,
+            created_by="source_index",
+            now=now,
+        )
+        module_by_key[module_key] = node_id
+        if path:
+            modules_by_path.setdefault(path, []).append(node_id)
+        return node_id
+
     def ensure_feature(entrypoint) -> str | None:
         feature_key = _route_feature_key(entrypoint["route"])
         if feature_key is None:
@@ -1972,6 +2431,19 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
         )
         control_by_ref[key] = node_id
         controls_by_path.setdefault(path, []).append(node_id)
+        module_id = ensure_module(path, evidence_text=evidence_text, line_start=line_start)
+        if module_id:
+            _insert_business_edge_seed(
+                conn,
+                project_id,
+                from_node_id=module_id,
+                to_node_id=node_id,
+                relation="contains",
+                description="业务模块包含该处理逻辑。",
+                confidence=0.66,
+                created_by="source_index",
+                now=now,
+            )
         return node_id
 
     def ensure_data_object(path: str | None, name: str | None, evidence_text: str | None, line_start: int | None, confidence: float) -> str | None:
@@ -2008,6 +2480,75 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
         )
         data_by_ref[key] = node_id
         data_by_path.setdefault(path, []).append(node_id)
+        module_id = ensure_module(path, evidence_text=evidence_text, line_start=line_start)
+        if module_id:
+            _insert_business_edge_seed(
+                conn,
+                project_id,
+                from_node_id=module_id,
+                to_node_id=node_id,
+                relation="contains",
+                description="业务模块包含该数据对象。",
+                confidence=0.66,
+                created_by="source_index",
+                now=now,
+            )
+        return node_id
+
+    def ensure_semantic_capability(capability) -> str | None:
+        category = capability["category"]
+        config = _semantic_capability_config(category)
+        if config is None:
+            return None
+        path = capability["path"]
+        if not path:
+            return None
+        symbol = capability["symbol"]
+        node_id = _stable_business_id("biz", snapshot_id, "semantic_capability", path, category, symbol)
+        tags = _decode_json_list(capability["risk_tags_json"])
+        for tag in config["risk_tags"]:
+            if tag not in tags:
+                tags.append(tag)
+        evidence = _business_evidence(path, capability["line_start"], capability["evidence"])
+        title = f"{config['title_prefix']} {capability['title'] or CAPABILITY_CATEGORY_TITLES.get(category, category)}"
+        _insert_business_node_seed(
+            conn,
+            project_id,
+            snapshot_id=snapshot_id,
+            node_id=node_id,
+            node_type=config["node_type"],
+            title=title,
+            description=(
+                f"源码索引在 {path} 识别到 {capability['title']}。"
+                f"符号：{symbol or '未定位'}。"
+                "该节点用于把权限、对象、文件、任务或外部系统边界提升为业务语义，"
+                "帮助 worker 沿业务链路审计，不代表漏洞结论。"
+            ),
+            risk_level=_semantic_capability_risk_level(category, capability["risk_level"]),
+            review_status="unreviewed",
+            coverage_note="索引自动生成的业务语义边界节点，需要结合入口、对象和能力链验证。",
+            risk_tags=tags[:8],
+            evidence=evidence,
+            confidence=min(0.86, max(0.45, float(capability["confidence"] or 0.65))),
+            created_by="source_index",
+            now=now,
+        )
+        nodes = semantic_by_path.setdefault(path, [])
+        if node_id not in nodes:
+            nodes.append(node_id)
+        module_id = ensure_module(path, evidence_text=capability["evidence"], line_start=capability["line_start"])
+        if module_id:
+            _insert_business_edge_seed(
+                conn,
+                project_id,
+                from_node_id=module_id,
+                to_node_id=node_id,
+                relation="contains",
+                description="业务模块包含该业务语义边界。",
+                confidence=0.65,
+                created_by="source_index",
+                now=now,
+            )
         return node_id
 
     for symbol in data_symbols:
@@ -2055,6 +2596,19 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
             created_by="source_index",
             now=now,
         )
+        module_id = ensure_module(entrypoint["path"], entrypoint["route"], entrypoint["evidence"], entrypoint["line_start"])
+        if module_id:
+            _insert_business_edge_seed(
+                conn,
+                project_id,
+                from_node_id=module_id,
+                to_node_id=node_id,
+                relation="contains",
+                description="业务模块包含该入口。",
+                confidence=0.72,
+                created_by="source_index",
+                now=now,
+            )
         feature_id = ensure_feature(entrypoint)
         if feature_id:
             _insert_business_edge_seed(
@@ -2076,6 +2630,18 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
             float(entrypoint["confidence"] or 0.7),
         )
         if control_id:
+            if module_id:
+                _insert_business_edge_seed(
+                    conn,
+                    project_id,
+                    from_node_id=module_id,
+                    to_node_id=control_id,
+                    relation="contains",
+                    description="业务模块包含该处理逻辑。",
+                    confidence=0.66,
+                    created_by="source_index",
+                    now=now,
+                )
             _insert_business_edge_seed(
                 conn,
                 project_id,
@@ -2173,6 +2739,32 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
                     now=now,
                 )
 
+    for capability in capabilities:
+        semantic_id = ensure_semantic_capability(capability)
+        if not semantic_id:
+            continue
+        source_ids = controls_by_path.get(capability["path"]) or endpoint_by_path.get(capability["path"]) or []
+        if not source_ids:
+            continue
+        relation = _semantic_capability_edge_relation(capability["category"])
+        reverse = capability["category"] in {"auth_guard", "object_scope_guard"}
+        for source_id in source_ids[:3]:
+            if reverse:
+                from_id, to_id = semantic_id, source_id
+            else:
+                from_id, to_id = source_id, semantic_id
+            _insert_business_edge_seed(
+                conn,
+                project_id,
+                from_node_id=from_id,
+                to_node_id=to_id,
+                relation=relation,
+                description=_semantic_capability_edge_description(capability["category"]),
+                confidence=min(0.76, max(0.42, float(capability["confidence"] or 0.65))),
+                created_by="source_index",
+                now=now,
+            )
+
     candidates = conn.execute(
         """
         SELECT id, candidate_type, severity, title, description, file_path, line_start,
@@ -2186,7 +2778,7 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
         (snapshot_id,),
     ).fetchall()
     for candidate in candidates:
-        node_id = _stable_business_id("biz", snapshot_id, "risk", candidate["id"])
+        node_id = _candidate_risk_node_id(snapshot_id, candidate)
         evidence = _business_evidence(candidate["file_path"], candidate["line_start"], candidate["description"])
         risk_tag = _candidate_risk_tag(candidate["title"]) or _candidate_capability_risk_tag(candidate["title"])
         risk_level = _candidate_business_risk_level(candidate["severity"], candidate["title"])
@@ -2200,17 +2792,29 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
             title=f"{node_title_prefix} {candidate['title']}",
             description=(
                 f"{candidate['description']} "
-                "该节点由源码索引生成，只表示需要 worker 读取源码确认，不预设最终漏洞类型。"
+                "该节点由源码索引按风险链聚合生成，只表示需要 worker 读取源码确认，不预设最终漏洞类型。"
             ),
             risk_level=risk_level,
             review_status="unreviewed",
-            coverage_note=f"索引自动生成的高价值{node_title_prefix[3:]}，需要源码证据闭环。",
+            coverage_note=f"索引自动生成的高价值{node_title_prefix[3:]}聚合节点，需要源码证据闭环。",
             risk_tags=[risk_tag] if risk_tag else [node_title_prefix],
             evidence=evidence,
             confidence=0.72,
             created_by="source_index",
             now=now,
         )
+        for module_id in modules_by_path.get(candidate["file_path"] or "", []):
+            _insert_business_edge_seed(
+                conn,
+                project_id,
+                from_node_id=module_id,
+                to_node_id=node_id,
+                relation="contains",
+                description="业务模块包含该待审计风险链。",
+                confidence=0.66,
+                created_by="source_index",
+                now=now,
+            )
         conn.execute(
             """
             UPDATE audit_candidates
@@ -2245,6 +2849,18 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
                 created_by="source_index",
                 now=now,
             )
+        for semantic_id in semantic_by_path.get(candidate["file_path"] or "", [])[:6]:
+            _insert_business_edge_seed(
+                conn,
+                project_id,
+                from_node_id=semantic_id,
+                to_node_id=node_id,
+                relation="risk_of",
+                description="业务语义边界关联到索引发现的待审计风险链。",
+                confidence=0.64,
+                created_by="source_index",
+                now=now,
+            )
         for data_id in data_by_path.get(candidate["file_path"] or "", []):
             _insert_business_edge_seed(
                 conn,
@@ -2257,6 +2873,91 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
                 created_by="source_index",
                 now=now,
             )
+
+
+def _candidate_risk_node_id(snapshot_id: str, candidate) -> str:
+    cluster_key = audit_candidate_cluster_key(
+        candidate_type=candidate["candidate_type"],
+        severity=candidate["severity"],
+        title=candidate["title"],
+        file_path=candidate["file_path"],
+        line_start=candidate["line_start"],
+        entry_point=candidate["entry_point"],
+        symbol=candidate["symbol"],
+    )
+    return _stable_business_id("biz", snapshot_id, "risk_cluster", cluster_key)
+
+
+def _semantic_capability_config(category: str) -> dict[str, object] | None:
+    if category == "auth_guard":
+        return {
+            "node_type": "control",
+            "title_prefix": "权限边界",
+            "risk_tags": ["权限边界", "认证授权"],
+        }
+    if category in {"object_scope_guard", "object_id_lookup"}:
+        return {
+            "node_type": "asset",
+            "title_prefix": "对象边界",
+            "risk_tags": ["对象边界", "租户/归属"],
+        }
+    if category in {"file_upload", "file_write", "file_read", "archive_extract"}:
+        return {
+            "node_type": "asset",
+            "title_prefix": "文件生命周期",
+            "risk_tags": ["文件生命周期", "文件能力"],
+        }
+    if category in {"process_execution", "task_execution", "template_render", "websocket_boundary"}:
+        return {
+            "node_type": "control",
+            "title_prefix": "执行边界",
+            "risk_tags": ["执行边界"],
+        }
+    if category == "credential_access":
+        return {
+            "node_type": "asset",
+            "title_prefix": "敏感资产",
+            "risk_tags": ["敏感资产", "凭据"],
+        }
+    if category == "external_system":
+        return {
+            "node_type": "external_system",
+            "title_prefix": "外部系统",
+            "risk_tags": ["外部系统", "基础设施"],
+        }
+    return None
+
+
+def _semantic_capability_risk_level(category: str, raw_level: str | None) -> str:
+    if raw_level in {"critical", "high", "medium", "low"}:
+        return raw_level
+    if category in {"file_upload", "file_write", "archive_extract", "process_execution", "task_execution"}:
+        return "high"
+    if category in {"auth_guard", "object_scope_guard", "object_id_lookup", "credential_access", "external_system"}:
+        return "medium"
+    return "unknown"
+
+
+def _semantic_capability_edge_relation(category: str) -> str:
+    if category in {"auth_guard", "object_scope_guard", "object_id_lookup"}:
+        return "guards"
+    if category == "external_system":
+        return "depends_on"
+    return "uses"
+
+
+def _semantic_capability_edge_description(category: str) -> str:
+    if category == "auth_guard":
+        return "认证/权限边界保护该入口或处理逻辑。"
+    if category in {"object_scope_guard", "object_id_lookup"}:
+        return "对象归属、租户或资源定位边界约束该处理逻辑。"
+    if category in {"file_upload", "file_write", "file_read", "archive_extract"}:
+        return "处理逻辑使用文件生命周期相关能力。"
+    if category in {"process_execution", "task_execution"}:
+        return "处理逻辑依赖后台任务或执行边界。"
+    if category == "external_system":
+        return "处理逻辑依赖外部系统或基础设施接口。"
+    return "处理逻辑关联到源码索引识别的业务语义能力。"
 
 
 def _insert_business_node_seed(
@@ -2351,6 +3052,53 @@ def _business_evidence(path: str | None, line_start: int | None, detail: str | N
 
 
 ROUTE_GROUP_PREFIXES = {"api", "v1", "v2", "v3", "rest", "admin"}
+MODULE_PATH_PREFIXES = {
+    ".",
+    "app",
+    "apps",
+    "backend",
+    "cmd",
+    "demo",
+    "internal",
+    "java",
+    "lib",
+    "main",
+    "pkg",
+    "python",
+    "server",
+    "src",
+    "web",
+}
+
+
+def _business_module_key(path: str | None, route: str | None = None) -> str | None:
+    route_key = _route_feature_key(route)
+    if route_key and route_key.lower() not in ROUTE_GROUP_PREFIXES:
+        return route_key[:80]
+    if not path:
+        return None
+    parts = [part for part in PurePosixPath(path).parts if part not in ("", ".")]
+    for index, part in enumerate(parts):
+        clean = part.strip()
+        if not clean:
+            continue
+        lower = clean.lower()
+        if lower in MODULE_PATH_PREFIXES:
+            continue
+        if "." in clean and index == len(parts) - 1:
+            stem = PurePosixPath(clean).stem
+            if stem and stem.lower() not in {"index", "main", "app", "server"}:
+                return stem[:80]
+            continue
+        if re.fullmatch(r"v\d+", lower):
+            continue
+        if clean.startswith("__"):
+            continue
+        return clean[:80]
+    if parts:
+        stem = PurePosixPath(parts[-1]).stem
+        return stem[:80] if stem else None
+    return None
 
 
 def _route_feature_key(route: str | None) -> str | None:

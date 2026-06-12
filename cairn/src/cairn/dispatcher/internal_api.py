@@ -275,7 +275,11 @@ def build_status_snapshot(loop: "DispatcherLoop") -> dict[str, Any]:
 
     # Live, mutable state -- take defensive copies.
     running_tasks = _safe_copy(
-        lambda: list(loop.futures.values()) + list(getattr(loop, "tool_scan_futures", {}).values())
+        lambda: (
+            list(loop.futures.values())
+            + list(getattr(loop, "report_futures", {}).values())
+            + list(getattr(loop, "tool_scan_futures", {}).values())
+        )
     )
     unhealthy_until = dict(_safe_copy(lambda: list(loop.worker_unhealthy_until.items())))
     rejected_until = dict(_safe_copy(lambda: list(loop.worker_rejected_until.items())))

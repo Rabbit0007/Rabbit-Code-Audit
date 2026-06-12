@@ -299,6 +299,8 @@ CREATE TABLE IF NOT EXISTS audit_findings (
     severity TEXT NOT NULL CHECK(severity IN ('critical', 'high', 'medium', 'low', 'info')),
     status TEXT NOT NULL DEFAULT 'candidate'
         CHECK(status IN ('candidate', 'investigating', 'pending_review', 'confirmed', 'rejected', 'needs_more_evidence')),
+    evidence_level TEXT NOT NULL DEFAULT 'L0'
+        CHECK(evidence_level IN ('L0', 'L1', 'L2', 'L3', 'L4', 'L5')),
     cwe TEXT,
     file_path TEXT,
     line_start INTEGER,
@@ -522,6 +524,10 @@ VULNERABILITY_COLUMNS: dict[str, str] = {
 
 
 AUDIT_FINDING_COLUMNS: dict[str, str] = {
+    "evidence_level": (
+        "TEXT NOT NULL DEFAULT 'L0' "
+        "CHECK(evidence_level IN ('L0', 'L1', 'L2', 'L3', 'L4', 'L5'))"
+    ),
     "symbol": "TEXT",
     "entry_point": "TEXT",
     "business_node_id": "TEXT REFERENCES business_nodes(id) ON DELETE SET NULL",

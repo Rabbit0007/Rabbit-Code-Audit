@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
-from cairn.server.models import Intent, ProjectMeta, ProjectReason
+from cairn.server.models import Fact, Intent, ProjectMeta, ProjectReason
 
 BUSINESS_NODE_COVERAGE_NOTE_LIMIT = 1000
 BACKGROUND_TASK_STALE_MIN_SECONDS = 60
@@ -31,10 +32,75 @@ HIGH_IMPACT_AUDIT_MARKERS = (
     "move_uploaded_file",
     "savemultipartfile",
 )
+INTENT_TARGET_ID_RE = re.compile(
+    r"\b(?:cand|finding|tool|biz|rev|rpt|snap)_[0-9a-zA-Z][0-9a-zA-Z_-]{3,63}\b"
+)
+INTENT_PATH_RE = re.compile(
+    r"\b[\w./@+-]+\.(?:php|py|go|java|js|ts|tsx|jsx|rb|cs|kt|scala|rs|cpp|c|h|hpp|"
+    r"yaml|yml|xml|json|properties|ini|conf)\b",
+    re.IGNORECASE,
+)
 
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _normalize_fingerprint_text(value: str | None, *, limit: int = 4000) -> str | None:
+    if value is None:
+        return None
+    text = " ".join(value.strip().lower().split())
+    return text[:limit] or None
+
+
+def build_intent_fingerprint(
+    source_fact_ids: list[str],
+    description: str,
+    *,
+    target_kind: str | None = None,
+    target_id: str | None = None,
+    objective: str | None = None,
+    evidence_gap: str | None = None,
+) -> str:
+    normalized_description = _normalize_fingerprint_text(description) or ""
+    inferred_ids = sorted(
+        {match.group(0).lower() for match in INTENT_TARGET_ID_RE.finditer(description)}
+    )
+    inferred_paths = sorted(
+        {match.group(0).strip("./").lower() for match in INTENT_PATH_RE.finditer(description)}
+    )[:20]
+    payload = {
+        "sources": sorted({item.strip() for item in source_fact_ids if item.strip()}),
+        "description": normalized_description,
+        "target_kind": _normalize_fingerprint_text(target_kind),
+        "target_id": _normalize_fingerprint_text(target_id),
+        "objective": _normalize_fingerprint_text(objective),
+        "evidence_gap": _normalize_fingerprint_text(evidence_gap),
+        "inferred_ids": inferred_ids,
+        "inferred_paths": inferred_paths,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def get_equivalent_open_intent(
+    conn: sqlite3.Connection,
+    project_id: str,
+    fingerprint: str,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM intents
+        WHERE project_id = ?
+          AND fingerprint = ?
+          AND to_fact_id IS NULL
+          AND status IN ('open', 'claimed', 'cooldown')
+        ORDER BY created_at, id
+        LIMIT 1
+        """,
+        (project_id, fingerprint),
+    ).fetchone()
 
 
 def business_node_coverage_status_for_conclusion(conclusion: str) -> str | None:
@@ -275,11 +341,15 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
 
     open_candidates = conn.execute(
         """
-        SELECT id, title, severity, status, candidate_type, file_path, line_start, entry_point
+        SELECT id, source, title, severity, status, candidate_type, file_path, line_start, entry_point
         FROM audit_candidates
         WHERE project_id = ?
           AND severity IN ('critical', 'high', 'unknown')
           AND status IN ('candidate', 'investigating')
+          AND NOT (
+              source = 'index'
+              AND candidate_type IN ('entrypoint', 'web_entrypoint')
+          )
         ORDER BY created_at, id
         LIMIT 20
         """,
@@ -352,7 +422,7 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
 
     invalid_candidate_conclusions = conn.execute(
         """
-        SELECT c.id, c.title, c.severity, c.status, c.candidate_type,
+        SELECT c.id, c.source, c.title, c.severity, c.status, c.candidate_type,
                c.audit_finding_id, af.status AS audit_finding_status,
                c.conclusion_summary, c.evidence
         FROM audit_candidates c
@@ -361,6 +431,10 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
          AND af.project_id = c.project_id
         WHERE c.project_id = ?
           AND c.severity IN ('critical', 'high', 'unknown')
+          AND NOT (
+              c.source = 'index'
+              AND c.candidate_type IN ('entrypoint', 'web_entrypoint')
+          )
           AND (
               (c.status = 'confirmed'
                AND (c.audit_finding_id IS NULL OR af.status IS NULL OR af.status != 'confirmed'))
@@ -402,7 +476,12 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
         """
         SELECT s.id AS snapshot_id,
                (SELECT COUNT(*) FROM code_entrypoints ce WHERE ce.snapshot_id = s.id) AS entrypoint_count,
-               (SELECT COUNT(*) FROM audit_candidates ac WHERE ac.snapshot_id = s.id) AS candidate_count,
+               (SELECT COUNT(*) FROM audit_candidates ac
+                WHERE ac.snapshot_id = s.id
+                  AND NOT (
+                      ac.source = 'index'
+                      AND ac.candidate_type IN ('entrypoint', 'web_entrypoint')
+                  )) AS candidate_count,
                (SELECT COUNT(*) FROM business_nodes bn WHERE bn.project_id = s.project_id) AS business_node_count
         FROM source_snapshots s
         WHERE s.project_id = ?
@@ -819,6 +898,8 @@ def get_claimable_open_intent_or_404(
     row = get_intent_or_404(conn, project_id, intent_id)
     if row["to_fact_id"] is not None:
         raise HTTPException(409, "Intent already concluded")
+    if row["status"] in ("blocked", "superseded"):
+        raise HTTPException(409, f"Intent is {row['status']}")
     if row["worker"] is not None and row["worker"] != worker:
         raise HTTPException(409, f"Intent is currently claimed by {row['worker']}")
     return row
@@ -831,6 +912,8 @@ def get_releasable_open_intent_or_404(
     row = get_intent_or_404(conn, project_id, intent_id)
     if row["to_fact_id"] is not None:
         raise HTTPException(409, "Intent already concluded")
+    if row["status"] in ("blocked", "superseded"):
+        raise HTTPException(409, f"Intent is {row['status']}")
     if row["worker"] is None:
         return row
     if row["worker"] != worker:
@@ -865,7 +948,40 @@ def intent_to_model(conn: sqlite3.Connection, row: sqlite3.Row, project_id: str)
         last_heartbeat_at=row["last_heartbeat_at"],
         created_at=row["created_at"],
         concluded_at=row["concluded_at"],
+        fingerprint=row["fingerprint"],
+        status=row["status"],
+        superseded_by=row["superseded_by"],
+        target_kind=row["target_kind"],
+        target_id=row["target_id"],
+        objective=row["objective"],
+        evidence_gap=row["evidence_gap"],
     )
+
+
+def fact_to_model(row: sqlite3.Row) -> Fact:
+    data = dict(row)
+    return Fact(
+        id=data["id"],
+        description=data["description"],
+        fact_type=data.get("fact_type") or "observation",
+        source=data.get("source") or "worker",
+        confidence=data.get("confidence") if data.get("confidence") is not None else 0.7,
+        evidence_refs=_decode_json_string_list(data.get("evidence_refs_json")),
+        parent_fact_ids=_decode_json_string_list(data.get("parent_fact_ids_json")),
+        fingerprint=data.get("fingerprint"),
+    )
+
+
+def _decode_json_string_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item).strip()]
 
 
 def build_intents(conn: sqlite3.Connection, project_id: str) -> list[Intent]:
@@ -941,7 +1057,10 @@ def expire_workers(conn: sqlite3.Connection, project_id: str | None = None) -> N
     expired = conn.execute(f"SELECT 1 FROM intents WHERE {where} LIMIT 1", params).fetchone()
     if expired is None:
         return
-    conn.execute(f"UPDATE intents SET worker = NULL WHERE {where}", params)
+    conn.execute(
+        f"UPDATE intents SET worker = NULL, status = 'open' WHERE {where}",
+        params,
+    )
 
 
 def expire_reason_leases(conn: sqlite3.Connection, project_id: str | None = None) -> None:
