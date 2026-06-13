@@ -221,7 +221,10 @@ CREATE TABLE IF NOT EXISTS code_relationships (
     to_path TEXT NOT NULL,
     to_symbol TEXT,
     relation TEXT NOT NULL
-        CHECK(relation IN ('imports', 'calls', 'uses', 'references')),
+        CHECK(relation IN (
+            'imports', 'calls', 'uses', 'references',
+            'implements', 'implemented_by', 'extends', 'extended_by'
+        )),
     evidence TEXT,
     confidence REAL NOT NULL DEFAULT 0.55,
     source TEXT NOT NULL DEFAULT 'heuristic',
@@ -358,7 +361,9 @@ CREATE TABLE IF NOT EXISTS business_edges (
     relation TEXT NOT NULL
         CHECK(relation IN (
             'contains', 'exposes', 'calls', 'uses', 'owns',
-            'guards', 'transitions_to', 'depends_on', 'risk_of', 'relates_to'
+            'guards', 'transitions_to', 'depends_on', 'risk_of',
+            'implements', 'implemented_by', 'extends', 'extended_by',
+            'relates_to'
         )),
     description TEXT,
     created_by TEXT NOT NULL,
@@ -615,6 +620,96 @@ def _ensure_columns(conn, table: str, columns: dict[str, str]) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
+def _table_create_sql(conn, table: str) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return str(row["sql"] or "") if row else ""
+
+
+def _ensure_code_relationship_relation_values(conn) -> None:
+    sql = _table_create_sql(conn, "code_relationships")
+    if not sql or "implemented_by" in sql:
+        return
+    conn.executescript(
+        """
+        DROP INDEX IF EXISTS idx_code_relationships_snapshot;
+        DROP INDEX IF EXISTS idx_code_relationships_target;
+        ALTER TABLE code_relationships RENAME TO code_relationships_legacy;
+        CREATE TABLE code_relationships (
+            id TEXT PRIMARY KEY,
+            snapshot_id TEXT NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
+            from_path TEXT NOT NULL,
+            from_symbol TEXT,
+            to_path TEXT NOT NULL,
+            to_symbol TEXT,
+            relation TEXT NOT NULL
+                CHECK(relation IN (
+                    'imports', 'calls', 'uses', 'references',
+                    'implements', 'implemented_by', 'extends', 'extended_by'
+                )),
+            evidence TEXT,
+            confidence REAL NOT NULL DEFAULT 0.55,
+            source TEXT NOT NULL DEFAULT 'heuristic',
+            line_start INTEGER
+        );
+        INSERT OR IGNORE INTO code_relationships (
+            id, snapshot_id, from_path, from_symbol, to_path, to_symbol,
+            relation, evidence, confidence, source, line_start
+        )
+        SELECT
+            id, snapshot_id, from_path, from_symbol, to_path, to_symbol,
+            relation, evidence, confidence, source, line_start
+        FROM code_relationships_legacy;
+        DROP TABLE code_relationships_legacy;
+        CREATE INDEX IF NOT EXISTS idx_code_relationships_snapshot
+            ON code_relationships(snapshot_id, from_path, relation);
+        CREATE INDEX IF NOT EXISTS idx_code_relationships_target
+            ON code_relationships(snapshot_id, to_path, relation);
+        """
+    )
+
+
+def _ensure_business_edge_relation_values(conn) -> None:
+    sql = _table_create_sql(conn, "business_edges")
+    if not sql or "implemented_by" in sql:
+        return
+    conn.executescript(
+        """
+        DROP INDEX IF EXISTS idx_business_edges_project;
+        ALTER TABLE business_edges RENAME TO business_edges_legacy;
+        CREATE TABLE business_edges (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            from_node_id TEXT NOT NULL REFERENCES business_nodes(id) ON DELETE CASCADE,
+            to_node_id TEXT NOT NULL REFERENCES business_nodes(id) ON DELETE CASCADE,
+            relation TEXT NOT NULL
+                CHECK(relation IN (
+                    'contains', 'exposes', 'calls', 'uses', 'owns',
+                    'guards', 'transitions_to', 'depends_on', 'risk_of',
+                    'implements', 'implemented_by', 'extends', 'extended_by',
+                    'relates_to'
+                )),
+            description TEXT,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO business_edges (
+            id, project_id, from_node_id, to_node_id, relation,
+            description, created_by, created_at
+        )
+        SELECT
+            id, project_id, from_node_id, to_node_id, relation,
+            description, created_by, created_at
+        FROM business_edges_legacy;
+        DROP TABLE business_edges_legacy;
+        CREATE INDEX IF NOT EXISTS idx_business_edges_project
+            ON business_edges(project_id, relation);
+        """
+    )
+
+
 def configure_product_db() -> None:
     """Run the product-feature schema DDL on the existing SQLite connection.
 
@@ -627,6 +722,8 @@ def configure_product_db() -> None:
     """
     with db.get_conn() as conn:
         conn.executescript(PRODUCT_SCHEMA)
+        _ensure_code_relationship_relation_values(conn)
+        _ensure_business_edge_relation_values(conn)
         _ensure_vulnerability_columns(conn)
         _ensure_columns(conn, "audit_findings", AUDIT_FINDING_COLUMNS)
         _ensure_columns(conn, "business_nodes", BUSINESS_NODE_COLUMNS)

@@ -161,6 +161,10 @@ class SourceIndexQuality(BaseModel):
     candidate_density_per_code_file: float = 0.0
     business_graph_node_count: int = 0
     business_graph_edge_count: int = 0
+    business_module_count: int = 0
+    business_module_island_count: int = 0
+    entrypoints_with_business_flows: int = 0
+    entrypoints_with_capability_paths: int = 0
     issues: list[SourceIndexQualityIssue] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
 

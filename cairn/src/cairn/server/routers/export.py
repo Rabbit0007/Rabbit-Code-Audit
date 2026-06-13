@@ -682,8 +682,15 @@ def _load_code_index_audit_context(
     entrypoint_traces = _candidate_entrypoint_traces(conn, snapshot_id, priority_candidates)
     module_limit = 8 if profile == "explore" else 12 if profile == "reason" else 30
     flow_limit = 10 if profile == "explore" else 18 if profile == "reason" else 40
+    entrypoint_summary_limit = 8 if profile == "explore" else 14 if profile == "reason" else 40
     module_summaries = _business_module_summaries(conn, project_id, snapshot_id, limit=module_limit)
     business_flow_traces = _business_flow_traces(conn, snapshot_id, limit=flow_limit)
+    entrypoint_summaries = _entrypoint_business_summaries(
+        conn,
+        snapshot_id,
+        business_flow_traces,
+        limit=entrypoint_summary_limit,
+    )
 
     entrypoints_by_path = _group_by_path(entrypoints)
     capabilities_by_path = _group_by_path(capabilities)
@@ -703,6 +710,7 @@ def _load_code_index_audit_context(
         "priority_model": "risk_score 只用于排序：入口可达、高影响能力、输入符号、控制/校验线索和已有结论会改变分数。",
         "focused_candidate_ids": sorted(focus_candidate_ids),
         "module_summaries": module_summaries,
+        "entrypoint_summaries": entrypoint_summaries,
         "business_flow_traces": business_flow_traces,
         "priority_candidates": [_candidate_context_item(row) for row in priority_candidates],
         "candidate_entrypoint_traces": entrypoint_traces,
@@ -758,9 +766,9 @@ def _candidate_entrypoint_traces(conn, snapshot_id: str, candidates, *, max_dept
                evidence, confidence, source, line_start
         FROM code_relationships
         WHERE snapshot_id = ?
-          AND relation IN ('calls', 'imports', 'uses')
+          AND relation IN ('calls', 'imports', 'uses', 'implemented_by', 'extended_by')
         ORDER BY
-            CASE relation WHEN 'calls' THEN 0 WHEN 'uses' THEN 1 WHEN 'imports' THEN 2 ELSE 3 END,
+            CASE relation WHEN 'calls' THEN 0 WHEN 'implemented_by' THEN 1 WHEN 'extended_by' THEN 2 WHEN 'uses' THEN 3 WHEN 'imports' THEN 4 ELSE 5 END,
             confidence DESC,
             from_path,
             to_path,
@@ -1027,9 +1035,9 @@ def _business_flow_traces(conn, snapshot_id: str, *, limit: int, max_depth: int 
                evidence, confidence, source, line_start
         FROM code_relationships
         WHERE snapshot_id = ?
-          AND relation IN ('calls', 'imports', 'uses')
+          AND relation IN ('calls', 'imports', 'uses', 'implemented_by', 'extended_by')
         ORDER BY
-            CASE relation WHEN 'calls' THEN 0 WHEN 'uses' THEN 1 WHEN 'imports' THEN 2 ELSE 3 END,
+            CASE relation WHEN 'calls' THEN 0 WHEN 'implemented_by' THEN 1 WHEN 'extended_by' THEN 2 WHEN 'uses' THEN 3 WHEN 'imports' THEN 4 ELSE 5 END,
             confidence DESC,
             from_path,
             to_path,
@@ -1047,9 +1055,10 @@ def _business_flow_traces(conn, snapshot_id: str, *, limit: int, max_depth: int 
     traces: list[dict] = []
     seen_trace_keys: set[tuple[str, tuple[str, ...]]] = set()
     for entrypoint in entrypoint_rows:
-        emitted = 0
+        entrypoint_traces: list[dict] = []
+        entrypoint_seen: set[tuple[str, tuple[str, ...]]] = set()
         queue: list[tuple[str, list, set[str]]] = [(entrypoint["path"], [], {entrypoint["path"]})]
-        while queue and len(traces) < limit and emitted < max_per_entrypoint:
+        while queue:
             current_path, edges, visited = queue.pop(0)
             if len(edges) >= max_depth:
                 continue
@@ -1060,16 +1069,214 @@ def _business_flow_traces(conn, snapshot_id: str, *, limit: int, max_depth: int 
                 next_edges = [*edges, rel]
                 item = _business_flow_trace_item(entrypoint, next_edges)
                 key = (item["entry_point"], tuple(item["path_chain"]))
-                if key not in seen_trace_keys:
-                    traces.append(item)
-                    seen_trace_keys.add(key)
-                    emitted += 1
-                    if len(traces) >= limit or emitted >= max_per_entrypoint:
-                        break
+                if key not in entrypoint_seen:
+                    entrypoint_traces.append(item)
+                    entrypoint_seen.add(key)
                 queue.append((next_path, next_edges, visited | {next_path}))
-            if len(traces) >= limit or emitted >= max_per_entrypoint:
-                break
+        for item in sorted(entrypoint_traces, key=_business_flow_trace_rank)[:max_per_entrypoint]:
+            key = (item["entry_point"], tuple(item["path_chain"]))
+            if key in seen_trace_keys:
+                continue
+            traces.append(item)
+            seen_trace_keys.add(key)
+            if len(traces) >= limit:
+                return traces
     return traces
+
+
+def _business_flow_trace_rank(item: dict) -> tuple[int, int, int, float, str]:
+    hops = item.get("hops") or []
+    call_count = sum(1 for hop in hops if hop.get("relation") == "calls")
+    hierarchy_count = sum(1 for hop in hops if hop.get("relation") in {"implemented_by", "extended_by"})
+    import_count = sum(1 for hop in hops if hop.get("relation") == "imports")
+    path_chain = item.get("path_chain") or []
+    return (
+        -len(path_chain),
+        -call_count,
+        -hierarchy_count,
+        import_count,
+        -float(item.get("confidence") or 0),
+        " -> ".join(str(path) for path in path_chain),
+    )
+
+
+def _entrypoint_business_summaries(conn, snapshot_id: str, traces: list[dict], *, limit: int) -> list[dict]:
+    entrypoint_rows = conn.execute(
+        """
+        SELECT path, method, route, handler, line_start, evidence, confidence, source
+        FROM code_entrypoints
+        WHERE snapshot_id = ?
+        ORDER BY path, COALESCE(line_start, 0), route, COALESCE(method, '')
+        LIMIT 3000
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    if not entrypoint_rows:
+        return []
+    traces_by_entrypoint: dict[str, list[dict]] = {}
+    for trace in traces:
+        traces_by_entrypoint.setdefault(trace["entry_point"], []).append(trace)
+    summaries: list[dict] = []
+    for entrypoint in entrypoint_rows[:limit]:
+        label = _entrypoint_label(entrypoint["method"], entrypoint["route"])
+        related_traces = traces_by_entrypoint.get(label, [])
+        reachable_paths = _entrypoint_reachable_paths(conn, snapshot_id, entrypoint["path"], related_traces)
+        paths = reachable_paths[:20]
+        capabilities = _index_rows_for_paths(
+            conn,
+            snapshot_id,
+            "code_capabilities",
+            paths,
+            columns="id, path, symbol, category, title, line_start, evidence, risk_level, risk_tags_json, confidence, source",
+            order_by=(
+                "CASE risk_level WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, "
+                "path, COALESCE(line_start, 0), category"
+            ),
+            limit=80,
+        )
+        data_objects = _index_rows_for_paths(
+            conn,
+            snapshot_id,
+            "code_symbols",
+            paths,
+            columns="id, path, kind, name, container, signature, line_start, line_end, confidence, source",
+            where_extra="AND kind = 'data_object'",
+            order_by="path, COALESCE(line_start, 0), name",
+            limit=80,
+        )
+        relationships = _relationship_rows_for_paths(conn, snapshot_id, paths, limit=120)
+        relationship_counts = Counter(row["relation"] for row in relationships)
+        capability_counts = Counter(row["category"] for row in capabilities)
+        boundary_capabilities = [
+            row
+            for row in capabilities
+            if row["category"]
+            in {
+                "auth_guard",
+                "object_scope_guard",
+                "object_id_lookup",
+                "file_upload",
+                "file_write",
+                "file_read",
+                "archive_extract",
+                "process_execution",
+                "task_execution",
+                "credential_access",
+                "external_system",
+                "websocket_boundary",
+            }
+        ]
+        summaries.append(
+            {
+                "entry_point": label,
+                "handler": entrypoint["handler"],
+                "start_path": entrypoint["path"],
+                "start_line": entrypoint["line_start"],
+                "reachable_paths": reachable_paths[:14],
+                "flow_count": len(related_traces),
+                "relationship_counts": dict(sorted(relationship_counts.items())),
+                "capability_counts": dict(sorted(capability_counts.items())),
+                "data_objects": [_symbol_with_path_context_item(row) for row in data_objects[:10]],
+                "semantic_boundaries": [_capability_with_path_context_item(row) for row in boundary_capabilities[:10]],
+                "representative_flows": related_traces[:3],
+            }
+        )
+    return sorted(
+        summaries,
+        key=lambda item: (
+            -len(item["reachable_paths"]),
+            -sum(item["relationship_counts"].values()),
+            item["entry_point"],
+        ),
+    )
+
+
+def _entrypoint_reachable_paths(conn, snapshot_id: str, start_path: str, traces: list[dict]) -> list[str]:
+    paths = [start_path]
+    for trace in traces:
+        for path in trace.get("path_chain") or []:
+            if path and path not in paths:
+                paths.append(path)
+    for path in _entrypoint_graph_reachable_paths(conn, snapshot_id, start_path):
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _entrypoint_graph_reachable_paths(
+    conn,
+    snapshot_id: str,
+    start_path: str,
+    *,
+    max_depth: int = 5,
+    max_paths: int = 36,
+    fanout: int = 24,
+) -> list[str]:
+    if not start_path:
+        return []
+    relationship_rows = conn.execute(
+        """
+        SELECT from_path, to_path, relation, confidence, line_start
+        FROM code_relationships
+        WHERE snapshot_id = ?
+          AND relation IN (
+            'calls', 'uses', 'imports',
+            'implements', 'implemented_by', 'extends', 'extended_by'
+          )
+        ORDER BY
+            CASE relation
+                WHEN 'calls' THEN 0
+                WHEN 'implemented_by' THEN 1
+                WHEN 'extended_by' THEN 2
+                WHEN 'uses' THEN 3
+                WHEN 'implements' THEN 4
+                WHEN 'extends' THEN 5
+                WHEN 'imports' THEN 6
+                ELSE 7
+            END,
+            confidence DESC,
+            from_path,
+            to_path,
+            COALESCE(line_start, 0)
+        LIMIT 50000
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    adjacency: dict[str, list] = {}
+    for row in relationship_rows:
+        if not row["from_path"] or not row["to_path"] or row["from_path"] == row["to_path"]:
+            continue
+        adjacency.setdefault(row["from_path"], []).append(row)
+
+    reachable: list[str] = [start_path]
+    visited: set[str] = {start_path}
+    queue: list[tuple[str, int]] = [(start_path, 0)]
+    while queue and len(reachable) < max_paths:
+        current_path, depth = queue.pop(0)
+        if depth >= max_depth:
+            continue
+        for rel in adjacency.get(current_path, [])[:fanout]:
+            next_path = rel["to_path"]
+            if not next_path or next_path in visited:
+                continue
+            visited.add(next_path)
+            reachable.append(next_path)
+            if len(reachable) >= max_paths:
+                break
+            queue.append((next_path, depth + 1))
+    return reachable
+
+
+def _symbol_with_path_context_item(row) -> dict:
+    item = _symbol_context_item(row)
+    item["path"] = row["path"]
+    return item
+
+
+def _capability_with_path_context_item(row) -> dict:
+    item = _capability_context_item(row)
+    item["path"] = row["path"]
+    return item
 
 
 def _business_flow_trace_item(entrypoint, edges: list) -> dict:

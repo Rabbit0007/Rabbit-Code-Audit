@@ -708,6 +708,18 @@ def get_source_index_quality(project_id: str, snapshot_id: str) -> SourceIndexQu
             """,
             (snapshot_id,),
         ).fetchall()
+        capability_paths = {
+            row["path"]
+            for row in conn.execute(
+                """
+                SELECT DISTINCT path
+                FROM code_capabilities
+                WHERE snapshot_id = ?
+                """,
+                (snapshot_id,),
+            ).fetchall()
+            if row["path"]
+        }
         candidate_rows = conn.execute(
             """
             SELECT candidate_type, severity, status, title, description,
@@ -733,9 +745,34 @@ def get_source_index_quality(project_id: str, snapshot_id: str) -> SourceIndexQu
             """,
             (snapshot_id, snapshot_id),
         ).fetchone()
+        business_module_stats = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS module_count,
+                SUM(
+                    CASE
+                        WHEN NOT EXISTS (
+                            SELECT 1
+                            FROM business_edges e
+                            WHERE e.project_id = n.project_id
+                              AND e.from_node_id = n.id
+                              AND e.relation = 'contains'
+                        )
+                        THEN 1 ELSE 0
+                    END
+                ) AS island_count
+            FROM business_nodes n
+            WHERE n.source_snapshot_id = ?
+              AND n.node_type = 'feature'
+              AND n.title LIKE '业务模块 %'
+            """,
+            (snapshot_id,),
+        ).fetchone()
 
     data_object_count = symbol_kind_counts.get("data_object", 0)
     entrypoints_with_data_paths = _entrypoints_with_data_paths(entrypoints, relationships, data_objects)
+    entrypoints_with_business_flows = _entrypoints_with_business_flows(entrypoints, relationships)
+    entrypoints_with_capability_paths = _entrypoints_with_reachable_paths(entrypoints, relationships, capability_paths)
     candidate_count = len(candidate_rows)
     high_impact_candidate_count = sum(
         1
@@ -759,6 +796,8 @@ def get_source_index_quality(project_id: str, snapshot_id: str) -> SourceIndexQu
     candidate_density = round(candidate_count / max(1, code_file_count), 3)
     business_graph_node_count = int((business_graph_size or {})["nodes"] or 0)
     business_graph_edge_count = int((business_graph_size or {})["edges"] or 0)
+    business_module_count = int((business_module_stats or {})["module_count"] or 0)
+    business_module_island_count = int((business_module_stats or {})["island_count"] or 0)
     issues: list[SourceIndexQualityIssue] = []
     recommendations: list[str] = []
     score = 100
@@ -831,6 +870,36 @@ def get_source_index_quality(project_id: str, snapshot_id: str) -> SourceIndexQu
                 12,
                 "增强 endpoint -> controller/service -> model/DAO 的调用链解析。",
             )
+    if summary.entrypoint_count and entrypoints_with_business_flows / max(1, summary.entrypoint_count) < 0.35:
+        add_issue(
+            "warning",
+            "weak_entrypoint_business_flows",
+            "入口业务流偏弱",
+            "多数入口没有跨处理逻辑、服务或数据对象的可达链路，模型仍需要从入口文件手动追踪业务。",
+            summary.entrypoint_count - entrypoints_with_business_flows,
+            10,
+            "优先补强 import 作用域、对象方法调用、依赖注入和框架 handler 解析。",
+        )
+    if business_module_count == 0 and summary.entrypoint_count > 0:
+        add_issue(
+            "warning",
+            "no_business_modules",
+            "未形成业务模块",
+            "入口存在但业务图没有模块聚合，模型难以先按业务域理解大项目。",
+            0,
+            8,
+            "按路径、路由前缀和语义能力生成模块聚合节点，并为入口、处理逻辑、数据对象建立 contains 关系。",
+        )
+    elif business_module_island_count > max(2, business_module_count // 3):
+        add_issue(
+            "warning",
+            "business_module_islands",
+            "孤立业务模块较多",
+            "部分业务模块没有包含入口、处理逻辑或数据对象，说明模块聚合边不足。",
+            business_module_island_count,
+            6,
+            "检查模块 key 归纳和 contains 边生成逻辑，减少只有标题但没有业务事实的模块。",
+        )
     if low_confidence["relationships"] > max(5, summary.relationship_count // 4):
         add_issue(
             "warning",
@@ -917,6 +986,10 @@ def get_source_index_quality(project_id: str, snapshot_id: str) -> SourceIndexQu
         candidate_density_per_code_file=candidate_density,
         business_graph_node_count=business_graph_node_count,
         business_graph_edge_count=business_graph_edge_count,
+        business_module_count=business_module_count,
+        business_module_island_count=business_module_island_count,
+        entrypoints_with_business_flows=entrypoints_with_business_flows,
+        entrypoints_with_capability_paths=entrypoints_with_capability_paths,
         issues=issues,
         recommendations=list(dict.fromkeys(recommendations)),
     )
@@ -1122,7 +1195,7 @@ def _entrypoints_with_data_paths(entrypoints, relationships, data_objects) -> in
 
     adjacency: dict[tuple[str, str | None], set[tuple[str, str | None]]] = {}
     for row in relationships:
-        if row["relation"] not in {"calls", "imports", "uses"}:
+        if row["relation"] not in {"calls", "imports", "uses", "implemented_by", "extended_by"}:
             continue
         start = (row["from_path"], row["from_symbol"])
         adjacency.setdefault(start, set()).add((row["to_path"], row["to_symbol"]))
@@ -1140,6 +1213,62 @@ def _entrypoints_with_data_paths(entrypoints, relationships, data_objects) -> in
         if any(_has_reachable_data_object(start, adjacency, data_targets) for start in starts):
             linked += 1
     return linked
+
+
+def _entrypoints_with_business_flows(entrypoints, relationships) -> int:
+    target_paths = {
+        row["to_path"]
+        for row in relationships
+        if row["relation"] in {"calls", "imports", "uses"}
+        and row["to_path"]
+        and row["to_path"] != row["from_path"]
+    }
+    return _entrypoints_with_reachable_paths(entrypoints, relationships, target_paths)
+
+
+def _entrypoints_with_reachable_paths(entrypoints, relationships, target_paths: set[str]) -> int:
+    if not entrypoints or not target_paths:
+        return 0
+    adjacency: dict[str, set[str]] = {}
+    for row in relationships:
+        if row["relation"] not in {"calls", "imports", "uses", "implemented_by", "extended_by"}:
+            continue
+        from_path = row["from_path"]
+        to_path = row["to_path"]
+        if not from_path or not to_path:
+            continue
+        adjacency.setdefault(from_path, set()).add(to_path)
+
+    linked = 0
+    for entrypoint in entrypoints:
+        if _path_reaches_any(entrypoint["path"], adjacency, target_paths):
+            linked += 1
+    return linked
+
+
+def _path_reaches_any(
+    start_path: str,
+    adjacency: dict[str, set[str]],
+    target_paths: set[str],
+    *,
+    max_depth: int = 4,
+) -> bool:
+    if start_path in target_paths:
+        return True
+    seen = {start_path}
+    frontier = [(start_path, 0)]
+    while frontier:
+        path, depth = frontier.pop(0)
+        if depth >= max_depth:
+            continue
+        for next_path in sorted(adjacency.get(path, set())):
+            if next_path in target_paths:
+                return True
+            if next_path in seen:
+                continue
+            seen.add(next_path)
+            frontier.append((next_path, depth + 1))
+    return False
 
 
 def _has_reachable_data_object(
@@ -2128,7 +2257,7 @@ def _entrypoint_labels_by_target_path(code_index) -> dict[str, list[str]]:
         if label not in labels_by_path[entrypoint.path]:
             labels_by_path[entrypoint.path].append(label)
     for relationship in code_index.relationships:
-        if relationship.relation not in {"calls", "imports", "uses"}:
+        if relationship.relation not in {"calls", "imports", "uses", "implemented_by", "extended_by"}:
             continue
         adjacency.setdefault(relationship.from_path, set()).add(relationship.to_path)
     for entrypoint in code_index.entrypoints:
@@ -2685,6 +2814,14 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
             source_id = endpoint_by_label.get(relationship["from_symbol"]) or control_by_ref.get(
                 (relationship["from_path"], relationship["from_symbol"])
             )
+            if source_id is None and relationship["relation"] in {"implements", "extends", "implemented_by", "extended_by"}:
+                source_id = ensure_control(
+                    relationship["from_path"],
+                    relationship["from_symbol"],
+                    relationship["evidence"],
+                    relationship["line_start"],
+                    float(relationship["confidence"] or 0.55),
+                )
         if source_id is None and source_nodes:
             source_id = source_nodes[0]
         if source_id is None:
@@ -2705,7 +2842,7 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
                 now=now,
             )
             continue
-        if relationship["relation"] in {"imports", "calls"}:
+        if relationship["relation"] in {"imports", "calls", "implemented_by", "extended_by"}:
             for data_id in data_by_path.get(relationship["to_path"], []):
                 _insert_business_edge_seed(
                     conn,
@@ -2718,7 +2855,7 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
                     created_by="source_index",
                     now=now,
                 )
-        if relationship["relation"] == "calls" and relationship["to_symbol"]:
+        if relationship["relation"] in {"calls", "implements", "extends", "implemented_by", "extended_by"} and relationship["to_symbol"]:
             target_control_id = ensure_control(
                 relationship["to_path"],
                 relationship["to_symbol"],
@@ -2732,8 +2869,8 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
                     project_id,
                     from_node_id=source_id,
                     to_node_id=target_control_id,
-                    relation="calls",
-                    description="源码索引识别到处理逻辑之间的调用关系。",
+                    relation=relationship["relation"],
+                    description=_business_relationship_description(relationship["relation"]),
                     confidence=min(0.68, max(0.35, float(relationship["confidence"] or 0.55))),
                     created_by="source_index",
                     now=now,
@@ -2958,6 +3095,20 @@ def _semantic_capability_edge_description(category: str) -> str:
     if category == "external_system":
         return "处理逻辑依赖外部系统或基础设施接口。"
     return "处理逻辑关联到源码索引识别的业务语义能力。"
+
+
+def _business_relationship_description(relation: str) -> str:
+    if relation == "calls":
+        return "源码索引识别到处理逻辑之间的调用关系。"
+    if relation == "implements":
+        return "源码类型层次显示该处理逻辑实现接口或契约。"
+    if relation == "implemented_by":
+        return "源码类型层次显示该接口或契约由目标处理逻辑实现。"
+    if relation == "extends":
+        return "源码类型层次显示该处理逻辑继承父类或基类。"
+    if relation == "extended_by":
+        return "源码类型层次显示该父类或基类被目标处理逻辑继承。"
+    return "源码索引识别到处理逻辑之间的结构关系。"
 
 
 def _insert_business_node_seed(

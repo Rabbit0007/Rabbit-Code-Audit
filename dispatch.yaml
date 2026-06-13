@@ -84,7 +84,7 @@ workers:
     PI_BASE_URL: https://vsllm.com/v1
     PI_API_KEY: sk-qcTmy1lhc0MkEBKcjkuFJLo7Mo7pK0Fs9S3Axl4QZvSZ1Y6G
     PI_PROVIDER_API: openai-completions
-- name: claude-sonnet-4-6-1
+- name: xplt-deepseek-v4-pro-1
   type: pi
   enabled: false
   task_types:
@@ -93,6 +93,48 @@ workers:
   - explore
   max_running: 1
   priority: 3
+  env:
+    PI_MODEL: ByteDance-volcengine/DeepSeek-V4-Pro
+    PI_BASE_URL: https://xplt.sdu.edu.cn:4000/v1
+    PI_API_KEY: sk-6p8fnM1HRV_im8LI2F1v5A
+    PI_PROVIDER_API: openai-completions
+- name: xplt-deepseek-v4-pro-2
+  type: pi
+  enabled: false
+  task_types:
+  - bootstrap
+  - reason
+  - explore
+  max_running: 1
+  priority: 4
+  env:
+    PI_MODEL: ByteDance-volcengine/DeepSeek-V4-Pro
+    PI_BASE_URL: https://xplt.sdu.edu.cn:4000/v1
+    PI_API_KEY: sk-6p8fnM1HRV_im8LI2F1v5A
+    PI_PROVIDER_API: openai-completions
+- name: xplt-deepseek-v4-pro-3
+  type: pi
+  enabled: false
+  task_types:
+  - bootstrap
+  - reason
+  - explore
+  max_running: 1
+  priority: 5
+  env:
+    PI_MODEL: ByteDance-volcengine/DeepSeek-V4-Pro
+    PI_BASE_URL: https://xplt.sdu.edu.cn:4000/v1
+    PI_API_KEY: sk-6p8fnM1HRV_im8LI2F1v5A
+    PI_PROVIDER_API: openai-completions
+- name: claude-sonnet-4-6-1
+  type: pi
+  enabled: false
+  task_types:
+  - bootstrap
+  - reason
+  - explore
+  max_running: 1
+  priority: 6
   env:
     PI_MODEL: claude-sonnet-4-6
     PI_BASE_URL: https://vsllm.com/v1
@@ -106,7 +148,7 @@ workers:
   - reason
   - explore
   max_running: 1
-  priority: 4
+  priority: 7
   env:
     PI_MODEL: claude-sonnet-4-6
     PI_BASE_URL: https://vsllm.com/v1
@@ -120,7 +162,7 @@ workers:
   - reason
   - explore
   max_running: 1
-  priority: 5
+  priority: 8
   env:
     PI_MODEL: claude-sonnet-4-6
     PI_BASE_URL: https://vsllm.com/v1
@@ -134,7 +176,7 @@ workers:
   - reason
   - explore
   max_running: 1
-  priority: 6
+  priority: 9
   env:
     PI_MODEL: deepseek-v4-pro
     PI_BASE_URL: https://api.deepseek.com
@@ -148,7 +190,7 @@ workers:
   - reason
   - explore
   max_running: 1
-  priority: 7
+  priority: 10
   env:
     PI_MODEL: deepseek-v4-pro
     PI_BASE_URL: https://api.deepseek.com
@@ -162,7 +204,7 @@ workers:
   - reason
   - explore
   max_running: 1
-  priority: 8
+  priority: 11
   env:
     PI_MODEL: deepseek-v4-pro
     PI_BASE_URL: https://api.deepseek.com
@@ -175,7 +217,7 @@ workers:
   - reason
   - explore
   max_running: 1
-  priority: 9
+  priority: 12
   env:
     PI_MODEL: glm-5
     PI_BASE_URL: http://10.2.8.77:3000/v1
@@ -188,7 +230,7 @@ workers:
   - reason
   - explore
   max_running: 1
-  priority: 10
+  priority: 13
   env:
     PI_MODEL: glm-5
     PI_BASE_URL: http://10.2.8.77:3000/v1
@@ -201,7 +243,7 @@ workers:
   - reason
   - explore
   max_running: 1
-  priority: 11
+  priority: 14
   env:
     PI_MODEL: glm-5
     PI_BASE_URL: http://10.2.8.77:3000/v1
@@ -213,7 +255,7 @@ workers:
   task_types:
   - report_enrichment
   max_running: 1
-  priority: 12
+  priority: 15
   env:
     PI_MODEL: deepseek-v4-pro
     PI_BASE_URL: https://api.deepseek.com
@@ -225,7 +267,7 @@ workers:
   task_types:
   - report_enrichment
   max_running: 1
-  priority: 13
+  priority: 16
   env:
     PI_MODEL: gpt-5.5
     PI_BASE_URL: https://vsllm.com/v1
@@ -237,7 +279,7 @@ workers:
   task_types:
   - review
   max_running: 1
-  priority: 14
+  priority: 17
   env:
     PI_MODEL: gpt-5.5
     PI_BASE_URL: https://vsllm.com/v1

@@ -273,7 +273,15 @@ SYMBOL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("class", re.compile(r"^\s*(?:pub\s+)?(?:struct|enum)\s+([A-Za-z_][\w]*)\b", re.MULTILINE)),
     ("function", re.compile(r"^\s*def\s+([A-Za-z_][\w!?=]*)\b", re.MULTILINE)),
     ("class", re.compile(r"^\s*(?:class|module)\s+([A-Za-z_][\w:]*)(?:\s|$)", re.MULTILINE)),
-    ("function", re.compile(r"^\s*(?:public|private|protected|static|final|async|\s)+[A-Za-z_<>\[\], ?]+\s+([A-Za-z_][\w]*)\s*\(", re.MULTILINE)),
+    (
+        "function",
+        re.compile(
+            r"^\s*(?!return\b|throw\b|new\b|if\b|for\b|while\b|switch\b|catch\b)"
+            r"(?:(?:public|private|protected|static|final|abstract|synchronized|async)\s+)*"
+            r"[A-Za-z_][\w_<>\[\], ?]*\s+([A-Za-z_][\w]*)\s*\(",
+            re.MULTILINE,
+        ),
+    ),
 )
 
 
@@ -381,7 +389,7 @@ def _data_object_symbols(snapshot_id: str, file: CodeFile, text: str) -> list[Co
         block = text[match.start() : match.start() + 800]
         if "gorm." in block or "`json:" in block or "`db:" in block:
             add(match.group(1), match.start(), _line_at(text, _line_no(text, match.start())), 0.64, "heuristic:model")
-    for match in re.finditer(r"\bclass\s+([A-Za-z_][\w]*(?:Model|Entity|Record|Repository))\b", text):
+    for match in re.finditer(r"\bclass\s+([A-Za-z_][\w]*(?:Model|Entity|Record))\b", text):
         add(match.group(1), match.start(), _line_at(text, _line_no(text, match.start())), 0.62, "heuristic:model")
     return symbols
 
@@ -462,6 +470,7 @@ def _python_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[Cod
         elif line.strip() and not line.lstrip().startswith("@") and pending:
             pending = []
     records.extend(_python_django_entrypoints(snapshot_id, file, text))
+    records.extend(_python_drf_entrypoints(snapshot_id, file, text))
     return records
 
 
@@ -518,6 +527,8 @@ def _python_django_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> l
         call, route, handler = match.group(1), match.group(2), match.group(3)
         if handler.strip().startswith("include("):
             continue
+        if ".as_view" in handler and "{" in handler:
+            continue
         if call == "re_path":
             route = route.strip("^").rstrip("$")
         route = _join_routes(None, route)
@@ -536,6 +547,139 @@ def _python_django_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> l
             )
         )
     return records
+
+
+DRF_STANDARD_ACTIONS: tuple[tuple[str, str, str], ...] = (
+    ("GET", "", "list"),
+    ("POST", "", "create"),
+    ("GET", "{pk}", "retrieve"),
+    ("PUT", "{pk}", "update"),
+    ("PATCH", "{pk}", "partial_update"),
+    ("DELETE", "{pk}", "destroy"),
+)
+
+
+def _python_drf_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
+    records: list[CodeEntrypointRecord] = []
+    router_prefixes = _python_drf_router_prefixes(text)
+    action_routes = _python_drf_action_routes(text)
+
+    register_pattern = re.compile(
+        r"\b([A-Za-z_][\w]*)\.register\(\s*r?['\"]([^'\"]+)['\"]\s*,\s*([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?)",
+        re.MULTILINE,
+    )
+    for match in register_pattern.finditer(text):
+        router_name, route, viewset = match.group(1), match.group(2), match.group(3)
+        if not viewset.split(".")[-1].endswith("ViewSet"):
+            continue
+        base_route = _join_routes(router_prefixes.get(router_name), route)
+        line_start = _line_no(text, match.start())
+        evidence = _line_at(text, line_start).strip()
+        for method, suffix, action in DRF_STANDARD_ACTIONS:
+            records.append(
+                _entrypoint(
+                    snapshot_id,
+                    file,
+                    "http_route",
+                    "drf",
+                    method,
+                    _join_routes(base_route, suffix),
+                    f"{viewset}.{action}",
+                    line_start,
+                    evidence,
+                    0.62,
+                    "heuristic:drf_router",
+                )
+            )
+        for custom in action_routes.get(viewset.split(".")[-1], []):
+            detail, methods, url_path, action = custom
+            suffix = _join_routes("{pk}" if detail else "", url_path)
+            for method in methods:
+                records.append(
+                    _entrypoint(
+                        snapshot_id,
+                        file,
+                        "http_route",
+                        "drf",
+                        method,
+                        _join_routes(base_route, suffix),
+                        f"{viewset}.{action}",
+                        line_start,
+                        evidence,
+                        0.66,
+                        "heuristic:drf_router_action",
+                    )
+                )
+
+    as_view_pattern = re.compile(
+        r"\b(path|re_path)\(\s*r?['\"]([^'\"]+)['\"]\s*,\s*([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?)\.as_view\(\s*\{([^}]*)\}",
+        re.MULTILINE | re.DOTALL,
+    )
+    for match in as_view_pattern.finditer(text):
+        call, route, viewset, mapping = match.group(1), match.group(2), match.group(3), match.group(4)
+        if call == "re_path":
+            route = route.strip("^").rstrip("$")
+        line_start = _line_no(text, match.start())
+        evidence = _line_at(text, line_start).strip()
+        for method, action in _python_drf_action_map(mapping):
+            records.append(
+                _entrypoint(
+                    snapshot_id,
+                    file,
+                    "http_route",
+                    "drf",
+                    method,
+                    _join_routes(None, route),
+                    f"{viewset}.{action}",
+                    line_start,
+                    evidence,
+                    0.7,
+                    "heuristic:drf_as_view",
+                )
+            )
+    return records
+
+
+def _python_drf_router_prefixes(text: str) -> dict[str, str]:
+    prefixes: dict[str, str] = {}
+    pattern = re.compile(
+        r"\b(?:path|re_path)\(\s*r?['\"]([^'\"]+)['\"]\s*,\s*include\(\s*([A-Za-z_][\w]*)\.urls",
+        re.MULTILINE,
+    )
+    for match in pattern.finditer(text):
+        route, router_name = match.group(1), match.group(2)
+        prefixes[router_name] = _join_routes(prefixes.get(router_name), route)
+    return prefixes
+
+
+def _python_drf_action_routes(text: str) -> dict[str, list[tuple[bool, list[str], str, str]]]:
+    result: dict[str, list[tuple[bool, list[str], str, str]]] = {}
+    class_pattern = re.compile(r"^\s*class\s+([A-Za-z_][\w]*)\s*\([^)]*(?:ViewSet|GenericViewSet|ModelViewSet)[^)]*\)\s*:", re.MULTILINE)
+    for class_match in class_pattern.finditer(text):
+        class_name = class_match.group(1)
+        class_start = class_match.end()
+        next_class = re.search(r"^\s*class\s+[A-Za-z_][\w]*\s*\(", text[class_start:], re.MULTILINE)
+        class_end = class_start + next_class.start() if next_class else len(text)
+        block = text[class_start:class_end]
+        action_pattern = re.compile(
+            r"@action\(([^)]*)\)\s*\n\s*def\s+([A-Za-z_][\w]*)\s*\(",
+            re.MULTILINE,
+        )
+        for action_match in action_pattern.finditer(block):
+            args = action_match.group(1)
+            method_name = action_match.group(2)
+            detail = _keyword_bool(args, "detail")
+            methods = _methods_from_args(args) or ["GET"]
+            url_path = _keyword_string(args, "url_path") or method_name.replace("_", "-")
+            result.setdefault(class_name, []).append((detail, methods, url_path, method_name))
+    return result
+
+
+def _python_drf_action_map(value: str) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for match in re.finditer(r"['\"]([A-Za-z]+)['\"]\s*:\s*['\"]([A-Za-z_][\w]*)['\"]", value):
+        items.append((match.group(1).upper(), match.group(2)))
+    return items
 
 
 def _js_entrypoints(
@@ -588,11 +732,66 @@ def _js_entrypoints(
                 _line_at(text, _line_no(text, match.start())).strip(),
             )
         )
-    decorators = re.compile(r"@(Get|Post|Put|Delete|Patch|Options|Head)\(\s*['\"]?([^'\")]+)?['\"]?\s*\)\s*\n\s*(?:async\s+)?([A-Za-z_$][\w$]*)\s*\(", re.IGNORECASE)
+    records.extend(_nestjs_entrypoints(snapshot_id, file, text))
+    return records
+
+
+def _nestjs_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
+    records: list[CodeEntrypointRecord] = []
+    class_pattern = re.compile(
+        r"@Controller\s*(?:\(([^)]*)\))?\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)[^{]*\{",
+        re.IGNORECASE,
+    )
+    for class_match in class_pattern.finditer(text):
+        open_brace = text.find("{", class_match.start(), class_match.end())
+        if open_brace < 0:
+            continue
+        close_brace = _find_matching_brace(text, open_brace)
+        if close_brace is None:
+            continue
+        prefix = _first_string(class_match.group(1) or "") or ""
+        block = text[open_brace + 1 : close_brace]
+        for item in _nestjs_method_entrypoints(snapshot_id, file, text, block, open_brace + 1, prefix):
+            records.append(item)
+
+    if not records:
+        for item in _nestjs_method_entrypoints(snapshot_id, file, text, text, 0, ""):
+            records.append(item)
+    return records
+
+
+def _nestjs_method_entrypoints(
+    snapshot_id: str,
+    file: CodeFile,
+    full_text: str,
+    text: str,
+    offset: int,
+    prefix: str,
+) -> list[CodeEntrypointRecord]:
+    records: list[CodeEntrypointRecord] = []
+    decorators = re.compile(
+        r"@(Get|Post|Put|Delete|Patch|Options|Head|All)\s*(?:\(([^)]*)\))?"
+        r"\s*(?:public|private|protected|async|static|\s)*([A-Za-z_$][\w$]*)\s*\(",
+        re.IGNORECASE,
+    )
     for match in decorators.finditer(text):
-        method = match.group(1).upper()
-        route = match.group(2) or "/"
-        records.append(_entrypoint(snapshot_id, file, "http_route", "nestjs", method, route, match.group(3), _line_no(text, match.start()), match.group(0).splitlines()[0].strip()))
+        raw_method = match.group(1).upper()
+        method = None if raw_method == "ALL" else raw_method
+        route = _join_routes(prefix, _first_string(match.group(2) or "") or "")
+        line_start = _line_no(full_text, offset + match.start())
+        records.append(
+            _entrypoint(
+                snapshot_id,
+                file,
+                "http_route",
+                "nestjs",
+                method,
+                route,
+                match.group(3),
+                line_start,
+                _line_at(full_text, line_start).strip(),
+            )
+        )
     return records
 
 
@@ -994,6 +1193,9 @@ def _extract_relationships(
         for name, items in symbols_by_name.items()
         if len({item.path for item in items}) == 1
     }
+    symbols_by_path: dict[str, list[CodeSymbolRecord]] = {}
+    for symbol in symbols:
+        symbols_by_path.setdefault(symbol.path, []).append(symbol)
     entrypoints_by_path: dict[str, list[CodeEntrypointRecord]] = {}
     for entrypoint in entrypoints:
         entrypoints_by_path.setdefault(entrypoint.path, []).append(entrypoint)
@@ -1001,6 +1203,15 @@ def _extract_relationships(
     for symbol in symbols:
         if symbol.kind == "data_object":
             data_objects_by_path.setdefault(symbol.path, []).append(symbol)
+    data_objects_by_name: dict[str, list[CodeSymbolRecord]] = {}
+    for symbol in symbols:
+        if symbol.kind == "data_object" and len(symbol.name) >= 3:
+            data_objects_by_name.setdefault(symbol.name, []).append(symbol)
+    unique_data_objects = {
+        name: items[0]
+        for name, items in data_objects_by_name.items()
+        if len({item.path for item in items}) == 1
+    }
 
     for file, text in readable:
         relationships.extend(
@@ -1012,10 +1223,44 @@ def _extract_relationships(
                 paths,
                 module_map,
                 symbols_by_name,
+                symbols_by_path,
             )
         )
         relationships.extend(_import_relationships(snapshot_id, file, text, paths, module_map, unique_symbols))
         relationships.extend(_call_relationships(snapshot_id, file, text, unique_symbols))
+        relationships.extend(_data_object_reference_relationships(snapshot_id, file, text, unique_data_objects))
+        relationships.extend(
+            _scoped_call_relationships(
+                snapshot_id,
+                file,
+                text,
+                paths,
+                module_map,
+                symbols_by_path,
+            )
+        )
+        relationships.extend(
+            _object_method_call_relationships(
+                snapshot_id,
+                file,
+                text,
+                paths,
+                module_map,
+                symbols_by_name,
+                symbols_by_path,
+            )
+        )
+        relationships.extend(
+            _inheritance_relationships(
+                snapshot_id,
+                file,
+                text,
+                paths,
+                module_map,
+                symbols_by_name,
+                symbols_by_path,
+            )
+        )
         relationships.extend(_data_object_use_relationships(snapshot_id, file, data_objects_by_path.get(file.path, [])))
     return relationships
 
@@ -1028,9 +1273,11 @@ def _entrypoint_handler_relationships(
     paths: set[str],
     module_map: dict[str, str],
     symbols_by_name: dict[str, list[CodeSymbolRecord]],
+    symbols_by_path: dict[str, list[CodeSymbolRecord]],
 ) -> list[CodeRelationshipRecord]:
     relationships: list[CodeRelationshipRecord] = []
     import_aliases = _python_import_aliases(file.path, text, paths, module_map) if file.language == "Python" else {}
+    symbol_aliases = _import_symbol_aliases(file, text, paths, module_map, symbols_by_path)
     for entrypoint in entrypoints:
         if not entrypoint.handler:
             continue
@@ -1061,6 +1308,24 @@ def _entrypoint_handler_relationships(
                     evidence=entrypoint.evidence,
                     confidence=min(0.9, max(0.58, entrypoint.confidence)),
                     source="heuristic:django_handler",
+                    line_start=entrypoint.line_start,
+                )
+            )
+            continue
+        resolved = _resolve_framework_handler_target(handler_text, symbol_aliases, symbols_by_name)
+        if resolved is not None:
+            target_path, target_symbol = resolved
+            relationships.append(
+                _relationship(
+                    snapshot_id,
+                    from_path=entrypoint.path,
+                    from_symbol=_entrypoint_label(entrypoint.method, entrypoint.route),
+                    to_path=target_path,
+                    to_symbol=target_symbol,
+                    relation="calls",
+                    evidence=entrypoint.evidence,
+                    confidence=min(0.86, max(0.52, entrypoint.confidence)),
+                    source="heuristic:framework_handler",
                     line_start=entrypoint.line_start,
                 )
             )
@@ -1163,6 +1428,50 @@ def _resolve_python_handler_target(
         if scope_path is None:
             scope_path = _resolve_module_import(current_path, ".".join(parts[:-1]), paths, module_map)
     return _find_symbol_target(symbol_name, scope_path, symbols_by_name)
+
+
+def _resolve_framework_handler_target(
+    handler_text: str,
+    symbol_aliases: dict[str, tuple[str, str | None, str | None]],
+    symbols_by_name: dict[str, list[CodeSymbolRecord]],
+) -> tuple[str, str] | None:
+    text = handler_text.strip().strip("[]")
+    if not text:
+        return None
+    class_method = re.search(
+        r"([A-Za-z_$][\w$]*(?:\\[A-Za-z_$][\w$]*)*)\s*@\s*([A-Za-z_$][\w$]*)",
+        text,
+    )
+    if class_method:
+        class_name = class_method.group(1).rsplit("\\", 1)[-1]
+        method_name = class_method.group(2)
+        alias_target = symbol_aliases.get(class_name)
+        scope_path = alias_target[0] if alias_target else None
+        method_target = _find_symbol_target(method_name, scope_path, symbols_by_name)
+        if method_target is not None:
+            return method_target
+        class_target = _find_symbol_target(class_name, scope_path, symbols_by_name)
+        if class_target is not None:
+            return class_target
+
+    dotted = re.search(r"([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)$", text)
+    if dotted:
+        parts = dotted.group(1).split(".")
+        alias_target = symbol_aliases.get(parts[0])
+        if alias_target is not None:
+            target = _find_symbol_target(parts[-1], alias_target[0], symbols_by_name)
+            if target is not None:
+                return target
+            return alias_target[0], alias_target[1] or parts[-1]
+
+    simple = re.search(r"([A-Za-z_$][\w$]*)$", text)
+    if simple:
+        name = simple.group(1)
+        alias_target = symbol_aliases.get(name)
+        if alias_target is not None:
+            return alias_target[0], alias_target[1] or name
+        return _find_symbol_target(name, None, symbols_by_name)
+    return None
 
 
 def _python_handler_reference(handler_text: str) -> str | None:
@@ -1319,6 +1628,542 @@ def _call_relationships(
         )
         per_file_count += 1
     return relationships
+
+
+def _data_object_reference_relationships(
+    snapshot_id: str,
+    file: CodeFile,
+    text: str,
+    unique_data_objects: dict[str, CodeSymbolRecord],
+) -> list[CodeRelationshipRecord]:
+    if file.language not in CALL_RELATIONSHIP_LANGUAGES or _is_generated_relationship_path(file.path):
+        return []
+    relationships: list[CodeRelationshipRecord] = []
+    emitted = 0
+    for name, target in sorted(unique_data_objects.items()):
+        if emitted >= 60:
+            break
+        if target.path == file.path or name.lower() in SYMBOL_RESERVED_NAMES:
+            continue
+        pattern = re.compile(rf"\b{re.escape(name)}\b")
+        for match in pattern.finditer(text):
+            line_start = _line_no(text, match.start())
+            line = _line_at(text, line_start).strip()
+            if not line or _looks_like_language_import_line(line):
+                continue
+            if _looks_like_symbol_declaration(line, name):
+                continue
+            relationships.append(
+                _relationship(
+                    snapshot_id,
+                    from_path=file.path,
+                    from_symbol=None,
+                    to_path=target.path,
+                    to_symbol=target.name,
+                    relation="uses",
+                    evidence=line,
+                    confidence=0.62,
+                    source="heuristic:data_object_reference",
+                    line_start=line_start,
+                )
+            )
+            emitted += 1
+            break
+    return relationships
+
+
+def _scoped_call_relationships(
+    snapshot_id: str,
+    file: CodeFile,
+    text: str,
+    paths: set[str],
+    module_map: dict[str, str],
+    symbols_by_path: dict[str, list[CodeSymbolRecord]],
+) -> list[CodeRelationshipRecord]:
+    if file.language not in CALL_RELATIONSHIP_LANGUAGES or _is_generated_relationship_path(file.path):
+        return []
+    aliases = _import_symbol_aliases(file, text, paths, module_map, symbols_by_path)
+    if not aliases:
+        return []
+    relationships: list[CodeRelationshipRecord] = []
+    emitted = 0
+    direct_call_pattern = re.compile(r"\b([A-Za-z_$][\w$]*)\s*\(")
+    member_call_pattern = re.compile(r"\b([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*\(")
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if emitted >= 80:
+            break
+        stripped = line.strip()
+        if not stripped or _looks_like_import_or_declaration(stripped):
+            continue
+        for match in member_call_pattern.finditer(stripped):
+            if emitted >= 80:
+                break
+            alias, member = match.group(1), match.group(2)
+            target = aliases.get(alias)
+            if target is None:
+                continue
+            target_path, target_symbol, container = target
+            resolved = _member_target_in_path(target_path, member, symbols_by_path, container=container)
+            if resolved is None:
+                resolved = (target_path, target_symbol or member)
+            if resolved[0] == file.path:
+                continue
+            relationships.append(
+                _relationship(
+                    snapshot_id,
+                    from_path=file.path,
+                    from_symbol=None,
+                    to_path=resolved[0],
+                    to_symbol=resolved[1],
+                    relation="calls",
+                    evidence=stripped,
+                    confidence=0.72,
+                    source="heuristic:scoped_member_call",
+                    line_start=lineno,
+                )
+            )
+            emitted += 1
+        for match in direct_call_pattern.finditer(stripped):
+            if emitted >= 80:
+                break
+            alias = match.group(1)
+            if alias in SYMBOL_RESERVED_NAMES:
+                continue
+            target = aliases.get(alias)
+            if target is None:
+                continue
+            target_path, target_symbol, _container = target
+            if target_path == file.path:
+                continue
+            relationships.append(
+                _relationship(
+                    snapshot_id,
+                    from_path=file.path,
+                    from_symbol=None,
+                    to_path=target_path,
+                    to_symbol=target_symbol or alias,
+                    relation="calls",
+                    evidence=stripped,
+                    confidence=0.74,
+                    source="heuristic:scoped_symbol_call",
+                    line_start=lineno,
+                )
+            )
+            emitted += 1
+    return relationships
+
+
+def _object_method_call_relationships(
+    snapshot_id: str,
+    file: CodeFile,
+    text: str,
+    paths: set[str],
+    module_map: dict[str, str],
+    symbols_by_name: dict[str, list[CodeSymbolRecord]],
+    symbols_by_path: dict[str, list[CodeSymbolRecord]],
+) -> list[CodeRelationshipRecord]:
+    if file.language not in CALL_RELATIONSHIP_LANGUAGES or _is_generated_relationship_path(file.path):
+        return []
+    variables = _object_variable_types(text)
+    if not variables:
+        return []
+    aliases = _import_symbol_aliases(file, text, paths, module_map, symbols_by_path)
+    relationships: list[CodeRelationshipRecord] = []
+    emitted = 0
+    method_call_pattern = re.compile(r"\b([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*\(")
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if emitted >= 80:
+            break
+        stripped = line.strip()
+        if not stripped or _looks_like_import_or_declaration(stripped):
+            continue
+        for match in method_call_pattern.finditer(stripped):
+            variable, method_name = match.group(1), match.group(2)
+            class_name = variables.get(variable)
+            if not class_name:
+                continue
+            alias_target = aliases.get(class_name)
+            if alias_target is not None:
+                target_path, target_symbol, _container = alias_target
+                target_class = (target_path, target_symbol or class_name)
+            else:
+                target_class = _find_symbol_target(class_name, None, symbols_by_name)
+            if target_class is None or target_class[0] == file.path:
+                continue
+            target_path, target_symbol = target_class
+            resolved = _member_target_in_path(target_path, method_name, symbols_by_path, container=target_symbol)
+            if resolved is None:
+                resolved = _member_target_in_path(target_path, method_name, symbols_by_path)
+            if resolved is None:
+                resolved = (target_path, target_symbol)
+            relationships.append(
+                _relationship(
+                    snapshot_id,
+                    from_path=file.path,
+                    from_symbol=None,
+                    to_path=resolved[0],
+                    to_symbol=resolved[1],
+                    relation="calls",
+                    evidence=stripped,
+                    confidence=0.7,
+                    source="heuristic:object_method_call",
+                    line_start=lineno,
+                )
+            )
+            emitted += 1
+            if emitted >= 80:
+                break
+    return relationships
+
+
+def _import_symbol_aliases(
+    file: CodeFile,
+    text: str,
+    paths: set[str],
+    module_map: dict[str, str],
+    symbols_by_path: dict[str, list[CodeSymbolRecord]],
+) -> dict[str, tuple[str, str | None, str | None]]:
+    if file.language == "Python":
+        return _python_import_symbol_aliases(file.path, text, paths, module_map, symbols_by_path)
+    if file.language in {"JavaScript", "TypeScript", "Vue"}:
+        return _js_import_symbol_aliases(file.path, text, paths, symbols_by_path)
+    if file.language == "PHP":
+        return _php_import_symbol_aliases(file.path, text, symbols_by_path)
+    if file.language in {"Java", "Kotlin", "Scala", "C#"}:
+        return _typed_import_symbol_aliases(file.path, text, symbols_by_path)
+    return {}
+
+
+def _python_import_symbol_aliases(
+    current_path: str,
+    text: str,
+    paths: set[str],
+    module_map: dict[str, str],
+    symbols_by_path: dict[str, list[CodeSymbolRecord]],
+) -> dict[str, tuple[str, str | None, str | None]]:
+    aliases: dict[str, tuple[str, str | None, str | None]] = {}
+    from_pattern = re.compile(
+        r"^\s*from\s+([.\w]+)\s+import\s+([A-Za-z_][\w]*(?:\s+as\s+[A-Za-z_][\w]*)?(?:\s*,\s*[A-Za-z_][\w]*(?:\s+as\s+[A-Za-z_][\w]*)?)*)",
+        re.MULTILINE,
+    )
+    for match in from_pattern.finditer(text):
+        module = match.group(1)
+        module_path = _resolve_module_import(current_path, module, paths, module_map)
+        for imported_name, alias in _python_import_items(match.group(2)):
+            target_path = None
+            if module_path:
+                target_path = _resolve_imported_child(module_path, imported_name, paths) or module_path
+            if target_path is None:
+                target_path = _resolve_module_import(current_path, f"{module}.{imported_name}", paths, module_map)
+            if target_path is None:
+                continue
+            target_symbol = _symbol_name_in_path(imported_name, target_path, symbols_by_path)
+            aliases[alias or imported_name] = (target_path, target_symbol or imported_name, target_symbol or imported_name)
+    import_pattern = re.compile(r"^\s*import\s+([A-Za-z_][\w.]*)((?:\s+as\s+)([A-Za-z_][\w]*))?", re.MULTILINE)
+    for match in import_pattern.finditer(text):
+        module = match.group(1)
+        target_path = _resolve_module_import(current_path, module, paths, module_map)
+        if not target_path:
+            continue
+        alias = match.group(3) or module.split(".")[-1]
+        aliases[alias] = (target_path, None, None)
+    return aliases
+
+
+def _js_import_symbol_aliases(
+    current_path: str,
+    text: str,
+    paths: set[str],
+    symbols_by_path: dict[str, list[CodeSymbolRecord]],
+) -> dict[str, tuple[str, str | None, str | None]]:
+    aliases: dict[str, tuple[str, str | None, str | None]] = {}
+    named_import = re.compile(r"\bimport\s+\{([^}]+)\}\s+from\s+['\"]([^'\"]+)['\"]")
+    for match in named_import.finditer(text):
+        target_path = _resolve_relative_path(current_path, match.group(2), paths)
+        if not target_path:
+            continue
+        for imported_name, alias in _js_import_items(match.group(1)):
+            symbol = _symbol_name_in_path(imported_name, target_path, symbols_by_path) or imported_name
+            aliases[alias or imported_name] = (target_path, symbol, symbol)
+    default_import = re.compile(r"\bimport\s+([A-Za-z_$][\w$]*)\s+from\s+['\"]([^'\"]+)['\"]")
+    for match in default_import.finditer(text):
+        target_path = _resolve_relative_path(current_path, match.group(2), paths)
+        if not target_path:
+            continue
+        alias = match.group(1)
+        symbol = _symbol_name_in_path(alias, target_path, symbols_by_path)
+        aliases[alias] = (target_path, symbol or alias, symbol or alias)
+    namespace_import = re.compile(r"\bimport\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+['\"]([^'\"]+)['\"]")
+    for match in namespace_import.finditer(text):
+        target_path = _resolve_relative_path(current_path, match.group(2), paths)
+        if target_path:
+            aliases[match.group(1)] = (target_path, None, None)
+    require_object = re.compile(r"\b(?:const|let|var)\s+\{([^}]+)\}\s*=\s*require\(\s*['\"]([^'\"]+)['\"]\s*\)")
+    for match in require_object.finditer(text):
+        target_path = _resolve_relative_path(current_path, match.group(2), paths)
+        if not target_path:
+            continue
+        for imported_name, alias in _js_import_items(match.group(1)):
+            symbol = _symbol_name_in_path(imported_name, target_path, symbols_by_path) or imported_name
+            aliases[alias or imported_name] = (target_path, symbol, symbol)
+    require_module = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*['\"]([^'\"]+)['\"]\s*\)")
+    for match in require_module.finditer(text):
+        target_path = _resolve_relative_path(current_path, match.group(2), paths)
+        if target_path:
+            aliases[match.group(1)] = (target_path, None, None)
+    return aliases
+
+
+def _js_import_items(value: str) -> list[tuple[str, str | None]]:
+    items: list[tuple[str, str | None]] = []
+    for part in value.split(","):
+        text = part.strip()
+        if not text:
+            continue
+        text = text.replace(":", " as ")
+        match = re.fullmatch(r"([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?", text)
+        if match:
+            items.append((match.group(1), match.group(2)))
+    return items
+
+
+def _php_import_symbol_aliases(
+    current_path: str,
+    text: str,
+    symbols_by_path: dict[str, list[CodeSymbolRecord]],
+) -> dict[str, tuple[str, str | None, str | None]]:
+    aliases: dict[str, tuple[str, str | None, str | None]] = {}
+    for match in re.finditer(
+        r"^\s*use\s+([A-Za-z_][\w\\]*)(?:\s+as\s+([A-Za-z_][\w]*))?\s*;",
+        text,
+        re.MULTILINE,
+    ):
+        class_name = match.group(1).rsplit("\\", 1)[-1]
+        alias = match.group(2) or class_name
+        for path, symbols in symbols_by_path.items():
+            if path == current_path:
+                continue
+            symbol = next((item for item in symbols if item.name == class_name), None)
+            if symbol:
+                aliases[alias] = (symbol.path, symbol.name, symbol.name)
+                break
+    return aliases
+
+
+def _typed_import_symbol_aliases(
+    current_path: str,
+    text: str,
+    symbols_by_path: dict[str, list[CodeSymbolRecord]],
+) -> dict[str, tuple[str, str | None, str | None]]:
+    aliases: dict[str, tuple[str, str | None, str | None]] = {}
+    for match in re.finditer(r"^\s*(?:import|using)\s+(?:static\s+)?([A-Za-z_][\w.]*);?", text, re.MULTILINE):
+        name = match.group(1).split(".")[-1]
+        for path, symbols in symbols_by_path.items():
+            if path == current_path:
+                continue
+            symbol = next((item for item in symbols if item.name == name), None)
+            if symbol:
+                aliases[name] = (symbol.path, symbol.name, symbol.name)
+                break
+    return aliases
+
+
+def _object_variable_types(text: str) -> dict[str, str]:
+    variables: dict[str, str] = {}
+    patterns = (
+        re.compile(r"\b([A-Za-z_$][\w$]*)\s*=\s*(?:new\s+)?([A-Z][A-Za-z0-9_]*)\s*\("),
+        re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:new\s+)?([A-Z][A-Za-z0-9_]*)\s*\("),
+        re.compile(r"\b(?:private|protected|public|final|readonly|static|\s)*([A-Z][A-Za-z0-9_]*)\s+([a-z_][A-Za-z0-9_]*)\s*(?:[;=]|$)"),
+        re.compile(r"\b(?:private|protected|public|readonly|\s)*([a-z_][A-Za-z0-9_]*)\s*:\s*([A-Z][A-Za-z0-9_]*)"),
+        re.compile(r"\b([a-z_][A-Za-z0-9_]*)\s*:=\s*&?([A-Z][A-Za-z0-9_]*)\s*(?:\{|\()"),
+    )
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            first, second = match.group(1), match.group(2)
+            if first[:1].isupper() and not second[:1].isupper():
+                class_name, variable = first, second
+            else:
+                variable, class_name = first, second
+            if variable and class_name and variable not in SYMBOL_RESERVED_NAMES:
+                variables.setdefault(variable, class_name)
+    return variables
+
+
+def _member_target_in_path(
+    target_path: str,
+    member: str,
+    symbols_by_path: dict[str, list[CodeSymbolRecord]],
+    *,
+    container: str | None = None,
+) -> tuple[str, str] | None:
+    symbols = symbols_by_path.get(target_path, [])
+    if container:
+        scoped = [
+            symbol
+            for symbol in symbols
+            if symbol.name == member
+            and (symbol.container == container or (symbol.container or "").endswith(f".{container}"))
+        ]
+        if scoped:
+            return target_path, scoped[0].name
+    candidates = [
+        symbol
+        for symbol in symbols
+        if symbol.name == member and symbol.kind in {"function", "method", "class", "interface"}
+    ]
+    if candidates:
+        return target_path, candidates[0].name
+    return None
+
+
+def _symbol_name_in_path(
+    name: str,
+    target_path: str,
+    symbols_by_path: dict[str, list[CodeSymbolRecord]],
+) -> str | None:
+    for symbol in symbols_by_path.get(target_path, []):
+        if symbol.name == name and symbol.kind != "data_object":
+            return symbol.name
+    return None
+
+
+def _looks_like_import_or_declaration(line: str) -> bool:
+    if _looks_like_language_import_line(line):
+        return True
+    return bool(
+        re.match(r"^(?:class|interface|trait|enum|record|struct|func|function|def)\b", line)
+        or re.match(r"^package\s+", line)
+    )
+
+
+def _inheritance_relationships(
+    snapshot_id: str,
+    file: CodeFile,
+    text: str,
+    paths: set[str],
+    module_map: dict[str, str],
+    symbols_by_name: dict[str, list[CodeSymbolRecord]],
+    symbols_by_path: dict[str, list[CodeSymbolRecord]],
+) -> list[CodeRelationshipRecord]:
+    if file.language not in {"Python", "JavaScript", "TypeScript", "Vue", "PHP", "Java", "Kotlin", "Scala", "C#"}:
+        return []
+    aliases = _import_symbol_aliases(file, text, paths, module_map, symbols_by_path)
+    relationships: list[CodeRelationshipRecord] = []
+    for item in _declared_type_edges(file.language, text):
+        class_name, relation, target_name, line_start, evidence = item
+        target = _resolve_type_target(target_name, aliases, symbols_by_name)
+        if target is None or target[0] == file.path:
+            continue
+        target_path, target_symbol = target
+        relationships.append(
+            _relationship(
+                snapshot_id,
+                from_path=file.path,
+                from_symbol=class_name,
+                to_path=target_path,
+                to_symbol=target_symbol,
+                relation=relation,
+                evidence=evidence,
+                confidence=0.7,
+                source="heuristic:type_hierarchy",
+                line_start=line_start,
+            )
+        )
+        reverse_relation = "implemented_by" if relation == "implements" else "extended_by"
+        relationships.append(
+            _relationship(
+                snapshot_id,
+                from_path=target_path,
+                from_symbol=target_symbol,
+                to_path=file.path,
+                to_symbol=class_name,
+                relation=reverse_relation,
+                evidence=evidence,
+                confidence=0.68,
+                source="heuristic:type_hierarchy_reverse",
+                line_start=line_start,
+            )
+        )
+    return relationships
+
+
+def _declared_type_edges(language: str | None, text: str) -> list[tuple[str, str, str, int, str]]:
+    edges: list[tuple[str, str, str, int, str]] = []
+    if language == "Python":
+        pattern = re.compile(r"^\s*class\s+([A-Za-z_][\w]*)\s*\(([^)]*)\)\s*:", re.MULTILINE)
+        for match in pattern.finditer(text):
+            class_name = match.group(1)
+            evidence = match.group(0).strip()
+            for target_name in _type_names_from_list(match.group(2)):
+                edges.append((class_name, "extends", target_name, _line_no(text, match.start()), evidence))
+        return edges
+
+    if language in {"JavaScript", "TypeScript", "Vue", "PHP", "Java", "Kotlin", "Scala"}:
+        pattern = re.compile(
+            r"^\s*(?:export\s+)?(?:abstract\s+|final\s+|public\s+|private\s+|protected\s+|sealed\s+|open\s+|data\s+)*"
+            r"(?:class|record)\s+([A-Za-z_][\w]*)"
+            r"(?:\s+extends\s+([A-Za-z_][\w.$\\<>]*))?"
+            r"(?:\s+implements\s+([A-Za-z_][\w.$\\<>,\s]*))?",
+            re.MULTILINE,
+        )
+        for match in pattern.finditer(text):
+            class_name = match.group(1)
+            evidence = match.group(0).strip()
+            if match.group(2):
+                edges.append((class_name, "extends", _simple_type_name(match.group(2)), _line_no(text, match.start()), evidence))
+            for target_name in _type_names_from_list(match.group(3) or ""):
+                edges.append((class_name, "implements", target_name, _line_no(text, match.start()), evidence))
+        return edges
+
+    if language == "C#":
+        pattern = re.compile(
+            r"^\s*(?:public|private|protected|internal|sealed|abstract|partial|\s)*"
+            r"(?:class|record)\s+([A-Za-z_][\w]*)\s*:\s*([A-Za-z_][\w.<>,\s]*)",
+            re.MULTILINE,
+        )
+        for match in pattern.finditer(text):
+            class_name = match.group(1)
+            evidence = match.group(0).strip()
+            for target_name in _type_names_from_list(match.group(2)):
+                relation = "implements" if target_name.startswith("I") and len(target_name) > 1 and target_name[1:2].isupper() else "extends"
+                edges.append((class_name, relation, target_name, _line_no(text, match.start()), evidence))
+        return edges
+
+    return edges
+
+
+def _resolve_type_target(
+    target_name: str,
+    aliases: dict[str, tuple[str, str | None, str | None]],
+    symbols_by_name: dict[str, list[CodeSymbolRecord]],
+) -> tuple[str, str] | None:
+    clean_name = _simple_type_name(target_name)
+    if not clean_name:
+        return None
+    alias_target = aliases.get(clean_name)
+    if alias_target is not None:
+        return alias_target[0], alias_target[1] or clean_name
+    return _find_symbol_target(clean_name, None, symbols_by_name)
+
+
+def _type_names_from_list(value: str) -> list[str]:
+    names: list[str] = []
+    for item in value.split(","):
+        name = _simple_type_name(item)
+        if name and name not in names and name not in {"object", "Object", "BaseModel"}:
+            names.append(name)
+    return names
+
+
+def _simple_type_name(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    text = re.sub(r"<[^<>]*>", "", text)
+    text = text.strip().strip("&*?")
+    text = text.split()[0] if text.split() else text
+    text = text.rsplit("\\", 1)[-1].rsplit(".", 1)[-1]
+    return re.sub(r"[^A-Za-z0-9_$]", "", text)
 
 
 def _is_generated_relationship_path(path: str) -> bool:
@@ -1703,6 +2548,11 @@ def _first_string(value: str) -> str | None:
 def _keyword_string(value: str, key: str) -> str | None:
     match = re.search(rf"\b{re.escape(key)}\s*=\s*['\"]([^'\"]+)['\"]", value)
     return match.group(1) if match else None
+
+
+def _keyword_bool(value: str, key: str) -> bool:
+    match = re.search(rf"\b{re.escape(key)}\s*=\s*(True|False|true|false)", value)
+    return bool(match and match.group(1).lower() == "true")
 
 
 def _join_routes(prefix: str | None, route: str | None) -> str:

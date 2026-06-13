@@ -610,6 +610,9 @@ class User(models.Model):
     assert quality["score"] >= 70
     assert quality["grade"] in {"strong", "usable"}
     assert quality["entrypoints_with_data_paths"] >= 1
+    assert quality["entrypoints_with_business_flows"] >= 1
+    assert quality["business_module_count"] >= 1
+    assert quality["business_module_island_count"] == 0
     assert quality["relationship_counts"]["calls"] >= 1
     assert quality["data_object_count"] >= 1
 
@@ -669,6 +672,12 @@ class User(models.Model):
         and trace["path_chain"][:2] == ["app/api.py", "app/services.py"]
         for trace in audit_context["business_flow_traces"]
     )
+    assert any(
+        summary["entry_point"] == "POST /api/users/{user_id}/lock"
+        and "app/models.py" in summary["reachable_paths"]
+        and any(item["name"] == "User" for item in summary["data_objects"])
+        for summary in audit_context["entrypoint_summaries"]
+    )
     traces = audit_context["candidate_entrypoint_traces"]
     assert any(
         trace["candidate_id"] == data_flow["id"]
@@ -685,6 +694,534 @@ class User(models.Model):
     edge_ids = [item["id"] for item in graph_after["edges"]]
     assert len(node_ids) == len(set(node_ids))
     assert len(edge_ids) == len(set(edge_ids))
+
+
+def test_source_index_uses_import_scope_for_object_method_business_flow(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/app/api.py": b"""
+from fastapi import APIRouter
+from .services.users import UserService
+from .services.audit import UserService as AuditUserService
+
+router = APIRouter(prefix="/api")
+svc = UserService()
+
+@router.post("/users/{user_id}/lock")
+def lock_user(user_id: str):
+    return svc.lock_user(user_id)
+""",
+            "demo/app/services/users.py": b"""
+from ..repositories.users import UserRepository
+
+class UserService:
+    def lock_user(self, user_id):
+        return UserRepository().lock(user_id)
+""",
+            "demo/app/services/audit.py": b"""
+class UserService:
+    def write_audit(self, message):
+        return message
+""",
+            "demo/app/repositories/users.py": b"""
+from ..models import User
+
+class UserRepository:
+    def lock(self, user_id):
+        return User(id=user_id)
+""",
+            "demo/app/models.py": b"""
+from django.db import models
+
+class User(models.Model):
+    locked = models.BooleanField(default=False)
+""",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("scoped-flow.zip", payload, "application/zip")},
+    ).json()
+    quality = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/index-quality").json()
+    assert quality["entrypoints_with_business_flows"] >= 1
+    assert quality["business_module_count"] >= 1
+
+    relationships = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/relationships").json()
+    call_pairs = {
+        (item["from_path"], item["relation"], item["to_path"], item["to_symbol"], item["source"])
+        for item in relationships
+        if item["relation"] == "calls"
+    }
+    assert (
+        "app/api.py",
+        "calls",
+        "app/services/users.py",
+        "lock_user",
+        "heuristic:object_method_call",
+    ) in call_pairs
+    assert not any(
+        item["from_path"] == "app/api.py"
+        and item["relation"] == "calls"
+        and item["to_path"] == "app/services/audit.py"
+        for item in relationships
+    )
+    assert any(
+        item["from_path"] == "app/services/users.py"
+        and item["relation"] == "calls"
+        and item["to_path"] == "app/repositories/users.py"
+        for item in relationships
+    )
+    assert any(
+        item["from_path"] == "app/repositories/users.py"
+        and item["relation"] == "calls"
+        and item["to_path"] == "app/models.py"
+        for item in relationships
+    )
+
+    exported = client.get(
+        f"/projects/{project_id}/export",
+        params={"format": "yaml", "profile": "explore"},
+    )
+    data = yaml.safe_load(exported.text)
+    traces = data["code_index"]["audit_context"]["business_flow_traces"]
+    assert any(
+        trace["entry_point"] == "POST /api/users/{user_id}/lock"
+        and trace["path_chain"][:3] == [
+            "app/api.py",
+            "app/services/users.py",
+            "app/repositories/users.py",
+        ]
+        for trace in traces
+    )
+    summaries = data["code_index"]["audit_context"]["entrypoint_summaries"]
+    assert any(
+        summary["entry_point"] == "POST /api/users/{user_id}/lock"
+        and "app/repositories/users.py" in summary["reachable_paths"]
+        and any(item["name"] == "User" for item in summary["data_objects"])
+        for summary in summaries
+    )
+
+
+def test_source_index_links_interface_implementation_business_flow(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/src/main/java/demo/UserController.java": b"""
+package demo;
+
+import demo.UserService;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api/users")
+class UserController {
+    private final UserService userService;
+
+    UserController(UserService userService) {
+        this.userService = userService;
+    }
+
+    @PostMapping("/{id}/lock")
+    public User lockUser(String id) {
+        return userService.lockUser(id);
+    }
+}
+""",
+            "demo/src/main/java/demo/UserService.java": b"""
+package demo;
+
+interface UserService {
+    User lockUser(String id);
+}
+""",
+            "demo/src/main/java/demo/UserServiceImpl.java": b"""
+package demo;
+
+import demo.UserRepository;
+
+class UserServiceImpl implements UserService {
+    private final UserRepository repository;
+
+    UserServiceImpl(UserRepository repository) {
+        this.repository = repository;
+    }
+
+    public User lockUser(String id) {
+        return repository.lock(id);
+    }
+}
+""",
+            "demo/src/main/java/demo/UserRepository.java": b"""
+package demo;
+
+class UserRepository {
+    public User lock(String id) {
+        return new User(id);
+    }
+}
+""",
+            "demo/src/main/java/demo/User.java": b"""
+package demo;
+
+@Entity
+class User {
+    private String id;
+    User(String id) {
+        this.id = id;
+    }
+}
+""",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("spring-interface-flow.zip", payload, "application/zip")},
+    ).json()
+
+    relationships = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/relationships").json()
+    assert any(
+        item["from_path"] == "src/main/java/demo/UserService.java"
+        and item["relation"] == "implemented_by"
+        and item["to_path"] == "src/main/java/demo/UserServiceImpl.java"
+        for item in relationships
+    )
+    assert any(
+        item["from_path"] == "src/main/java/demo/UserController.java"
+        and item["relation"] == "calls"
+        and item["to_path"] == "src/main/java/demo/UserService.java"
+        and item["to_symbol"] == "lockUser"
+        for item in relationships
+    )
+    assert any(
+        item["from_path"] == "src/main/java/demo/UserServiceImpl.java"
+        and item["relation"] == "calls"
+        and item["to_path"] == "src/main/java/demo/UserRepository.java"
+        and item["to_symbol"] == "lock"
+        for item in relationships
+    )
+    symbols = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/symbols").json()
+    assert not any(
+        item["path"] == "src/main/java/demo/UserRepository.java"
+        and item["kind"] == "function"
+        and item["name"] == "User"
+        for item in symbols
+    )
+    assert not any(
+        item["path"] == "src/main/java/demo/UserRepository.java"
+        and item["kind"] == "data_object"
+        and item["name"] == "UserRepository"
+        for item in symbols
+    )
+
+    exported = client.get(
+        f"/projects/{project_id}/export",
+        params={"format": "yaml", "profile": "explore"},
+    )
+    data = yaml.safe_load(exported.text)
+    traces = data["code_index"]["audit_context"]["business_flow_traces"]
+    assert any(
+        trace["entry_point"] == "POST /api/users/{id}/lock"
+        and trace["path_chain"][:4]
+        == [
+            "src/main/java/demo/UserController.java",
+            "src/main/java/demo/UserService.java",
+            "src/main/java/demo/UserServiceImpl.java",
+            "src/main/java/demo/UserRepository.java",
+        ]
+        for trace in traces
+    )
+    summaries = data["code_index"]["audit_context"]["entrypoint_summaries"]
+    assert any(
+        summary["entry_point"] == "POST /api/users/{id}/lock"
+        and "src/main/java/demo/UserServiceImpl.java" in summary["reachable_paths"]
+        and any(item["name"] == "User" for item in summary["data_objects"])
+        for summary in summaries
+    )
+
+
+def test_source_index_understands_framework_semantic_layers(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/src/main/java/demo/UserController.java": b"""
+package demo;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api/users")
+class UserController {
+    private final UserService userService;
+
+    UserController(UserService userService) {
+        this.userService = userService;
+    }
+
+    @GetMapping("/{id}")
+    public User getUser(String id) {
+        return userService.find(id);
+    }
+}
+""",
+            "demo/src/main/java/demo/UserService.java": b"""
+package demo;
+
+import org.springframework.stereotype.Service;
+
+@Service
+class UserService {
+    private final UserMapper userMapper;
+
+    UserService(UserMapper userMapper) {
+        this.userMapper = userMapper;
+    }
+
+    public User find(String id) {
+        return userMapper.findById(id);
+    }
+}
+""",
+            "demo/src/main/java/demo/UserMapper.java": b"""
+package demo;
+
+import org.apache.ibatis.annotations.Mapper;
+import org.apache.ibatis.annotations.Select;
+
+@Mapper
+interface UserMapper {
+    @Select("select * from users where id = #{id}")
+    User findById(String id);
+}
+""",
+            "demo/src/main/java/demo/User.java": b"""
+package demo;
+
+import jakarta.persistence.Entity;
+
+@Entity
+class User {
+    private String id;
+}
+""",
+            "demo/src/app/users.controller.ts": b"""
+import { Controller, Get, Param } from '@nestjs/common';
+import { UserService } from './users.service';
+
+@Controller('api/nest-users')
+export class UsersController {
+  constructor(private readonly service: UserService) {}
+
+  @Get(':id')
+  getUser(@Param('id') id: string) {
+    return this.service.findOne(id);
+  }
+}
+""",
+            "demo/src/app/users.service.ts": b"""
+export class UserService {
+  findOne(id: string) {
+    return { id };
+  }
+}
+""",
+            "demo/routes/web.php": b"""<?php
+use App\\Http\\Controllers\\ProfileController;
+
+Route::get('/web/profile', [ProfileController::class, 'show']);
+""",
+            "demo/app/Http/Controllers/ProfileController.php": b"""<?php
+namespace App\\Http\\Controllers;
+
+class ProfileController {
+    public function show() {
+        return 'ok';
+    }
+}
+""",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("framework-semantics.zip", payload, "application/zip")},
+    ).json()
+
+    entrypoints = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/entrypoints").json()
+    route_methods = {(item["route"], item["method"], item["framework"]) for item in entrypoints}
+    assert ("/api/users/{id}", "GET", "spring") in route_methods
+    assert ("/api/nest-users/:id", "GET", "nestjs") in route_methods
+    assert ("/web/profile", "GET", "laravel") in route_methods
+
+    relationships = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/relationships").json()
+    assert any(
+        item["from_path"] == "src/main/java/demo/UserController.java"
+        and item["relation"] == "calls"
+        and item["to_path"] == "src/main/java/demo/UserService.java"
+        and item["to_symbol"] == "find"
+        for item in relationships
+    )
+    assert any(
+        item["from_path"] == "src/main/java/demo/UserService.java"
+        and item["relation"] == "calls"
+        and item["to_path"] == "src/main/java/demo/UserMapper.java"
+        and item["to_symbol"] == "findById"
+        for item in relationships
+    )
+    assert any(
+        item["from_path"] == "src/main/java/demo/UserMapper.java"
+        and item["relation"] == "uses"
+        and item["to_path"] == "src/main/java/demo/User.java"
+        and item["to_symbol"] == "User"
+        for item in relationships
+    )
+    assert any(
+        item["from_path"] == "src/app/users.controller.ts"
+        and item["relation"] == "calls"
+        and item["to_path"] == "src/app/users.service.ts"
+        for item in relationships
+    )
+    assert any(
+        item["from_path"] == "routes/web.php"
+        and item["relation"] == "calls"
+        and item["to_path"] == "app/Http/Controllers/ProfileController.php"
+        and item["to_symbol"] == "show"
+        for item in relationships
+    )
+
+    exported = client.get(
+        f"/projects/{project_id}/export",
+        params={"format": "yaml", "profile": "explore"},
+    )
+    data = yaml.safe_load(exported.text)
+    summaries = data["code_index"]["audit_context"]["entrypoint_summaries"]
+    assert any(
+        summary["entry_point"] == "GET /api/users/{id}"
+        and "src/main/java/demo/UserMapper.java" in summary["reachable_paths"]
+        and any(item["name"] == "User" for item in summary["data_objects"])
+        for summary in summaries
+    )
+    assert any(
+        summary["entry_point"] == "GET /api/nest-users/:id"
+        and "src/app/users.service.ts" in summary["reachable_paths"]
+        for summary in summaries
+    )
+    assert any(
+        summary["entry_point"] == "GET /web/profile"
+        and "app/Http/Controllers/ProfileController.php" in summary["reachable_paths"]
+        for summary in summaries
+    )
+
+
+def test_source_index_understands_drf_viewset_business_layers(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/users/urls.py": b"""
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
+from .views import UserViewSet
+
+router = DefaultRouter()
+router.register(r"users", UserViewSet, basename="user")
+
+urlpatterns = [
+    path("api/", include(router.urls)),
+    path("direct/users/", UserViewSet.as_view({"get": "list", "post": "create"})),
+]
+""",
+            "demo/users/views.py": b"""
+from rest_framework import viewsets
+from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from .models import User
+
+class UserViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated]
+    queryset = User.objects.all()
+
+    def list(self, request):
+        return Response({"count": self.queryset.count()})
+
+    def create(self, request):
+        return Response({"ok": True})
+
+    @action(detail=True, methods=["post"], url_path="lock")
+    def lock(self, request, pk=None):
+        user = User.objects.get(pk=pk)
+        return Response({"id": user.id})
+""",
+            "demo/users/models.py": b"""
+from django.db import models
+
+class User(models.Model):
+    owner_id = models.CharField(max_length=64)
+""",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("drf-viewset.zip", payload, "application/zip")},
+    ).json()
+
+    entrypoints = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/entrypoints").json()
+    route_methods = {(item["route"], item["method"], item["handler"], item["framework"]) for item in entrypoints}
+    assert ("/api/users", "GET", "UserViewSet.list", "drf") in route_methods
+    assert ("/api/users", "POST", "UserViewSet.create", "drf") in route_methods
+    assert ("/api/users/{pk}", "GET", "UserViewSet.retrieve", "drf") in route_methods
+    assert ("/direct/users/", "GET", "UserViewSet.list", "drf") in route_methods
+
+    relationships = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/relationships").json()
+    assert any(
+        item["from_path"] == "users/urls.py"
+        and item["relation"] == "calls"
+        and item["to_path"] == "users/views.py"
+        and item["to_symbol"] == "list"
+        for item in relationships
+    )
+    assert any(
+        item["from_path"] == "users/views.py"
+        and item["relation"] == "uses"
+        and item["to_path"] == "users/models.py"
+        and item["to_symbol"] == "User"
+        for item in relationships
+    )
+
+    capabilities = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/capabilities").json()
+    assert any(
+        item["path"] == "users/views.py" and item["category"] == "auth_guard"
+        for item in capabilities
+    )
+    exported = client.get(
+        f"/projects/{project_id}/export",
+        params={"format": "yaml", "profile": "explore"},
+    )
+    data = yaml.safe_load(exported.text)
+    summaries = data["code_index"]["audit_context"]["entrypoint_summaries"]
+    assert any(
+        summary["entry_point"] == "GET /api/users"
+        and "users/views.py" in summary["reachable_paths"]
+        and "users/models.py" in summary["reachable_paths"]
+        and any(item["name"] == "User" for item in summary["data_objects"])
+        and any(item["category"] == "auth_guard" for item in summary["semantic_boundaries"])
+        for summary in summaries
+    )
 
 
 def test_source_index_builds_control_plane_capability_chains(temp_db, monkeypatch, tmp_path):
@@ -1388,6 +1925,7 @@ $result=mysql_query($sql);
     audit_context = data["code_index"]["audit_context"]
     assert audit_context["focused_candidate_ids"] == [focused["id"]]
     assert audit_context["module_summaries"]
+    assert audit_context["entrypoint_summaries"]
     assert "business_flow_traces" in audit_context
     assert audit_context["priority_candidates"][0]["id"] == focused["id"]
     assert audit_context["priority_candidates"][0]["risk_score"] >= 70
