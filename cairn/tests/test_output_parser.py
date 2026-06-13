@@ -18,3 +18,30 @@ def test_strip_model_reasoning_removes_closed_think_block():
 
 def test_strip_model_reasoning_uses_text_after_last_closing_marker():
     assert strip_model_reasoning("first </think> still thinking </think> pong") == "pong"
+
+
+def test_extract_json_object_from_jsonl_assistant_event():
+    text = "\n".join(
+        [
+            '{"type":"session","id":"s1"}',
+            '{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"```json\\n{\\"accepted\\": true, \\"data\\": {\\"description\\": \\"ok\\"}}\\n```"}]}}',
+        ]
+    )
+
+    assert extract_json_object(text) == {"accepted": True, "data": {"description": "ok"}}
+
+
+def test_extract_json_object_repairs_common_formatting_noise():
+    text = """
+    Here is the result:
+    ```json
+    {
+      accepted: True,
+      data: {
+        description: "ok",
+      },
+    }
+    ```
+    """
+
+    assert extract_json_object(text) == {"accepted": True, "data": {"description": "ok"}}

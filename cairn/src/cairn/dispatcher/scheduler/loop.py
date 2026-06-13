@@ -26,15 +26,23 @@ from cairn.dispatcher.tasks.reason import run_reason_task
 from cairn.dispatcher.tasks.report_enrichment import run_report_enrichment_task
 from cairn.dispatcher.tasks.review import run_review_task
 from cairn.dispatcher.tasks.tool_scan import TOOL_SCAN_WORKER_NAME, run_tool_scan_task
-from cairn.server.models import Intent, ProjectDetail, ProjectSummary
+from cairn.server.models import Intent, ProjectDetail, ProjectSummary, Settings
 
 LOG = logging.getLogger(__name__)
 UNHEALTHY_RETRY_AFTER_SECONDS = 5
 REJECTED_RETRY_AFTER_SECONDS = 5
 RATE_LIMIT_RETRY_AFTER_SECONDS = 120
 SOURCE_PREFLIGHT_RETRY_AFTER_SECONDS = 60
+SETTINGS_REFRESH_INTERVAL_SECONDS = 15
 REASON_PARSE_FAILURE_LIMIT = 3
 REASON_PARSE_FAILURE_RETRY_AFTER_SECONDS = 180
+REASON_WORKER_RETRY_AFTER_SECONDS = 45
+REASON_RETRYABLE_FAILURE_TYPES = frozenset(
+    {
+        "parse_failed",
+        "timeout",
+    }
+)
 EXPLORE_PARSE_FAILURE_LIMIT = 3
 EXPLORE_PARSE_FAILURE_RETRY_AFTER_SECONDS = 180
 EXPLORE_WORKER_PARSE_RETRY_AFTER_SECONDS = 45
@@ -87,10 +95,12 @@ class DispatcherLoop:
         self.container_manager = ContainerManager(self.config.container)
         self.executor = ThreadPoolExecutor(max_workers=self.config.runtime.max_workers)
         self.report_executor = ThreadPoolExecutor(max_workers=max(1, self.config.runtime.max_workers))
+        self.review_executor = ThreadPoolExecutor(max_workers=max(1, self.config.runtime.max_workers))
         self.cleanup_executor = ThreadPoolExecutor(max_workers=max(1, min(8, self.config.runtime.max_workers)))
         self.tool_scan_executor = ThreadPoolExecutor(max_workers=self.config.tasks.tool_scan.max_running)
         self.futures: dict[Future[str | TaskOutcome], RunningTask] = {}
         self.report_futures: dict[Future[TaskOutcome], RunningTask] = {}
+        self.review_futures: dict[Future[TaskOutcome], RunningTask] = {}
         self.tool_scan_futures: dict[Future[TaskOutcome], RunningTask] = {}
         self.cleanup_futures: dict[Future[bool], tuple[str, str | None, str | None]] = {}
         self.reason_checkpoints: dict[str, ReasonCheckpoint] = {}
@@ -101,6 +111,7 @@ class DispatcherLoop:
         self.worker_rejected_until: dict[tuple[str, str, str], float] = {}
         self.source_preflight_blocked_until: dict[tuple[str, str], float] = {}
         self.reason_failure_state: dict[str, ReasonFailureState] = {}
+        self.reason_worker_retry_blocked_until: dict[tuple[str, str, str], float] = {}
         self.explore_failure_state: dict[tuple[str, str], ExploreFailureState] = {}
         self.explore_worker_retry_blocked_until: dict[tuple[str, str, str], float] = {}
         self.explore_worker_parse_blocked_until = self.explore_worker_retry_blocked_until
@@ -109,6 +120,8 @@ class DispatcherLoop:
         self._inactive_cleanup_done: dict[str, str] = {}
         self.project_cursor = 0
         self._settings_checked = False
+        self._server_settings: Settings | None = None
+        self._server_settings_loaded_at = 0.0
         self._startup_healthchecks_checked = False
         self._config_lock = threading.RLock()
         # Optional, default-off task-history ring buffer for the read-only
@@ -138,6 +151,9 @@ class DispatcherLoop:
             for key in list(self.worker_rate_limited_until):
                 if key[1] not in worker_names:
                     self.worker_rate_limited_until.pop(key, None)
+            for key in list(self.reason_worker_retry_blocked_until):
+                if key[2] not in worker_names:
+                    self.reason_worker_retry_blocked_until.pop(key, None)
 
     def enable_internal_state_tracking(self, history_size: int = 200) -> None:
         """Enable the optional read-only task-history buffer.
@@ -237,14 +253,18 @@ class DispatcherLoop:
 
     def close(self) -> None:
         report_futures = getattr(self, "report_futures", {})
-        if self.futures or report_futures:
+        review_futures = getattr(self, "review_futures", {})
+        if self.futures or report_futures or review_futures:
             LOG.info(
-                "dispatcher shutting down waiting_for_tasks=%s report_tasks=%s running_projects=%s",
+                "dispatcher shutting down waiting_for_tasks=%s review_tasks=%s report_tasks=%s running_projects=%s",
                 len(self.futures),
+                len(review_futures),
                 len(report_futures),
-                sorted({task.project_id for task in [*self.futures.values(), *report_futures.values()]}),
+                sorted({task.project_id for task in [*self.futures.values(), *review_futures.values(), *report_futures.values()]}),
             )
         self.executor.shutdown(wait=True)
+        if hasattr(self, "review_executor"):
+            self.review_executor.shutdown(wait=True)
         if hasattr(self, "report_executor"):
             self.report_executor.shutdown(wait=True)
         self.tool_scan_executor.shutdown(wait=True)
@@ -258,6 +278,7 @@ class DispatcherLoop:
             self._maybe_start_internal_api()
             while True:
                 try:
+                    self._refresh_server_settings(force=not self._settings_checked)
                     if not self._settings_checked:
                         self._validate_server_settings()
                         self._validate_artifact_runtime()
@@ -314,17 +335,19 @@ class DispatcherLoop:
             LOG.warning("internal status API failed to initialize; dispatcher continues", exc_info=True)
 
     def _dispatch_available(self, summaries: list[ProjectSummary]) -> None:
-        if len(self.futures) >= self.config.runtime.max_workers:
-            self._log_changed(
-                "dispatch/global",
-                logging.INFO,
-                "skip dispatch because max_workers reached running_tasks=%s",
-                len(self.futures),
-            )
-            return
         active = [summary for summary in summaries if summary.status == "active"]
         if not active:
             self._log_changed("dispatch/global", logging.INFO, "skip dispatch because no active projects")
+            return
+        if len(self.futures) >= self.config.runtime.max_workers:
+            if self._dispatch_auxiliary_available(active):
+                return
+            self._log_changed(
+                "dispatch/global",
+                logging.INFO,
+                "skip core dispatch because max_workers reached running_tasks=%s",
+                len(self.futures),
+            )
             return
 
         running_projects = self._ordered_projects(
@@ -364,6 +387,37 @@ class DispatcherLoop:
                 if self._try_dispatch_project(summary):
                     dispatched = True
                     break
+
+    def _dispatch_auxiliary_available(self, summaries: list[ProjectSummary]) -> bool:
+        for summary in self._ordered_projects(summaries):
+            skip_scope = f"project:{summary.id}:aux"
+            container_name = self.container_manager.container_name(summary.id)
+            if container_name in self._cleanup_pending:
+                continue
+            project = self.client.get_project(summary.id)
+            if project.project.status != "active":
+                continue
+            if not any(source.status == "ready" for source in project.sources):
+                continue
+            running_review_tasks = self._project_running_review_tasks(summary.id)
+            pending_review_tasks = [
+                task
+                for task in self.client.list_pending_review_tasks(summary.id, limit=10)
+                if isinstance(task, dict) and str(task.get("id") or "") not in running_review_tasks
+            ]
+            for task in pending_review_tasks:
+                if self._dispatch_review_task(project, task):
+                    return True
+            running_report_tasks = self._project_running_report_enrichment_tasks(summary.id)
+            pending_report_tasks = [
+                task
+                for task in self.client.list_pending_report_enrichments(summary.id, limit=10)
+                if isinstance(task, dict) and task.get("id") not in running_report_tasks
+            ]
+            if pending_report_tasks and self._dispatch_report_enrichment(project, pending_report_tasks[0]):
+                return True
+            self._clear_log_state(f"{skip_scope}:pending")
+        return False
 
     def _dispatch_background_tool_scans(self, summaries: list[ProjectSummary]) -> None:
         config = self.config.tasks.tool_scan
@@ -510,15 +564,7 @@ class DispatcherLoop:
                 container_name,
             )
             return False
-        if self._project_running_task_count(summary.id) >= self.config.runtime.max_project_workers:
-            self._log_changed(
-                f"{skip_scope}:max_project_workers",
-                logging.INFO,
-                "skip project=%s because max_project_workers reached running_tasks=%s",
-                summary.id,
-                self._project_running_task_summary(summary.id),
-            )
-            return False
+        core_at_limit = self._project_running_task_count(summary.id) >= self.config.runtime.max_project_workers
 
         project = self.client.get_project(summary.id)
         if project.project.status != "active":
@@ -539,6 +585,15 @@ class DispatcherLoop:
             )
             return False
         if self._is_initial_project(project):
+            if core_at_limit:
+                self._log_changed(
+                    f"{skip_scope}:max_project_workers",
+                    logging.INFO,
+                    "skip core project=%s because max_project_workers reached running_tasks=%s",
+                    summary.id,
+                    self._project_running_task_summary(summary.id),
+                )
+                return False
             if project.project.reason is not None:
                 return False
             return self._dispatch_initial_project(project)
@@ -572,10 +627,6 @@ class DispatcherLoop:
                 summary.id,
                 sorted(intent.id for intent in unclaimed_intents),
             )
-        if dispatchable_intents:
-            self._clear_log_state(f"{skip_scope}:explore_retry_cooldown")
-            if self._dispatch_first_available_explore(project, dispatchable_intents):
-                return True
         running_review_tasks = self._project_running_review_tasks(summary.id)
         pending_review_tasks = [
             task
@@ -588,8 +639,22 @@ class DispatcherLoop:
             for task in self.client.list_pending_report_enrichments(summary.id, limit=10)
             if isinstance(task, dict) and task.get("id") not in running_report_tasks
         ]
+        if core_at_limit:
+            self._log_changed(
+                f"{skip_scope}:max_project_workers",
+                logging.INFO,
+                "skip core project=%s because max_project_workers reached running_tasks=%s",
+                summary.id,
+                self._project_running_task_summary(summary.id),
+            )
+        elif dispatchable_intents:
+            self._clear_log_state(f"{skip_scope}:explore_retry_cooldown")
+            if self._dispatch_first_available_explore(project, dispatchable_intents):
+                return True
         reason_trigger: str | None = None
-        if project.project.reason is not None:
+        if core_at_limit:
+            pass
+        elif project.project.reason is not None:
             self._log_changed(
                 f"{skip_scope}:reason_claimed",
                 logging.DEBUG,
@@ -620,7 +685,7 @@ class DispatcherLoop:
             if self._dispatch_report_enrichment(project, pending_report_tasks[0]):
                 return True
 
-        if reason_trigger is None and project.project.reason is None:
+        if reason_trigger is None and project.project.reason is None and not core_at_limit:
             self._log_changed(
                 f"{skip_scope}:graph_unchanged",
                 logging.DEBUG,
@@ -689,18 +754,20 @@ class DispatcherLoop:
         return False
 
     def _dispatch_reason(self, project: ProjectDetail, export_yaml: str, trigger: str) -> bool:
-        selection = self._select_worker(project.project.id, "reason")
+        excluded_workers = self._reason_retry_excluded_workers(project.project.id, trigger)
+        selection = self._select_worker(project.project.id, "reason", excluded_workers=excluded_workers)
         worker = selection.worker
         if worker is None:
             self._log_changed(
                 f"project:{project.project.id}:worker:reason",
                 logging.INFO,
-                "no worker available for reason project=%s blocked_busy=%s blocked_unhealthy=%s blocked_rate_limited=%s blocked_rejected=%s",
+                "no worker available for reason project=%s blocked_busy=%s blocked_unhealthy=%s blocked_rate_limited=%s blocked_rejected=%s blocked_policy=%s",
                 project.project.id,
                 selection.blocked_busy,
                 selection.blocked_unhealthy,
                 selection.blocked_rate_limited,
                 selection.blocked_rejected,
+                selection.blocked_policy,
             )
             return False
         self._clear_log_state(f"project:{project.project.id}:worker:reason")
@@ -956,7 +1023,7 @@ class DispatcherLoop:
         if isinstance(claim.data, dict):
             task = claim.data
         try:
-            future = self.executor.submit(
+            future = self.review_executor.submit(
                 run_review_task,
                 self.config,
                 self.client,
@@ -976,8 +1043,7 @@ class DispatcherLoop:
             )
             self.client.release_review_task(task_id, worker.name)
             return False
-        self.futures[future] = RunningTask(project.project.id, "review", worker.name, cancellation, intent_id=task_id)
-        self.runtime_project_ids.add(project.project.id)
+        self.review_futures[future] = RunningTask(project.project.id, "review", worker.name, cancellation, intent_id=task_id)
         self._clear_project_log_state(project.project.id)
         LOG.info(
             "dispatched review project=%s task=%s finding=%s worker=%s excluded_discoverer=%s",
@@ -1149,7 +1215,11 @@ class DispatcherLoop:
 
     def _worker_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
-        for task in [*self.futures.values(), *getattr(self, "report_futures", {}).values()]:
+        for task in [
+            *self.futures.values(),
+            *getattr(self, "review_futures", {}).values(),
+            *getattr(self, "report_futures", {}).values(),
+        ]:
             counts[task.worker_name] = counts.get(task.worker_name, 0) + 1
         return counts
 
@@ -1188,7 +1258,7 @@ class DispatcherLoop:
     def _project_running_review_tasks(self, project_id: str) -> set[str]:
         return {
             task.intent_id
-            for task in self.futures.values()
+            for task in getattr(self, "review_futures", {}).values()
             if task.project_id == project_id and task.task_type == "review" and task.intent_id is not None
         }
 
@@ -1330,7 +1400,7 @@ class DispatcherLoop:
             self._log_changed(
                 f"project:{project_id}:reason_parse_cooldown:{trigger}",
                 logging.INFO,
-                "skip reason project=%s trigger=%s because repeated parse failures are cooling down retry_after=%.0fs",
+                "skip reason project=%s trigger=%s because repeated retryable failures are cooling down retry_after=%.0fs",
                 project_id,
                 trigger,
                 remaining,
@@ -1341,31 +1411,61 @@ class DispatcherLoop:
         return False
 
     def _record_reason_parse_failure(self, project_id: str, trigger: str) -> bool:
+        return self._record_reason_retryable_failure(project_id, trigger, None, "parse_failed")
+
+    def _reason_retry_excluded_workers(self, project_id: str, trigger: str) -> set[str]:
+        now = time.time()
+        excluded: set[str] = set()
+        for key, retry_until in list(self.reason_worker_retry_blocked_until.items()):
+            key_project_id, key_trigger, worker_name = key
+            if retry_until <= now:
+                self.reason_worker_retry_blocked_until.pop(key, None)
+                continue
+            if key_project_id == project_id and key_trigger == trigger:
+                excluded.add(worker_name)
+        return excluded
+
+    def _record_reason_retryable_failure(
+        self,
+        project_id: str,
+        trigger: str,
+        worker_name: str | None,
+        error_type: str | None,
+    ) -> bool:
         current = self.reason_failure_state.get(project_id)
         failures = current.failures + 1 if current is not None and current.trigger == trigger else 1
+        now = time.time()
         cooldown_until = 0.0
         if failures >= REASON_PARSE_FAILURE_LIMIT:
-            cooldown_until = time.time() + REASON_PARSE_FAILURE_RETRY_AFTER_SECONDS
+            cooldown_until = now + REASON_PARSE_FAILURE_RETRY_AFTER_SECONDS
         self.reason_failure_state[project_id] = ReasonFailureState(
             trigger=trigger,
             failures=failures,
             cooldown_until=cooldown_until,
         )
+        if worker_name:
+            self.reason_worker_retry_blocked_until[(project_id, trigger, worker_name)] = (
+                now + REASON_WORKER_RETRY_AFTER_SECONDS
+            )
         if cooldown_until:
             LOG.warning(
-                "reason parse failure limit reached project=%s trigger=%s failures=%s retry_after=%.0fs",
+                "reason retryable failure limit reached project=%s trigger=%s failures=%s retry_after=%.0fs last_error=%s",
                 project_id,
                 trigger,
                 failures,
                 REASON_PARSE_FAILURE_RETRY_AFTER_SECONDS,
+                error_type,
             )
         else:
             LOG.info(
-                "reason parse failure recorded project=%s trigger=%s failures=%s/%s",
+                "reason retryable failure recorded project=%s trigger=%s worker=%s failures=%s/%s worker_retry_after=%.0fs last_error=%s",
                 project_id,
                 trigger,
+                worker_name,
                 failures,
                 REASON_PARSE_FAILURE_LIMIT,
+                REASON_WORKER_RETRY_AFTER_SECONDS,
+                error_type,
             )
         return bool(cooldown_until)
 
@@ -1478,6 +1578,8 @@ class DispatcherLoop:
 
     def _reap_futures(self) -> None:
         done = [(self.futures, future) for future in self.futures if future.done()]
+        review_futures = getattr(self, "review_futures", {})
+        done.extend((review_futures, future) for future in review_futures if future.done())
         report_futures = getattr(self, "report_futures", {})
         done.extend((report_futures, future) for future in report_futures if future.done())
         for task_futures, future in done:
@@ -1507,7 +1609,10 @@ class DispatcherLoop:
                     )
                 self._clear_project_log_state(task.project_id)
                 if status == "unhealthy":
-                    retry_after_seconds = UNHEALTHY_RETRY_AFTER_SECONDS
+                    retry_after_seconds = self._server_setting(
+                        "worker_unhealthy_retry_after_seconds",
+                        UNHEALTHY_RETRY_AFTER_SECONDS,
+                    )
                     self.worker_unhealthy_until[task.worker_name] = time.time() + retry_after_seconds
                     LOG.info(
                         "worker marked unhealthy worker=%s retry_after=%.0fs",
@@ -1539,7 +1644,10 @@ class DispatcherLoop:
                         outcome.error_detail,
                     )
                 if status == "rejected":
-                    retry_after_seconds = REJECTED_RETRY_AFTER_SECONDS
+                    retry_after_seconds = self._server_setting(
+                        "worker_rejected_retry_after_seconds",
+                        REJECTED_RETRY_AFTER_SECONDS,
+                    )
                     self.worker_rejected_until[rejection_key] = time.time() + retry_after_seconds
                     LOG.info(
                         "worker marked rejected project=%s task=%s worker=%s retry_after=%.0fs",
@@ -1553,8 +1661,18 @@ class DispatcherLoop:
                 if task.task_type == "reason":
                     if status == "success":
                         self.reason_failure_state.pop(task.project_id, None)
-                    elif outcome.error_type == "parse_failed" and task.reason_trigger:
-                        self._record_reason_parse_failure(task.project_id, task.reason_trigger)
+                        if task.reason_trigger:
+                            prefix = (task.project_id, task.reason_trigger)
+                            for key in list(self.reason_worker_retry_blocked_until):
+                                if key[:2] == prefix:
+                                    self.reason_worker_retry_blocked_until.pop(key, None)
+                    elif outcome.error_type in REASON_RETRYABLE_FAILURE_TYPES and task.reason_trigger:
+                        self._record_reason_retryable_failure(
+                            task.project_id,
+                            task.reason_trigger,
+                            task.worker_name,
+                            outcome.error_type,
+                        )
                 if task.task_type == "explore" and task.intent_id:
                     if status == "success":
                         self._clear_explore_parse_failure(task.project_id, task.intent_id)
@@ -1678,6 +1796,9 @@ class DispatcherLoop:
         for project_id in list(self.reason_failure_state):
             if project_id not in active_ids:
                 self.reason_failure_state.pop(project_id, None)
+        for key in list(self.reason_worker_retry_blocked_until):
+            if key[0] not in active_ids:
+                self.reason_worker_retry_blocked_until.pop(key, None)
         for project_id in list(self.completion_checkpoints):
             if project_id not in active_ids:
                 self.completion_checkpoints.pop(project_id, None)
@@ -1698,6 +1819,7 @@ class DispatcherLoop:
         status_by_project = {summary.id: summary.status for summary in summaries}
         running_tasks = (
             list(self.futures.values())
+            + list(getattr(self, "review_futures", {}).values())
             + list(getattr(self, "report_futures", {}).values())
             + list(self.tool_scan_futures.values())
         )
@@ -1777,8 +1899,28 @@ class DispatcherLoop:
             if scope.startswith(prefix):
                 self._log_state.pop(scope, None)
 
-    def _validate_server_settings(self) -> None:
+    def _refresh_server_settings(self, *, force: bool = False) -> Settings:
+        now = time.time()
+        if (
+            not force
+            and self._server_settings is not None
+            and (now - self._server_settings_loaded_at) < SETTINGS_REFRESH_INTERVAL_SECONDS
+        ):
+            return self._server_settings
         settings = self.client.get_settings()
+        self._server_settings = settings
+        self._server_settings_loaded_at = now
+        return settings
+
+    def _server_setting(self, name: str, default: int) -> int:
+        settings = getattr(self, "_server_settings", None)
+        if settings is None:
+            return default
+        value = getattr(settings, name, default)
+        return int(value)
+
+    def _validate_server_settings(self) -> None:
+        settings = self._server_settings or self._refresh_server_settings(force=True)
         interval = self.config.runtime.interval
         for name, value in (("intent_timeout", settings.intent_timeout), ("reason_timeout", settings.reason_timeout)):
             if value <= interval:

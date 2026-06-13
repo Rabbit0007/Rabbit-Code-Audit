@@ -277,6 +277,7 @@ def build_status_snapshot(loop: "DispatcherLoop") -> dict[str, Any]:
     running_tasks = _safe_copy(
         lambda: (
             list(loop.futures.values())
+            + list(getattr(loop, "review_futures", {}).values())
             + list(getattr(loop, "report_futures", {}).values())
             + list(getattr(loop, "tool_scan_futures", {}).values())
         )

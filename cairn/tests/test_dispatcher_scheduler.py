@@ -21,16 +21,19 @@ def _scheduler_loop() -> DispatcherLoop:
     loop = DispatcherLoop.__new__(DispatcherLoop)
     loop.futures = {}
     loop.report_futures = {}
+    loop.review_futures = {}
     loop.reason_failure_state = {}
     loop.reason_checkpoints = {}
     loop.completion_checkpoints = {}
     loop.explore_failure_state = {}
+    loop.reason_worker_retry_blocked_until = {}
     loop.explore_worker_retry_blocked_until = {}
     loop.explore_worker_parse_blocked_until = loop.explore_worker_retry_blocked_until
     loop.worker_unhealthy_until = {}
     loop.worker_rejected_until = {}
     loop.worker_rate_limited_until = {}
     loop.source_preflight_blocked_until = {}
+    loop._server_settings = None
     loop._log_state = {}
     return loop
 
@@ -170,6 +173,35 @@ def test_reason_parse_failure_limit_does_not_checkpoint_failed_graph_state():
     ) == "initial"
 
 
+def test_reason_timeout_temporarily_avoids_same_worker():
+    loop = _scheduler_loop()
+    loop._record_reason_retryable_failure("proj_1", "facts:2->3", "worker-a", "timeout")
+
+    assert loop._reason_retry_excluded_workers("proj_1", "facts:2->3") == {"worker-a"}
+    assert loop._reason_retry_excluded_workers("proj_1", "facts:3->4") == set()
+
+
+def test_reason_worker_selection_uses_next_worker_after_timeout():
+    loop = _scheduler_loop()
+    loop._config_lock = threading.RLock()
+    loop.config = SimpleNamespace(
+        workers=[
+            _worker("worker-a", task_types=["reason"], priority=0),
+            _worker("worker-b", task_types=["reason"], priority=1),
+        ]
+    )
+    loop._record_reason_retryable_failure("proj_1", "facts:2->3", "worker-a", "timeout")
+
+    selection = loop._select_worker(
+        "proj_1",
+        "reason",
+        excluded_workers=loop._reason_retry_excluded_workers("proj_1", "facts:2->3"),
+    )
+
+    assert selection.worker is not None
+    assert selection.worker.name == "worker-b"
+
+
 def test_reason_parse_fallback_derives_intents_from_coverage():
     intents = _fallback_intents_from_graph(
         """
@@ -250,6 +282,44 @@ def test_report_rate_limit_cooldown_blocks_only_that_task_type():
     assert explore_selection.worker.name == "worker-a"
 
 
+def test_worker_retry_cooldowns_use_server_settings():
+    loop = _scheduler_loop()
+    loop.task_history = None
+    loop.client = SimpleNamespace(
+        record_worker_task_history=lambda payload: SimpleNamespace(ok=True, status_code=200, text="")
+    )
+    loop._server_settings = SimpleNamespace(
+        worker_unhealthy_retry_after_seconds=17,
+        worker_rejected_retry_after_seconds=19,
+    )
+
+    unhealthy_future: Future = Future()
+    unhealthy_future.set_result(TaskOutcome(status="unhealthy"))
+    loop.futures[unhealthy_future] = RunningTask(
+        "proj_1",
+        "explore",
+        "worker-a",
+        TaskCancellation(),
+        intent_id="i001",
+    )
+
+    rejected_future: Future = Future()
+    rejected_future.set_result(TaskOutcome(status="rejected"))
+    loop.futures[rejected_future] = RunningTask(
+        "proj_1",
+        "explore",
+        "worker-b",
+        TaskCancellation(),
+        intent_id="i002",
+    )
+
+    now = time.time()
+    loop._reap_futures()
+
+    assert 15 <= loop.worker_unhealthy_until["worker-a"] - now <= 19
+    assert 17 <= loop.worker_rejected_until[("proj_1", "explore", "worker-b")] - now <= 21
+
+
 def test_dispatch_first_available_explore_skips_blocked_newer_intent():
     loop = _scheduler_loop()
     exported: list[str] = []
@@ -316,6 +386,7 @@ def _review_dispatch_loop(workers: list[WorkerConfig]) -> DispatcherLoop:
     loop._config_lock = threading.RLock()
     loop.config = SimpleNamespace(workers=workers)
     loop.executor = _FakeExecutor()
+    loop.review_executor = _FakeExecutor()
     loop.client = _ReviewClient()
     loop.container_manager = SimpleNamespace()
     return loop
@@ -386,6 +457,7 @@ def _completion_check_loop(
         workers=[_worker("reason-worker", task_types=["reason"])],
     )
     loop.executor = _FakeExecutor()
+    loop.review_executor = _FakeExecutor()
     loop.report_executor = _FakeExecutor()
     loop.container_manager = SimpleNamespace(container_name=lambda project_id: f"cairn-{project_id}")
     loop.client = _CompletionCheckClient(project, pending_reports=pending_reports)
@@ -555,7 +627,8 @@ def test_review_task_dispatch_excludes_discoverer_and_uses_review_worker():
     assert loop._dispatch_review_task(project, task) is True
 
     assert loop.client.claims == [("rev_1", "review-gpt55-1")]
-    running = list(loop.futures.values())[0]
+    assert loop.futures == {}
+    running = list(loop.review_futures.values())[0]
     assert running.task_type == "review"
     assert running.intent_id == "rev_1"
 
@@ -574,7 +647,7 @@ def test_review_task_marks_blocked_without_independent_worker():
 
 def test_review_task_marks_waiting_when_independent_worker_is_temporarily_busy():
     loop = _review_dispatch_loop([_worker("review-gpt55-1", task_types=["review"], max_running=1)])
-    loop.futures[Future()] = RunningTask(
+    loop.review_futures[Future()] = RunningTask(
         "proj_2",
         "review",
         "review-gpt55-1",
@@ -589,3 +662,49 @@ def test_review_task_marks_waiting_when_independent_worker_is_temporarily_busy()
     assert loop.client.claims == []
     assert loop.client.availability
     assert loop.client.availability[0][1] == "waiting_for_reviewer"
+
+
+def test_review_dispatch_uses_background_pool_not_core_futures():
+    loop = _review_dispatch_loop([_worker("review-gpt55-1", task_types=["review"])])
+    project = SimpleNamespace(project=SimpleNamespace(id="proj_1"))
+    task = {"id": "rev_1", "project_id": "proj_1", "finding_id": "finding_1", "discovered_by": "worker-a"}
+
+    assert loop._dispatch_review_task(project, task) is True
+
+    assert loop.futures == {}
+    assert len(loop.review_futures) == 1
+
+
+def test_core_worker_limit_does_not_block_review_dispatch():
+    project = _project_with_open_intent()
+    loop = _completion_check_loop(project)
+    loop.config.runtime.max_project_workers = 1
+    loop.config.workers = [
+        _worker("core-worker", task_types=["explore"]),
+        _worker("review-gpt55-1", task_types=["review"]),
+    ]
+    loop.futures[Future()] = RunningTask(
+        "proj_1",
+        "explore",
+        "core-worker",
+        TaskCancellation(),
+        intent_id="i_busy",
+    )
+    loop.client.list_pending_review_tasks = lambda project_id, limit=10: [
+        {"id": "rev_1", "project_id": project_id, "finding_id": "finding_1", "discovered_by": "worker-a"}
+    ]
+    loop.client.claim_review_task = lambda task_id, worker: SimpleNamespace(
+        ok=True,
+        status_code=200,
+        text="",
+        data={"id": task_id, "project_id": "proj_1", "finding_id": "finding_1", "discovered_by": "worker-a"},
+    )
+    loop.client.release_review_task = lambda task_id, worker: SimpleNamespace(ok=True, status_code=200, text="")
+    loop.client.mark_review_task_availability = lambda task_id, status, reason=None: SimpleNamespace(
+        ok=True,
+        status_code=200,
+        text="",
+    )
+
+    assert loop._try_dispatch_project(SimpleNamespace(id="proj_1", status="active")) is True
+    assert len(loop.review_futures) == 1

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from cairn.server import db
 from cairn.server.db import get_conn
 from cairn.server.routers import export, findings, hints, intents, projects
+from cairn.server.services import build_intent_fingerprint
 
 from .conftest import BASE_URL
 
@@ -113,6 +114,24 @@ def test_intent_fingerprint_dedupes_open_intents_and_exports_metadata(temp_db):
     assert data["facts"][0]["fact_type"] == "origin"
     assert data["hints"][0]["target"] == "auth"
     assert data["intents"][0]["fingerprint"] == first.json()["fingerprint"]
+
+
+def test_intent_fingerprint_uses_structured_targets_over_model_wording():
+    first = build_intent_fingerprint(
+        ["f001"],
+        "闭环候选 candidate_ids: cand_1234567890abcdef。source_targets: Less-56/index.php。",
+    )
+    second = build_intent_fingerprint(
+        ["f018"],
+        "重新补齐这个候选项的证据，candidate_ids: cand_1234567890abcdef，source_targets: Less-56/index.php。",
+    )
+    unrelated = build_intent_fingerprint(
+        ["f018"],
+        "重新补齐另一个候选项的证据，candidate_ids: cand_abcdef1234567890，source_targets: Less-57/index.php。",
+    )
+
+    assert first == second
+    assert first != unrelated
 
 
 def test_configure_migrates_existing_core_schema_before_creating_indexes(tmp_path, monkeypatch):

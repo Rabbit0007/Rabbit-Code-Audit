@@ -9,6 +9,32 @@ DEFAULT_DB = Path.home() / ".local" / "share" / "cairn" / "cairn.db"
 
 _db_path: Path | None = None
 
+SETTINGS_DEFAULTS: dict[str, int] = {
+    "intent_timeout": 15,
+    "reason_timeout": 15,
+    "worker_unhealthy_retry_after_seconds": 5,
+    "worker_rejected_retry_after_seconds": 5,
+    "max_failed_login_attempts": 5,
+    "rate_limit_window_minutes": 15,
+    "session_duration_hours": 24,
+    "log_retention_days": 30,
+    "export_retention_days": 30,
+    "notification_retention_days": 14,
+    "project_idle_alert_hours": 12,
+}
+
+SETTINGS_ADDITIONAL_COLUMNS: dict[str, str] = {
+    "worker_unhealthy_retry_after_seconds": "INTEGER NOT NULL DEFAULT 5",
+    "worker_rejected_retry_after_seconds": "INTEGER NOT NULL DEFAULT 5",
+    "max_failed_login_attempts": "INTEGER NOT NULL DEFAULT 5",
+    "rate_limit_window_minutes": "INTEGER NOT NULL DEFAULT 15",
+    "session_duration_hours": "INTEGER NOT NULL DEFAULT 24",
+    "log_retention_days": "INTEGER NOT NULL DEFAULT 30",
+    "export_retention_days": "INTEGER NOT NULL DEFAULT 30",
+    "notification_retention_days": "INTEGER NOT NULL DEFAULT 14",
+    "project_idle_alert_hours": "INTEGER NOT NULL DEFAULT 12",
+}
+
 SCHEMA = """\
 CREATE TABLE IF NOT EXISTS settings (
     intent_timeout INTEGER NOT NULL DEFAULT 15,
@@ -162,6 +188,7 @@ def configure(path: Path) -> None:
         _ensure_columns(conn, "facts", FACT_COLUMNS)
         _ensure_columns(conn, "intents", INTENT_COLUMNS)
         _ensure_columns(conn, "hints", HINT_COLUMNS)
+        _ensure_columns(conn, "settings", SETTINGS_ADDITIONAL_COLUMNS)
         _backfill_core_metadata(conn)
         _ensure_indexes(conn)
 

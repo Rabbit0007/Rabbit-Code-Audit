@@ -69,9 +69,20 @@ def build_intent_fingerprint(
     inferred_paths = sorted(
         {match.group(0).strip("./").lower() for match in INTENT_PATH_RE.finditer(description)}
     )[:20]
+    has_structured_target = bool(
+        target_kind
+        or target_id
+        or objective
+        or evidence_gap
+        or inferred_ids
+        or inferred_paths
+    )
     payload = {
-        "sources": sorted({item.strip() for item in source_fact_ids if item.strip()}),
-        "description": normalized_description,
+        # When the model gives concrete targets, use those targets as the
+        # identity. Model wording changes frequently; including the full
+        # description in that case lets duplicate work bypass de-duping.
+        "sources": [] if has_structured_target else sorted({item.strip() for item in source_fact_ids if item.strip()}),
+        "description": "" if has_structured_target else normalized_description,
         "target_kind": _normalize_fingerprint_text(target_kind),
         "target_id": _normalize_fingerprint_text(target_id),
         "objective": _normalize_fingerprint_text(objective),
