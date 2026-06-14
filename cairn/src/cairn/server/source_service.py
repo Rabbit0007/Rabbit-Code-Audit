@@ -89,6 +89,21 @@ MAX_AUDIT_CANDIDATE_DESCRIPTION_CHARS = 1600
 MAX_CODE_CAPABILITIES_PER_FILE = 20
 MAX_CAPABILITY_CHAIN_CANDIDATES = 120
 MAX_PRIORITY_REASON_COUNT = 6
+CAPABILITY_CHAIN_CATEGORY_QUOTAS = {
+    "file_upload": 16,
+    "archive_extract": 12,
+    "file_write": 14,
+    "file_read": 10,
+    "process_execution": 12,
+    "task_execution": 12,
+    "template_render": 8,
+    "credential_access": 10,
+    "websocket_boundary": 8,
+    "external_system": 8,
+    "auth_guard": 6,
+    "object_scope_guard": 6,
+    "object_id_lookup": 6,
+}
 HIGH_IMPACT_RISK_SIGNAL_CATEGORIES = {
     "文件读写/加载能力",
     "系统进程能力",
@@ -768,6 +783,107 @@ def get_source_index_quality(project_id: str, snapshot_id: str) -> SourceIndexQu
             """,
             (snapshot_id,),
         ).fetchone()
+        language_file_counts = _count_rows(
+            conn.execute(
+                """
+                SELECT language AS key, COUNT(*) AS count
+                FROM code_files
+                WHERE snapshot_id = ?
+                  AND is_binary = 0
+                  AND language IS NOT NULL
+                GROUP BY language
+                ORDER BY count DESC, key
+                """,
+                (snapshot_id,),
+            ).fetchall()
+        )
+        language_entrypoint_counts = _count_rows(
+            conn.execute(
+                """
+                SELECT COALESCE(language, 'unknown') AS key, COUNT(*) AS count
+                FROM code_entrypoints
+                WHERE snapshot_id = ?
+                GROUP BY COALESCE(language, 'unknown')
+                ORDER BY count DESC, key
+                """,
+                (snapshot_id,),
+            ).fetchall()
+        )
+        language_relationship_counts = _count_rows(
+            conn.execute(
+                """
+                SELECT COALESCE(f.language, 'unknown') AS key, COUNT(*) AS count
+                FROM code_relationships r
+                LEFT JOIN code_files f
+                  ON f.snapshot_id = r.snapshot_id
+                 AND f.path = r.from_path
+                WHERE r.snapshot_id = ?
+                GROUP BY COALESCE(f.language, 'unknown')
+                ORDER BY count DESC, key
+                """,
+                (snapshot_id,),
+            ).fetchall()
+        )
+        language_data_object_counts = _count_rows(
+            conn.execute(
+                """
+                SELECT COALESCE(language, 'unknown') AS key, COUNT(*) AS count
+                FROM code_symbols
+                WHERE snapshot_id = ?
+                  AND kind = 'data_object'
+                GROUP BY COALESCE(language, 'unknown')
+                ORDER BY count DESC, key
+                """,
+                (snapshot_id,),
+            ).fetchall()
+        )
+        language_framework_rows = conn.execute(
+            """
+            SELECT COALESCE(language, 'unknown') AS language,
+                   COALESCE(framework, 'unknown') AS framework,
+                   COUNT(*) AS count
+            FROM code_entrypoints
+            WHERE snapshot_id = ?
+            GROUP BY COALESCE(language, 'unknown'), COALESCE(framework, 'unknown')
+            ORDER BY language, count DESC, framework
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        graph_compression_rows = conn.execute(
+            """
+            SELECT m.id, m.title, m.risk_level, m.review_status,
+                   COUNT(c.id) AS child_count,
+                   SUM(CASE WHEN c.node_type = 'endpoint' THEN 1 ELSE 0 END) AS entrypoint_count,
+                   SUM(CASE WHEN c.node_type = 'risk' THEN 1 ELSE 0 END) AS risk_count,
+                   SUM(CASE WHEN c.risk_level IN ('critical', 'high', 'unknown') THEN 1 ELSE 0 END) AS high_risk_child_count
+            FROM business_nodes m
+            LEFT JOIN business_edges e
+              ON e.project_id = m.project_id
+             AND e.from_node_id = m.id
+             AND e.relation = 'contains'
+            LEFT JOIN business_nodes c
+              ON c.project_id = e.project_id
+             AND c.id = e.to_node_id
+            WHERE m.source_snapshot_id = ?
+              AND m.node_type = 'feature'
+              AND m.title LIKE '业务模块 %'
+            GROUP BY m.id
+            ORDER BY child_count DESC, high_risk_child_count DESC, m.title
+            LIMIT 12
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        high_risk_node_stats = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN review_status IN ('unreviewed', 'investigating', 'blocked') THEN 1 ELSE 0 END) AS open_count
+            FROM business_nodes
+            WHERE source_snapshot_id = ?
+              AND risk_level IN ('critical', 'high', 'unknown')
+            """,
+            (snapshot_id,),
+        ).fetchone()
 
     data_object_count = symbol_kind_counts.get("data_object", 0)
     entrypoints_with_data_paths = _entrypoints_with_data_paths(entrypoints, relationships, data_objects)
@@ -798,6 +914,33 @@ def get_source_index_quality(project_id: str, snapshot_id: str) -> SourceIndexQu
     business_graph_edge_count = int((business_graph_size or {})["edges"] or 0)
     business_module_count = int((business_module_stats or {})["module_count"] or 0)
     business_module_island_count = int((business_module_stats or {})["island_count"] or 0)
+    language_coverage = _language_coverage_summary(
+        language_file_counts=language_file_counts,
+        language_entrypoint_counts=language_entrypoint_counts,
+        language_relationship_counts=language_relationship_counts,
+        language_data_object_counts=language_data_object_counts,
+        language_framework_rows=language_framework_rows,
+    )
+    graph_compression = _graph_compression_summary(
+        node_count=business_graph_node_count,
+        edge_count=business_graph_edge_count,
+        module_count=business_module_count,
+        module_island_count=business_module_island_count,
+        module_rows=graph_compression_rows,
+        high_risk_node_stats=high_risk_node_stats,
+    )
+    audit_readiness = _audit_readiness_summary(
+        entrypoint_count=summary.entrypoint_count,
+        relationship_count=summary.relationship_count,
+        data_object_count=data_object_count,
+        entrypoints_with_data_paths=entrypoints_with_data_paths,
+        entrypoints_with_business_flows=entrypoints_with_business_flows,
+        entrypoints_with_capability_paths=entrypoints_with_capability_paths,
+        business_module_count=business_module_count,
+        business_module_island_count=business_module_island_count,
+        candidate_count=candidate_count,
+        high_impact_candidate_count=high_impact_candidate_count,
+    )
     issues: list[SourceIndexQualityIssue] = []
     recommendations: list[str] = []
     score = 100
@@ -950,6 +1093,17 @@ def get_source_index_quality(project_id: str, snapshot_id: str) -> SourceIndexQu
             6,
             "在 explore/reason 上下文中只导出聚焦候选相邻节点，完整业务图留在服务端作为可视化和覆盖状态。",
         )
+    readiness_score = int(audit_readiness.get("score") or 0)
+    if readiness_score < 55 and code_file_count > 0:
+        add_issue(
+            "warning",
+            "audit_readiness_low",
+            "审计阅读就绪度偏低",
+            "入口、业务流、数据对象和候选线索之间的闭环不足，大模型仍需要较多轮次手动建立业务理解。",
+            readiness_score,
+            6,
+            "优先补强主语言框架入口、跨文件调用、模块聚合和入口到数据对象/能力链的可达关系。",
+        )
 
     score = max(0, min(100, score))
     if score >= 80:
@@ -990,6 +1144,9 @@ def get_source_index_quality(project_id: str, snapshot_id: str) -> SourceIndexQu
         business_module_island_count=business_module_island_count,
         entrypoints_with_business_flows=entrypoints_with_business_flows,
         entrypoints_with_capability_paths=entrypoints_with_capability_paths,
+        language_coverage=language_coverage,
+        graph_compression=graph_compression,
+        audit_readiness=audit_readiness,
         issues=issues,
         recommendations=list(dict.fromkeys(recommendations)),
     )
@@ -1013,6 +1170,184 @@ def _count_rows_from_values(values) -> dict[str, int]:
             continue
         result[key] = result.get(key, 0) + 1
     return result
+
+
+def _language_coverage_summary(
+    *,
+    language_file_counts: dict[str, int],
+    language_entrypoint_counts: dict[str, int],
+    language_relationship_counts: dict[str, int],
+    language_data_object_counts: dict[str, int],
+    language_framework_rows,
+) -> dict[str, dict[str, object]]:
+    frameworks_by_language: dict[str, dict[str, int]] = {}
+    for row in language_framework_rows:
+        language = str(row["language"] or "unknown")
+        framework = str(row["framework"] or "unknown")
+        frameworks_by_language.setdefault(language, {})[framework] = int(row["count"] or 0)
+    result: dict[str, dict[str, object]] = {}
+    languages = sorted(
+        set(language_file_counts)
+        | set(language_entrypoint_counts)
+        | set(language_relationship_counts)
+        | set(language_data_object_counts)
+    )
+    for language in languages:
+        files = language_file_counts.get(language, 0)
+        entrypoints = language_entrypoint_counts.get(language, 0)
+        relationships = language_relationship_counts.get(language, 0)
+        data_objects = language_data_object_counts.get(language, 0)
+        frameworks = frameworks_by_language.get(language, {})
+        if entrypoints and relationships:
+            status = "strong"
+        elif entrypoints:
+            status = "entrypoints_only"
+        elif relationships or data_objects:
+            status = "partial"
+        elif language in {"C", "C++", "CSS", "HTML", "SQL"}:
+            status = "non_web_support"
+        else:
+            status = "weak"
+        result[language] = {
+            "files": files,
+            "entrypoints": entrypoints,
+            "relationships": relationships,
+            "data_objects": data_objects,
+            "frameworks": frameworks,
+            "status": status,
+        }
+    return result
+
+
+def _graph_compression_summary(
+    *,
+    node_count: int,
+    edge_count: int,
+    module_count: int,
+    module_island_count: int,
+    module_rows,
+    high_risk_node_stats,
+) -> dict[str, object]:
+    high_risk_total = int((high_risk_node_stats or {})["total"] or 0)
+    high_risk_open = int((high_risk_node_stats or {})["open_count"] or 0)
+    compressed_node_budget = module_count + high_risk_open
+    compression_ratio = round(compressed_node_budget / max(1, node_count), 3) if node_count else 0.0
+    top_modules = [
+        {
+            "id": row["id"],
+            "title": row["title"],
+            "risk_level": row["risk_level"],
+            "review_status": row["review_status"],
+            "child_count": int(row["child_count"] or 0),
+            "entrypoint_count": int(row["entrypoint_count"] or 0),
+            "risk_count": int(row["risk_count"] or 0),
+            "high_risk_child_count": int(row["high_risk_child_count"] or 0),
+        }
+        for row in module_rows
+    ]
+    return {
+        "node_count": node_count,
+        "edge_count": edge_count,
+        "module_count": module_count,
+        "module_island_count": module_island_count,
+        "high_risk_node_count": high_risk_total,
+        "open_high_risk_node_count": high_risk_open,
+        "compressed_node_budget": compressed_node_budget,
+        "compression_ratio": compression_ratio,
+        "top_modules": top_modules,
+    }
+
+
+def _audit_readiness_summary(
+    *,
+    entrypoint_count: int,
+    relationship_count: int,
+    data_object_count: int,
+    entrypoints_with_data_paths: int,
+    entrypoints_with_business_flows: int,
+    entrypoints_with_capability_paths: int,
+    business_module_count: int,
+    business_module_island_count: int,
+    candidate_count: int,
+    high_impact_candidate_count: int,
+) -> dict[str, object]:
+    data_path_ratio = round(entrypoints_with_data_paths / max(1, entrypoint_count), 3) if entrypoint_count else 0.0
+    business_flow_ratio = round(entrypoints_with_business_flows / max(1, entrypoint_count), 3) if entrypoint_count else 0.0
+    capability_path_ratio = round(entrypoints_with_capability_paths / max(1, entrypoint_count), 3) if entrypoint_count else 0.0
+    module_health_ratio = round(
+        (business_module_count - business_module_island_count) / max(1, business_module_count),
+        3,
+    ) if business_module_count else 0.0
+    score = 0
+    score += 20 if entrypoint_count else 0
+    score += 15 if relationship_count else 0
+    score += min(20, int(business_flow_ratio * 20))
+    score += min(15, int(data_path_ratio * 15)) if data_object_count else 0
+    score += min(15, int(capability_path_ratio * 15))
+    score += min(10, int(module_health_ratio * 10)) if business_module_count else 0
+    score += 5 if candidate_count else 0
+    score = max(0, min(100, score))
+    if score >= 78:
+        status = "strong"
+    elif score >= 58:
+        status = "usable"
+    elif score >= 38:
+        status = "weak"
+    else:
+        status = "poor"
+    checkpoints = [
+        {
+            "key": "entrypoints",
+            "label": "入口识别",
+            "current": entrypoint_count,
+            "target": 1,
+            "status": "ok" if entrypoint_count else "missing",
+        },
+        {
+            "key": "relationships",
+            "label": "跨文件关系",
+            "current": relationship_count,
+            "target": max(1, entrypoint_count),
+            "status": "ok" if relationship_count else "missing",
+        },
+        {
+            "key": "business_flows",
+            "label": "入口业务流",
+            "current": entrypoints_with_business_flows,
+            "target": max(1, int(entrypoint_count * 0.5)),
+            "status": "ok" if business_flow_ratio >= 0.5 else "weak",
+        },
+        {
+            "key": "data_paths",
+            "label": "入口数据链",
+            "current": entrypoints_with_data_paths,
+            "target": max(1, int(entrypoint_count * 0.35)),
+            "status": "ok" if data_path_ratio >= 0.35 or data_object_count == 0 else "weak",
+        },
+        {
+            "key": "modules",
+            "label": "业务模块聚合",
+            "current": business_module_count - business_module_island_count,
+            "target": max(1, business_module_count),
+            "status": "ok" if module_health_ratio >= 0.66 or business_module_count == 0 else "weak",
+        },
+        {
+            "key": "candidates",
+            "label": "审计候选线索",
+            "current": high_impact_candidate_count,
+            "target": 1,
+            "status": "ok" if candidate_count else "missing",
+        },
+    ]
+    return {
+        "score": score,
+        "status": status,
+        "entrypoint_data_path_ratio": data_path_ratio,
+        "entrypoint_business_flow_ratio": business_flow_ratio,
+        "entrypoint_capability_path_ratio": capability_path_ratio,
+        "module_health_ratio": module_health_ratio,
+        "checkpoints": checkpoints,
+    }
 
 
 def _avg_confidence(conn, table: str, snapshot_id: str) -> float:
@@ -2050,21 +2385,11 @@ def _insert_audit_candidates_from_index(
             )
 
     reachable_entrypoints = _entrypoint_labels_by_target_path(code_index)
-    capability_rows = conn.execute(
-        """
-        SELECT *
-        FROM code_capabilities
-        WHERE snapshot_id = ?
-          AND risk_level IN ('critical', 'high')
-        ORDER BY
-            CASE risk_level WHEN 'critical' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
-            path,
-            COALESCE(line_start, 0),
-            category
-        LIMIT ?
-        """,
-        (snapshot_id, MAX_CAPABILITY_CHAIN_CANDIDATES),
-    ).fetchall()
+    capability_rows = _select_capability_chain_candidate_rows(
+        conn,
+        snapshot_id,
+        limit=MAX_CAPABILITY_CHAIN_CANDIDATES,
+    )
     for capability in capability_rows:
         tags = _decode_json_list(capability["risk_tags_json"])
         entrypoints = reachable_entrypoints.get(capability["path"], [])
@@ -2126,6 +2451,75 @@ def _load_existing_index_candidate_ids(conn, snapshot_id: str) -> dict[tuple[str
         key = (row["source"], row["candidate_type"], row["file_path"], row["line_start"], row["entry_point"])
         result.setdefault(key, row["id"])
     return result
+
+
+def _select_capability_chain_candidate_rows(conn, snapshot_id: str, *, limit: int):
+    if limit <= 0:
+        return []
+
+    selected: list = []
+    seen_ids: set[str] = set()
+
+    def append_rows(rows) -> None:
+        for row in rows:
+            if len(selected) >= limit:
+                return
+            row_id = row["id"]
+            if row_id in seen_ids:
+                continue
+            selected.append(row)
+            seen_ids.add(row_id)
+
+    buckets: dict[str, list] = {}
+    for category, quota in CAPABILITY_CHAIN_CATEGORY_QUOTAS.items():
+        buckets[category] = conn.execute(
+            f"""
+            SELECT *
+            FROM code_capabilities
+            WHERE snapshot_id = ?
+              AND risk_level IN ('critical', 'high')
+              AND category = ?
+            ORDER BY {_capability_chain_order_sql()}
+            LIMIT ?
+            """,
+            (snapshot_id, category, min(limit, quota)),
+        ).fetchall()
+
+    # First pass gives every present capability family at least one slot.
+    for category in CAPABILITY_CHAIN_CATEGORY_QUOTAS:
+        rows = buckets.get(category) or []
+        append_rows(rows[:1])
+
+    # Second pass fills each family up to its quota before global ranking fills the rest.
+    for category in CAPABILITY_CHAIN_CATEGORY_QUOTAS:
+        rows = buckets.get(category) or []
+        append_rows(rows[1:])
+
+    if len(selected) < limit:
+        append_rows(
+            conn.execute(
+                f"""
+                SELECT *
+                FROM code_capabilities
+                WHERE snapshot_id = ?
+                  AND risk_level IN ('critical', 'high')
+                ORDER BY {_capability_chain_order_sql()}
+                LIMIT ?
+                """,
+                (snapshot_id, limit * 3),
+            ).fetchall()
+        )
+    return selected[:limit]
+
+
+def _capability_chain_order_sql() -> str:
+    return (
+        "CASE risk_level WHEN 'critical' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, "
+        "confidence DESC, "
+        "path, "
+        "COALESCE(line_start, 0), "
+        "category"
+    )
 
 
 def _risk_signal_candidate_key(file_path: str, entry_point: str | None, signal: RiskSignal) -> tuple[object, ...]:

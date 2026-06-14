@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import json
+import sqlite3
 import time
 import zipfile
 
@@ -14,7 +16,7 @@ from cairn.server import db
 from cairn.server.routers import business_graph, export, findings, intents, projects, review_tasks, sources, vulnerabilities
 from cairn.server.services import utcnow
 from cairn.server.source_models import CodeFile
-from cairn.server.source_service import rebuild_source_index
+from cairn.server.source_service import rebuild_source_index, _select_capability_chain_candidate_rows
 
 
 def _app(temp_db) -> FastAPI:
@@ -531,6 +533,100 @@ Route::prefix('api')->group(function () {
     assert {"get_user", "lock_user", "UserController", "AdminController", "UsersController", "ready", "getUser"} <= {item["name"] for item in symbols}
 
 
+def test_source_import_indexes_additional_framework_routes_and_quality_readiness(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/server.ts": b"""
+import fastify from 'fastify'
+import Hapi from '@hapi/hapi'
+
+const app = fastify()
+app.get('/fast/users/:id', getUser)
+app.route({ method: 'POST', url: '/fast/users', handler: createUser })
+
+const server = new Hapi.Server({})
+server.route({ method: 'GET', path: '/hapi/status', handler: status })
+""",
+            "demo/config/routes.rb": b"""
+Rails.application.routes.draw do
+  namespace :admin do
+    resources :users
+    post '/login', to: 'sessions#create'
+  end
+end
+""",
+            "demo/app.rb": b"""
+require 'sinatra'
+
+get '/health' do
+  'ok'
+end
+""",
+            "demo/src/main.rs": b"""
+use actix_web::{get, post};
+use axum::{routing::{get, post}, Router};
+
+#[get("/actix/users/{id}")]
+async fn get_user() -> String { String::new() }
+
+#[post("/actix/users")]
+async fn create_user() -> String { String::new() }
+
+fn app() -> Router {
+    Router::new()
+        .route("/axum/users", get(list_users))
+        .route("/axum/users", post(create_axum_user))
+}
+""",
+            "demo/src/rocket.rs": b"""
+use rocket::get;
+
+#[get("/rocket/ping")]
+fn ping() -> &'static str { "pong" }
+""",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("frameworks.zip", payload, "application/zip")},
+    ).json()
+
+    entrypoints = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/entrypoints").json()
+    route_methods = {(item["route"], item["method"], item["framework"]) for item in entrypoints}
+    assert {
+        ("/fast/users/:id", "GET", "fastify"),
+        ("/fast/users", "POST", "fastify"),
+        ("/hapi/status", "GET", "hapi"),
+        ("/admin/users", "GET", "rails"),
+        ("/admin/users", "POST", "rails"),
+        ("/admin/users/:id", "GET", "rails"),
+        ("/admin/login", "POST", "rails"),
+        ("/health", "GET", "sinatra"),
+        ("/actix/users/{id}", "GET", "actix"),
+        ("/actix/users", "POST", "actix"),
+        ("/axum/users", "GET", "axum"),
+        ("/axum/users", "POST", "axum"),
+        ("/rocket/ping", "GET", "rocket"),
+    } <= route_methods
+
+    quality = client.get(f"/api/projects/{project_id}/sources/{snapshot['id']}/index-quality").json()
+    assert quality["audit_readiness"]["score"] > 0
+    assert quality["graph_compression"]["module_count"] > 0
+    assert quality["language_coverage"]["Ruby"]["entrypoints"] >= 4
+    assert quality["language_coverage"]["Rust"]["entrypoints"] >= 5
+    assert quality["language_coverage"]["TypeScript"]["entrypoints"] >= 3
+
+    exported = client.get(f"/projects/{project_id}/export?format=yaml&profile=explore").text
+    data = yaml.safe_load(exported)
+    audit_context = data["code_index"]["audit_context"]
+    assert audit_context["compressed_business_graph"]["module_count"] > 0
+    assert audit_context["compressed_business_graph"]["top_modules"]
+
+
 def test_call_relationship_extraction_is_bounded_for_large_symbol_sets():
     snapshot_id = "snap_perf"
     file = CodeFile(
@@ -677,6 +773,18 @@ class User(models.Model):
         and "app/models.py" in summary["reachable_paths"]
         and any(item["name"] == "User" for item in summary["data_objects"])
         for summary in audit_context["entrypoint_summaries"]
+    )
+    focus_packs = audit_context["planner_focus_packs"]
+    assert audit_context["audit_packs"] == focus_packs
+    assert focus_packs
+    assert any(
+        data_flow["id"] in pack["candidate_ids"]
+        and pack["pack_id"].startswith("pack_")
+        and pack["objective"]
+        and "app/api.py" in pack["reading_order"]
+        and "app/services.py" in pack["reading_order"]
+        and pack["audit_focus"]
+        for pack in focus_packs
     )
     traces = audit_context["candidate_entrypoint_traces"]
     assert any(
@@ -1383,6 +1491,101 @@ class Job:
         item["id"] for item in reason_data["audit_candidates"]["coverage"]["high_risk_unresolved"]
     }
     assert {item["id"] for item in capability_candidates} & high_risk_ids
+
+
+def test_capability_chain_candidate_selection_balances_capability_families():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE code_capabilities (
+            id TEXT PRIMARY KEY,
+            snapshot_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            symbol TEXT,
+            category TEXT NOT NULL,
+            title TEXT NOT NULL,
+            line_start INTEGER,
+            line_end INTEGER,
+            evidence TEXT,
+            risk_level TEXT NOT NULL,
+            risk_tags_json TEXT NOT NULL DEFAULT '[]',
+            confidence REAL NOT NULL DEFAULT 0.65,
+            source TEXT NOT NULL DEFAULT 'heuristic'
+        )
+        """
+    )
+    rows = []
+    for index in range(40):
+        rows.append(
+            (
+                f"cap_cred_{index}",
+                "snap_1",
+                f"aaa/secrets_{index}.py",
+                "load_secret",
+                "credential_access",
+                "凭据/令牌访问能力",
+                index + 1,
+                index + 1,
+                "token = settings.SECRET",
+                "high",
+                "[]",
+                0.95,
+                "test",
+            )
+        )
+    rows.extend(
+        [
+            (
+                "cap_upload",
+                "snap_1",
+                "zzz/upload.py",
+                "upload",
+                "file_upload",
+                "文件上传入口/接收能力",
+                10,
+                10,
+                "request.FILES['file']",
+                "high",
+                "[]",
+                0.80,
+                "test",
+            ),
+            (
+                "cap_archive",
+                "snap_1",
+                "zzz/archive.py",
+                "extract",
+                "archive_extract",
+                "归档解压/展开能力",
+                20,
+                20,
+                "zipfile.ZipFile(src).extractall(dst)",
+                "high",
+                "[]",
+                0.80,
+                "test",
+            ),
+        ]
+    )
+    conn.executemany(
+        """
+        INSERT INTO code_capabilities (
+            id, snapshot_id, path, symbol, category, title, line_start, line_end,
+            evidence, risk_level, risk_tags_json, confidence, source
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+    selected = _select_capability_chain_candidate_rows(conn, "snap_1", limit=20)
+    categories = [row["category"] for row in selected]
+
+    assert "file_upload" in categories
+    assert "archive_extract" in categories
+    assert categories.index("file_upload") < 5
+    assert categories.index("archive_extract") < 5
 
 
 def test_source_index_extracts_multilanguage_upload_file_facts(temp_db, monkeypatch, tmp_path):
@@ -2223,12 +2426,107 @@ def test_high_severity_finding_requires_different_reviewer(temp_db, monkeypatch,
         json={"reviewer": "worker-b", "decision": "confirmed"},
     )
     assert reviewed_again.status_code == 200
+
+
+def test_duplicate_audit_findings_share_cluster_and_reuse_existing_record(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    payload = _zip_bytes({"app.php": b"<?php echo $_GET['x'];"})
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("demo.zip", payload, "application/zip")},
+    ).json()
+
+    first = client.post(
+        f"/api/projects/{project_id}/audit-findings",
+        json={
+            "snapshot_id": snapshot["id"],
+            "title": "reflected xss",
+            "category": "xss",
+            "severity": "high",
+            "file_path": "app.php",
+            "line_start": 1,
+            "entry_point": "GET /app.php?x=",
+            "description": "reflected output reaches the response without escaping",
+            "impact": "attacker can execute script in a victim browser",
+            "evidence": "app.php echoes $_GET['x'] directly",
+            "proof_packets": [_proof_packet()],
+            "discovered_by": "worker-a",
+        },
+    )
+    second = client.post(
+        f"/api/projects/{project_id}/audit-findings",
+        json={
+            "snapshot_id": snapshot["id"],
+            "title": "same reflected xss with static poc",
+            "category": "xss",
+            "severity": "high",
+            "file_path": "app.php",
+            "line_start": 1,
+            "entry_point": "GET /app.php?x=",
+            "description": "same source path and entry point",
+            "impact": "attacker can execute script in a victim browser",
+            "evidence": "same direct echo evidence",
+            "reproduction_poc": _reproduction_poc(),
+            "discovered_by": "worker-b",
+        },
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert second.json()["id"] == first.json()["id"]
+    assert second.json()["cluster_key"] == first.json()["cluster_key"]
+    assert second.json()["reproduction_poc"]["payload"] == "<script>alert(1)</script>"
+    findings = client.get(f"/api/projects/{project_id}/audit-findings").json()
+    assert len(findings) == 1
     with db.get_conn() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) AS count FROM report_enrichment_tasks WHERE project_id = ?",
+        review_tasks = conn.execute(
+            "SELECT finding_id, status, excluded_workers_json FROM review_tasks WHERE project_id = ?",
             (project_id,),
-        ).fetchone()
-    assert row["count"] == 1
+        ).fetchall()
+    assert len(review_tasks) == 1
+    assert review_tasks[0]["finding_id"] == first.json()["id"]
+    assert json.loads(review_tasks[0]["excluded_workers_json"]) == ["worker-a", "worker-b"]
+
+
+def test_finding_cluster_key_uses_root_location_before_route():
+    first = findings.audit_finding_cluster_key(
+        findings.CreateAuditFindingRequest(
+            snapshot_id="snap_1",
+            title="sso redirect",
+            category="open_redirect",
+            severity="high",
+            cwe="CWE-601",
+            file_path="apps/auth/sso.py",
+            line_start=88,
+            symbol="complete_login",
+            entry_point="GET /api/v1/auth/sso/callback/",
+            description="redirect target is controlled by request state",
+            impact="account phishing and token relay",
+            evidence="apps/auth/sso.py:88 returns redirect_url from request state",
+            discovered_by="worker-a",
+        )
+    )
+    second = findings.audit_finding_cluster_key(
+        findings.CreateAuditFindingRequest(
+            snapshot_id="snap_1",
+            title="sso redirect alternate route",
+            category="open_redirect",
+            severity="high",
+            cwe="CWE-601",
+            file_path="apps/auth/sso.py",
+            line_start=89,
+            symbol="complete_login",
+            entry_point="GET /api/v1/auth/sso/oidc/callback/",
+            description="same root cause through an alternate route",
+            impact="account phishing and token relay",
+            evidence="apps/auth/sso.py:89 returns redirect_url from request state",
+            discovered_by="worker-b",
+        )
+    )
+
+    assert second == first
 
 
 def test_high_severity_finding_creates_independent_review_task_queue(temp_db, monkeypatch, tmp_path):

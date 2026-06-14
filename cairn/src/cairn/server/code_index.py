@@ -46,7 +46,20 @@ SYMBOL_RESERVED_NAMES = {
     "while",
     "with",
 }
-CALL_RELATIONSHIP_LANGUAGES = {"Python", "JavaScript", "TypeScript", "Vue", "PHP", "Java", "Kotlin", "Scala", "C#", "Go"}
+CALL_RELATIONSHIP_LANGUAGES = {
+    "Python",
+    "JavaScript",
+    "TypeScript",
+    "Vue",
+    "PHP",
+    "Java",
+    "Kotlin",
+    "Scala",
+    "C#",
+    "Go",
+    "Ruby",
+    "Rust",
+}
 GENERATED_RELATIONSHIP_PARTS = {
     "__pycache__",
     "build",
@@ -432,6 +445,8 @@ def _extract_entrypoints(
     records.extend(_csharp_entrypoints(snapshot_id, file, text))
     records.extend(_java_entrypoints(snapshot_id, file, text))
     records.extend(_go_entrypoints(snapshot_id, file, text))
+    records.extend(_ruby_entrypoints(snapshot_id, file, text))
+    records.extend(_rust_entrypoints(snapshot_id, file, text))
     records.extend(_generic_web_script_entrypoints(snapshot_id, file, text))
     return records
 
@@ -694,8 +709,14 @@ def _js_entrypoints(
     records: list[CodeEntrypointRecord] = []
     constants = dict(string_constants or {})
     constants.update(_collect_js_string_constants([text]))
+    fastify_names = _js_fastify_names(text)
+    hapi_names = _js_hapi_names(text)
     express = re.compile(r"\b(?:app|router)\.(get|post|put|delete|patch|options|head|all)\(\s*['\"]([^'\"]+)['\"]\s*(?:,\s*([A-Za-z_$][\w$\.]*))?", re.IGNORECASE)
     for match in express.finditer(text):
+        target_match = re.search(r"\b([A-Za-z_$][\w$]*)\.", match.group(0))
+        target = target_match.group(1) if target_match else ""
+        if target in fastify_names or target in hapi_names:
+            continue
         method = match.group(1).upper()
         records.append(
             _entrypoint(
@@ -733,7 +754,132 @@ def _js_entrypoints(
             )
         )
     records.extend(_nestjs_entrypoints(snapshot_id, file, text))
+    records.extend(_js_fastify_entrypoints(snapshot_id, file, text))
+    records.extend(_js_hapi_entrypoints(snapshot_id, file, text))
     return records
+
+
+def _js_fastify_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
+    records: list[CodeEntrypointRecord] = []
+    method_pattern = re.compile(
+        r"\b([A-Za-z_$][\w$]*)\.(get|post|put|delete|patch|options|head|all)\(\s*['\"]([^'\"]+)['\"]\s*(?:,\s*([A-Za-z_$][\w$\.]*))?",
+        re.IGNORECASE,
+    )
+    fastify_names = _js_fastify_names(text)
+    for match in method_pattern.finditer(text):
+        target = match.group(1)
+        if target not in fastify_names and target.lower() != "fastify":
+            continue
+        method = match.group(2).upper()
+        line_start = _line_no(text, match.start())
+        records.append(
+            _entrypoint(
+                snapshot_id,
+                file,
+                "http_route",
+                "fastify",
+                None if method == "ALL" else method,
+                match.group(3),
+                match.group(4),
+                line_start,
+                _line_at(text, line_start).strip(),
+                0.78,
+                "heuristic:fastify",
+            )
+        )
+    route_pattern = re.compile(r"\b([A-Za-z_$][\w$]*)\.route\(\s*\{(?P<body>.*?)\}\s*\)", re.DOTALL)
+    for match in route_pattern.finditer(text):
+        target = match.group(1)
+        if target not in fastify_names and target.lower() != "fastify":
+            continue
+        body = match.group("body")
+        method = _js_object_string(body, "method")
+        route = _js_object_string(body, "url") or _js_object_string(body, "path")
+        if not route:
+            continue
+        handler = _js_object_identifier(body, "handler")
+        line_start = _line_no(text, match.start())
+        records.append(
+            _entrypoint(
+                snapshot_id,
+                file,
+                "http_route",
+                "fastify",
+                method.upper() if method else None,
+                route,
+                handler,
+                line_start,
+                _line_at(text, line_start).strip(),
+                0.78,
+                "heuristic:fastify_route",
+            )
+        )
+    return records
+
+
+def _js_fastify_names(text: str) -> set[str]:
+    names = {"fastify"}
+    for match in re.finditer(
+        r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:fastify|require\(['\"]fastify['\"]\))\s*\(",
+        text,
+    ):
+        names.add(match.group(1))
+    return names
+
+
+def _js_hapi_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
+    records: list[CodeEntrypointRecord] = []
+    hapi_names = _js_hapi_names(text)
+    pattern = re.compile(r"\b([A-Za-z_$][\w$]*)\.route\(\s*(?:\[\s*)?\{(?P<body>.*?)\}\s*(?:\]\s*)?\)", re.DOTALL)
+    for match in pattern.finditer(text):
+        target = match.group(1)
+        if target not in hapi_names and target.lower() not in {"server"}:
+            continue
+        line = _line_at(text, _line_no(text, match.start()))
+        if "route" not in line and "method" not in match.group("body"):
+            continue
+        body = match.group("body")
+        method = _js_object_string(body, "method")
+        route = _js_object_string(body, "path")
+        if not route:
+            continue
+        handler = _js_object_identifier(body, "handler")
+        line_start = _line_no(text, match.start())
+        records.append(
+            _entrypoint(
+                snapshot_id,
+                file,
+                "http_route",
+                "hapi",
+                method.upper() if method else None,
+                route,
+                handler,
+                line_start,
+                _line_at(text, line_start).strip(),
+                0.74,
+                "heuristic:hapi_route",
+            )
+        )
+    return records
+
+
+def _js_hapi_names(text: str) -> set[str]:
+    names: set[str] = set()
+    if "@hapi/hapi" in text or "require('hapi')" in text or 'require("hapi")' in text:
+        names.add("server")
+    for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:new\s+)?Hapi\.Server\b", text):
+        names.add(match.group(1))
+    return names
+
+
+def _js_object_string(body: str, key: str) -> str | None:
+    match = re.search(rf"\b{re.escape(key)}\s*:\s*['\"]([^'\"]+)['\"]", body)
+    return match.group(1) if match else None
+
+
+def _js_object_identifier(body: str, key: str) -> str | None:
+    match = re.search(rf"\b{re.escape(key)}\s*:\s*([A-Za-z_$][\w$\.]*)", body)
+    return match.group(1) if match else None
 
 
 def _nestjs_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
@@ -1005,6 +1151,7 @@ def _go_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEnt
         return []
     records: list[CodeEntrypointRecord] = []
     group_prefixes = _go_group_prefixes(text)
+    router_frameworks = _go_router_frameworks(text)
     handler_name = r"([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?)"
     patterns = (
         ("net/http", re.compile(rf"http\.HandleFunc\(\s*['\"]([^'\"]+)['\"]\s*,\s*{handler_name}")),
@@ -1021,15 +1168,166 @@ def _go_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEnt
             if framework == "net/http":
                 method, route, handler = None, match.group(1), match.group(2)
             elif framework == "go-method-router":
-                entry_framework = "go-router"
+                entry_framework = router_frameworks.get(match.group(1), "go-router")
                 method, route, handler = match.group(2).upper(), _join_routes(group_prefixes.get(match.group(1)), match.group(3)), match.group(4)
             elif framework == "mux":
+                entry_framework = router_frameworks.get(match.group(1), "mux")
                 method, route, handler = _go_http_method(match.group(4)), _join_routes(group_prefixes.get(match.group(1)), match.group(2)), match.group(3)
             else:
+                entry_framework = router_frameworks.get(match.group(1), framework)
                 method, route, handler = match.group(2).upper(), _join_routes(group_prefixes.get(match.group(1)), match.group(3)), match.group(4)
             line_start = _line_no(text, match.start())
             records.append(_entrypoint(snapshot_id, file, "http_route", entry_framework, method, route, handler, line_start, _line_at(text, line_start).strip()))
     return records
+
+
+def _ruby_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
+    if file.language != "Ruby":
+        return []
+    records: list[CodeEntrypointRecord] = []
+    scope_prefixes = _ruby_scope_prefixes(text)
+    is_rails_routes = "Rails.application.routes" in text or re.search(
+        r"^\s*(?:resources\s+:|namespace\s+:|scope\s+['\"]?:)",
+        text,
+        re.MULTILINE,
+    )
+    if is_rails_routes:
+        rails_pattern = re.compile(
+            r"^\s*(get|post|put|patch|delete|match)\s+['\"]([^'\"]+)['\"](?:\s*,\s*to:\s*['\"]([^'\"]+)['\"])?",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        for match in rails_pattern.finditer(text):
+            method = match.group(1).upper()
+            line_start = _line_no(text, match.start())
+            route = _join_routes(_ruby_prefix_at(scope_prefixes, match.start()), match.group(2))
+            records.append(
+                _entrypoint(
+                    snapshot_id,
+                    file,
+                    "http_route",
+                    "rails",
+                    None if method == "MATCH" else method,
+                    route,
+                    match.group(3),
+                    line_start,
+                    _line_at(text, line_start).strip(),
+                    0.74,
+                    "heuristic:rails_routes",
+                )
+            )
+        resources_pattern = re.compile(r"^\s*resources\s+:([A-Za-z_][\w]*)", re.MULTILINE)
+        for match in resources_pattern.finditer(text):
+            base = _join_routes(_ruby_prefix_at(scope_prefixes, match.start()), match.group(1).replace("_", "-"))
+            line_start = _line_no(text, match.start())
+            evidence = _line_at(text, line_start).strip()
+            controller = f"{match.group(1)}#"
+            for method, suffix, action in (
+                ("GET", "", "index"),
+                ("POST", "", "create"),
+                ("GET", ":id", "show"),
+                ("PATCH", ":id", "update"),
+                ("DELETE", ":id", "destroy"),
+            ):
+                records.append(
+                    _entrypoint(
+                        snapshot_id,
+                        file,
+                        "http_route",
+                        "rails",
+                        method,
+                        _join_routes(base, suffix),
+                        f"{controller}{action}",
+                        line_start,
+                        evidence,
+                        0.62,
+                        "heuristic:rails_resources",
+                    )
+                )
+    sinatra_pattern = re.compile(
+        r"^\s*(get|post|put|patch|delete|options|head)\s+['\"]([^'\"]+)['\"]\s+do\b",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for match in sinatra_pattern.finditer(text):
+        line_start = _line_no(text, match.start())
+        records.append(
+            _entrypoint(
+                snapshot_id,
+                file,
+                "http_route",
+                "sinatra",
+                match.group(1).upper(),
+                match.group(2),
+                None,
+                line_start,
+                _line_at(text, line_start).strip(),
+                0.72,
+                "heuristic:sinatra",
+            )
+        )
+    return records
+
+
+def _rust_entrypoints(snapshot_id: str, file: CodeFile, text: str) -> list[CodeEntrypointRecord]:
+    if file.language != "Rust":
+        return []
+    records: list[CodeEntrypointRecord] = []
+    route_attr_pattern = re.compile(
+        r"#\[(get|post|put|delete|patch|options|head)\s*\(\s*['\"]([^'\"]+)['\"](?:[^\]]*)\)\]\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_][\w]*)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for match in route_attr_pattern.finditer(text):
+        line_start = _line_no(text, match.start())
+        framework = _rust_attribute_framework(text, match.start())
+        records.append(
+            _entrypoint(
+                snapshot_id,
+                file,
+                "http_route",
+                framework,
+                match.group(1).upper(),
+                match.group(2),
+                match.group(3),
+                line_start,
+                _line_at(text, line_start).strip(),
+                0.76,
+                f"heuristic:{framework}_attribute",
+            )
+        )
+    axum_route_pattern = re.compile(
+        r"\.route\(\s*['\"]([^'\"]+)['\"]\s*,\s*([^)]+)\)",
+        re.DOTALL,
+    )
+    for match in axum_route_pattern.finditer(text):
+        route = match.group(1)
+        body = match.group(2)
+        line_start = _line_no(text, match.start())
+        for method, handler in _rust_axum_methods(body):
+            records.append(
+                _entrypoint(
+                    snapshot_id,
+                    file,
+                    "http_route",
+                    "axum",
+                    method,
+                    route,
+                    handler,
+                    line_start,
+                    _line_at(text, line_start).strip(),
+                    0.74,
+                    "heuristic:axum_route",
+                )
+            )
+    return records
+
+
+def _rust_attribute_framework(text: str, offset: int) -> str:
+    local_context = text[max(0, offset - 500) : offset].lower()
+    full_context = text[: min(len(text), offset + 2000)].lower()
+    if "rocket::" in local_context or "#[macro_use] extern crate rocket" in full_context or "use rocket::" in full_context:
+        return "rocket"
+    if "actix_web" in full_context or "use actix" in full_context:
+        return "actix"
+    return "actix"
 
 
 CSHARP_HTTP_METHOD_BY_ATTR = {
@@ -1163,6 +1461,27 @@ def _go_group_prefixes(text: str) -> dict[str, str]:
     return prefixes
 
 
+def _go_router_frameworks(text: str) -> dict[str, str]:
+    frameworks: dict[str, str] = {}
+    patterns = (
+        ("gin", re.compile(r"\b([A-Za-z_][\w]*)\s*:?=\s*gin\.(?:Default|New)\s*\(")),
+        ("chi", re.compile(r"\b([A-Za-z_][\w]*)\s*:?=\s*chi\.NewRouter\s*\(")),
+        ("fiber", re.compile(r"\b([A-Za-z_][\w]*)\s*:?=\s*fiber\.New\s*\(")),
+        ("echo", re.compile(r"\b([A-Za-z_][\w]*)\s*:?=\s*echo\.New\s*\(")),
+        ("mux", re.compile(r"\b([A-Za-z_][\w]*)\s*:?=\s*mux\.NewRouter\s*\(")),
+    )
+    for framework, pattern in patterns:
+        for match in pattern.finditer(text):
+            frameworks[match.group(1)] = framework
+    for child, parent, _route in re.findall(
+        r"\b([A-Za-z_][\w]*)\s*:?=\s*([A-Za-z_][\w]*)\.Group\(\s*['\"]([^'\"]+)['\"]",
+        text,
+    ):
+        if parent in frameworks:
+            frameworks[child] = frameworks[parent]
+    return frameworks
+
+
 def _go_http_method(value: str) -> str | None:
     text = value.strip()
     string_match = re.search(r"['\"]([A-Za-z]+)['\"]", text)
@@ -1172,6 +1491,50 @@ def _go_http_method(value: str) -> str | None:
     if const_match:
         return const_match.group(1).upper()
     return None
+
+
+def _ruby_scope_prefixes(text: str) -> list[tuple[int, int, str]]:
+    ranges: list[tuple[int, int, str]] = []
+    pattern = re.compile(r"^\s*(?:scope|namespace)\s+['\"]?:?([^'\"\s]+)['\"]?\s+do\b", re.MULTILINE)
+    for match in pattern.finditer(text):
+        end = _ruby_block_end(text, match.end())
+        if end is None:
+            continue
+        prefix = match.group(1).strip(":")
+        ranges.append((match.start(), end, prefix))
+    return ranges
+
+
+def _ruby_block_end(text: str, start: int) -> int | None:
+    depth = 1
+    for match in re.finditer(r"^\s*(do|end)\b", text[start:], re.MULTILINE):
+        token = match.group(1)
+        if token == "do":
+            depth += 1
+        else:
+            depth -= 1
+            if depth == 0:
+                return start + match.end()
+    return None
+
+
+def _ruby_prefix_at(ranges: list[tuple[int, int, str]], offset: int) -> str | None:
+    prefix: str | None = None
+    for start, end, value in ranges:
+        if start <= offset <= end:
+            prefix = _join_routes(prefix, value)
+    return prefix
+
+
+def _rust_axum_methods(body: str) -> list[tuple[str | None, str | None]]:
+    items: list[tuple[str | None, str | None]] = []
+    for match in re.finditer(
+        r"\b(get|post|put|delete|patch|options|head)\s*\(\s*([A-Za-z_][\w:]*)?",
+        body,
+        re.IGNORECASE,
+    ):
+        items.append((match.group(1).upper(), match.group(2)))
+    return items or [(None, None)]
 
 
 def _extract_relationships(

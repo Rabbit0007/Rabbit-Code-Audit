@@ -297,6 +297,7 @@ CREATE TABLE IF NOT EXISTS audit_findings (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     snapshot_id TEXT NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
+    cluster_key TEXT,
     title TEXT NOT NULL,
     category TEXT NOT NULL,
     severity TEXT NOT NULL CHECK(severity IN ('critical', 'high', 'medium', 'low', 'info')),
@@ -499,6 +500,7 @@ CREATE TABLE IF NOT EXISTS review_tasks (
             'blocked_no_independent_worker', 'completed', 'failed'
         )),
     created_by TEXT NOT NULL,
+    excluded_workers_json TEXT NOT NULL DEFAULT '[]',
     worker TEXT,
     blocked_reason TEXT,
     created_at TEXT NOT NULL,
@@ -529,6 +531,7 @@ VULNERABILITY_COLUMNS: dict[str, str] = {
 
 
 AUDIT_FINDING_COLUMNS: dict[str, str] = {
+    "cluster_key": "TEXT",
     "evidence_level": (
         "TEXT NOT NULL DEFAULT 'L0' "
         "CHECK(evidence_level IN ('L0', 'L1', 'L2', 'L3', 'L4', 'L5'))"
@@ -595,6 +598,7 @@ REPORT_ENRICHMENT_COLUMNS: dict[str, str] = {
 }
 
 REVIEW_TASK_COLUMNS: dict[str, str] = {
+    "excluded_workers_json": "TEXT NOT NULL DEFAULT '[]'",
     "blocked_reason": "TEXT",
     "retry_count": "INTEGER NOT NULL DEFAULT 0",
 }
@@ -726,6 +730,7 @@ def configure_product_db() -> None:
         _ensure_business_edge_relation_values(conn)
         _ensure_vulnerability_columns(conn)
         _ensure_columns(conn, "audit_findings", AUDIT_FINDING_COLUMNS)
+        _ensure_audit_finding_indexes(conn)
         _ensure_columns(conn, "business_nodes", BUSINESS_NODE_COLUMNS)
         _ensure_columns(conn, "business_edges", BUSINESS_EDGE_COLUMNS)
         _ensure_columns(conn, "code_symbols", CODE_SYMBOL_COLUMNS)
@@ -737,3 +742,12 @@ def configure_product_db() -> None:
         from cairn.server.services import sync_business_node_coverage_from_latest_conclusions
 
         sync_business_node_coverage_from_latest_conclusions(conn)
+
+
+def _ensure_audit_finding_indexes(conn) -> None:
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_audit_findings_cluster
+            ON audit_findings(project_id, snapshot_id, cluster_key, status)
+        """
+    )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 ReviewTaskStatus = Literal[
@@ -31,6 +31,7 @@ class ReviewTask(BaseModel):
     error_message: str | None = None
     retry_count: int = 0
     discovered_by: str | None = None
+    excluded_workers: list[str] = Field(default_factory=list)
 
 
 class CreateReviewTaskRequest(BaseModel):

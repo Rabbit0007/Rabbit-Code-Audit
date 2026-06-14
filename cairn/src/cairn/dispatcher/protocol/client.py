@@ -129,11 +129,36 @@ class CairnClient:
             json={"from": from_ids, "description": description, "worker": worker},
         )
 
-    def create_intent(self, project_id: str, from_ids: list[str], description: str, creator: str) -> ApiResult:
+    def create_intent(
+        self,
+        project_id: str,
+        from_ids: list[str],
+        description: str,
+        creator: str,
+        *,
+        target_kind: str | None = None,
+        target_id: str | None = None,
+        objective: str | None = None,
+        evidence_gap: str | None = None,
+    ) -> ApiResult:
+        payload: dict[str, Any] = {
+            "from": from_ids,
+            "description": description,
+            "creator": creator,
+            "worker": None,
+        }
+        if target_kind:
+            payload["target_kind"] = target_kind
+        if target_id:
+            payload["target_id"] = target_id
+        if objective:
+            payload["objective"] = objective
+        if evidence_gap:
+            payload["evidence_gap"] = evidence_gap
         return self._request_json(
             "POST",
             f"/projects/{project_id}/intents",
-            json={"from": from_ids, "description": description, "creator": creator, "worker": None},
+            json=payload,
         )
 
     def create_audit_finding(self, project_id: str, payload: dict[str, Any]) -> ApiResult:

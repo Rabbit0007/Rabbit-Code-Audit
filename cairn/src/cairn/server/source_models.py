@@ -165,6 +165,9 @@ class SourceIndexQuality(BaseModel):
     business_module_island_count: int = 0
     entrypoints_with_business_flows: int = 0
     entrypoints_with_capability_paths: int = 0
+    language_coverage: dict[str, dict[str, object]] = Field(default_factory=dict)
+    graph_compression: dict[str, object] = Field(default_factory=dict)
+    audit_readiness: dict[str, object] = Field(default_factory=dict)
     issues: list[SourceIndexQualityIssue] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
 
@@ -231,6 +234,7 @@ class AuditFinding(BaseModel):
     id: str
     project_id: str
     snapshot_id: str
+    cluster_key: str | None = None
     title: str
     category: str
     severity: Severity

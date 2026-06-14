@@ -47,6 +47,8 @@ class _FakeClient:
         self.audit_findings: list[dict] = []
         self.candidate_conclusions: list[dict] = []
         self.reviews: list[dict] = []
+        self.intents: list[dict] = []
+        self.fail_audit_finding = False
 
     def conclude(self, project_id: str, intent_id: str, worker: str, description: str) -> ApiResult:
         return ApiResult(status_code=200, data={"fact": {"id": "f001"}})
@@ -63,8 +65,36 @@ class _FakeClient:
         return ApiResult(status_code=201, data={"id": f"tool_{len(self.tool_findings)}"})
 
     def create_audit_finding(self, project_id: str, payload: dict) -> ApiResult:
+        if self.fail_audit_finding:
+            return ApiResult(status_code=422, text="missing business_node_id")
         self.audit_findings.append(payload)
         return ApiResult(status_code=201, data={"id": f"finding_{len(self.audit_findings)}"})
+
+    def create_intent(
+        self,
+        project_id: str,
+        from_ids: list[str],
+        description: str,
+        creator: str,
+        *,
+        target_kind: str | None = None,
+        target_id: str | None = None,
+        objective: str | None = None,
+        evidence_gap: str | None = None,
+    ) -> ApiResult:
+        self.intents.append(
+            {
+                "project_id": project_id,
+                "from": from_ids,
+                "description": description,
+                "creator": creator,
+                "target_kind": target_kind,
+                "target_id": target_id,
+                "objective": objective,
+                "evidence_gap": evidence_gap,
+            }
+        )
+        return ApiResult(status_code=201, data={"id": f"i_repair_{len(self.intents)}"})
 
     def conclude_audit_candidate(
         self,
@@ -280,3 +310,100 @@ def test_write_explore_result_persists_batch_findings_and_candidate_closure():
             "audit_finding_id": None,
         },
     ]
+
+
+def test_write_explore_result_filters_unsupported_fallback_candidate_conclusions():
+    client = _FakeClient()
+
+    outcome = _write_explore_result(
+        client,
+        "proj_1",
+        "i001",
+        "worker-a",
+        {
+            "description": "fallback summarized only source-backed closures",
+            "candidate_conclusions": [
+                {
+                    "candidate_id": "cand_safe",
+                    "decision": "rejected",
+                    "summary": "uses parameter binding",
+                    "evidence": "profile.php uses bind_param()",
+                },
+                {
+                    "candidate_id": "cand_guess",
+                    "decision": "rejected",
+                    "summary": "looks safe from graph",
+                    "evidence": "仅凭索引看起来有权限控制",
+                },
+            ],
+        },
+        source="explore_conclude",
+        phase_ms=10,
+        used_fallback=True,
+    )
+
+    assert outcome.status == "success"
+    assert client.candidate_conclusions == [
+        {
+            "candidate_id": "cand_safe",
+            "reviewer": "worker-a",
+            "decision": "rejected",
+            "summary": "uses parameter binding",
+            "evidence": "profile.php uses bind_param()",
+            "audit_finding_id": None,
+        }
+    ]
+
+
+def test_write_explore_result_creates_repair_intent_when_finding_write_fails():
+    client = _FakeClient()
+    client.fail_audit_finding = True
+
+    outcome = _write_explore_result(
+        client,
+        "proj_1",
+        "i001",
+        "worker-a",
+        {
+            "description": "发现了一个高危漏洞，但落库需要补齐结构化字段",
+            "findings": [
+                {
+                    "title": "upload chain RCE",
+                    "category": "file_upload",
+                    "severity": "high",
+                    "file_path": "app/upload.py",
+                    "line_start": 42,
+                    "entry_point": "POST /upload",
+                    "description": "upload reaches execution",
+                    "impact": "remote command execution",
+                    "evidence": "uploaded file is executed by worker",
+                    "reproduction_poc": _reproduction_poc(
+                        "/upload",
+                        "payload.php",
+                    ),
+                }
+            ],
+        },
+        source="explore_execute",
+        phase_ms=10,
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.error_type == "structured_output_write_failed"
+    assert len(client.audit_findings) == 0
+    assert len(client.audit_candidates) == 1
+    assert client.audit_candidates[0]["source"] == "model_write_failed"
+    assert client.audit_candidates[0]["candidate_type"] == "finding_write_failed"
+    assert client.intents == [
+        {
+            "project_id": "proj_1",
+            "from": ["f001"],
+            "description": client.intents[0]["description"],
+            "creator": "repair:worker-a",
+            "target_kind": "structured_output_write_failure",
+            "target_id": "i001",
+            "objective": "repair_structured_output",
+            "evidence_gap": "server_write_validation",
+        }
+    ]
+    assert "missing business_node_id" in client.intents[0]["description"]

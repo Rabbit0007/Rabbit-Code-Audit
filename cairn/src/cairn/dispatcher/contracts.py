@@ -755,18 +755,38 @@ def validate_reason_payload(
     if intents is not None:
         if not isinstance(intents, list):
             raise ValueError("intents must be an array")
+        normalized_intents: list[dict[str, Any]] = []
         for i, intent in enumerate(intents):
-            if not isinstance(intent, dict) or "from" not in intent or "description" not in intent:
-                raise ValueError(f"invalid intent at index {i}")
+            normalized_intents.append(_validate_reason_intent(intent, i))
         if not intents and open_intents_empty:
             raise ValueError("intents must not be empty when open_intents is empty")
-        intents = intents[:max_intents]
+        intents = normalized_intents[:max_intents]
         if not intents:
             return "noop", None
         return "intents", intents
     if open_intents_empty:
         raise ValueError("intents is required when open_intents is empty")
     return "noop", None
+
+
+def _validate_reason_intent(item: Any, index: int) -> dict[str, Any]:
+    if not isinstance(item, dict) or "from" not in item or "description" not in item:
+        raise ValueError(f"invalid intent at index {index}")
+    description = item.get("description")
+    if not isinstance(description, str) or not description.strip():
+        raise ValueError(f"intent at index {index} requires description")
+    from_ids = _string_list(item.get("from"), f"intent at index {index}.from")
+    if not from_ids:
+        raise ValueError(f"intent at index {index} requires at least one source fact")
+    intent: dict[str, Any] = {
+        "from": from_ids,
+        "description": description.strip(),
+    }
+    for field in ("target_kind", "target_id", "objective", "evidence_gap"):
+        value = _optional_string(item.get(field))
+        if value is not None:
+            intent[field] = value
+    return intent
 
 
 def validate_bootstrap_execute_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:

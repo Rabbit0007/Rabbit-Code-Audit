@@ -22,6 +22,8 @@ BusinessEdgeRelation = Literal[
     "exposes",
     "calls",
     "uses",
+    "extends",
+    "extended_by",
     "owns",
     "guards",
     "transitions_to",

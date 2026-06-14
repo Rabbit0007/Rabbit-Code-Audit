@@ -2,6 +2,7 @@ from collections import Counter
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from datetime import datetime
+import hashlib
 import json
 import re
 import yaml
@@ -465,12 +466,21 @@ def _select_audit_candidate_rows(rows, *, profile: str, focus_candidate_ids: set
     if profile == "explore":
         focused = [row for row in rows if row["id"] in focus_candidate_ids]
         focused_files = {row["file_path"] for row in focused if row["file_path"]}
+        focused_business_nodes = {
+            row["business_node_id"] for row in focused if row["business_node_id"]
+        }
         related = [
             row
             for row in rows
             if row["id"] not in focus_candidate_ids
             and row["status"] in ("candidate", "investigating")
-            and row["file_path"] in focused_files
+            and (
+                row["file_path"] in focused_files
+                or (
+                    row["business_node_id"]
+                    and row["business_node_id"] in focused_business_nodes
+                )
+            )
         ]
         if focused:
             return (_sort_candidate_rows(focused) + _sort_candidate_rows(related))[:EXPLORE_CANDIDATE_LIMIT]
@@ -637,12 +647,30 @@ def _load_code_index_audit_context(
         profile=profile,
         focus_candidate_ids=focus_candidate_ids,
     )
-    candidate_limit = 20 if profile == "explore" else 40 if profile == "reason" else 80
-    file_limit = 8 if profile == "explore" else 12 if profile == "reason" else 20
+    focused = bool(focus_candidate_ids)
+    if profile == "explore":
+        candidate_limit = 40 if focused else 20
+        file_limit = 16 if focused else 10
+    elif profile == "reason":
+        candidate_limit = 40
+        file_limit = 12
+    else:
+        candidate_limit = 80
+        file_limit = 20
     relationship_limit = 80 if profile == "explore" else 120 if profile == "reason" else 200
     priority_candidates = _sort_candidate_rows(selected)[:candidate_limit]
     paths = _ordered_candidate_paths(priority_candidates)[:file_limit]
     path_set = set(paths)
+    entrypoint_traces = _candidate_entrypoint_traces(
+        conn,
+        snapshot_id,
+        priority_candidates,
+        max_per_candidate=4 if focused else 3,
+    )
+    for trace in entrypoint_traces:
+        for path in trace.get("path_chain") or []:
+            if isinstance(path, str) and path:
+                path_set.add(path)
     if path_set:
         path_set.update(_adjacent_paths(conn, snapshot_id, path_set, limit=file_limit * 2))
     paths = [path for path in [*paths, *sorted(path_set - set(paths))] if path][:file_limit]
@@ -679,11 +707,24 @@ def _load_code_index_audit_context(
         limit=120,
     )
     relationships = _relationship_rows_for_paths(conn, snapshot_id, paths, limit=relationship_limit)
-    entrypoint_traces = _candidate_entrypoint_traces(conn, snapshot_id, priority_candidates)
     module_limit = 8 if profile == "explore" else 12 if profile == "reason" else 30
-    flow_limit = 10 if profile == "explore" else 18 if profile == "reason" else 40
-    entrypoint_summary_limit = 8 if profile == "explore" else 14 if profile == "reason" else 40
+    if profile == "explore":
+        flow_limit = 16 if focused else 10
+        entrypoint_summary_limit = 12 if focused else 8
+    elif profile == "reason":
+        flow_limit = 18
+        entrypoint_summary_limit = 14
+    else:
+        flow_limit = 40
+        entrypoint_summary_limit = 40
     module_summaries = _business_module_summaries(conn, project_id, snapshot_id, limit=module_limit)
+    compressed_business_graph = _compressed_business_graph(
+        conn,
+        project_id,
+        snapshot_id,
+        module_summaries,
+        limit=module_limit,
+    )
     business_flow_traces = _business_flow_traces(conn, snapshot_id, limit=flow_limit)
     entrypoint_summaries = _entrypoint_business_summaries(
         conn,
@@ -700,6 +741,14 @@ def _load_code_index_audit_context(
         relationships_by_path.setdefault(row["from_path"], []).append(row)
         if row["to_path"] != row["from_path"]:
             relationships_by_path.setdefault(row["to_path"], []).append(row)
+    planner_focus_packs = _planner_focus_packs(
+        conn,
+        project_id,
+        snapshot_id,
+        priority_candidates,
+        entrypoint_traces,
+        limit=8 if profile == "explore" else 12 if profile == "reason" else 20,
+    )
 
     return {
         "purpose": (
@@ -709,9 +758,12 @@ def _load_code_index_audit_context(
         ),
         "priority_model": "risk_score 只用于排序：入口可达、高影响能力、输入符号、控制/校验线索和已有结论会改变分数。",
         "focused_candidate_ids": sorted(focus_candidate_ids),
+        "compressed_business_graph": compressed_business_graph,
         "module_summaries": module_summaries,
         "entrypoint_summaries": entrypoint_summaries,
         "business_flow_traces": business_flow_traces,
+        "audit_packs": planner_focus_packs,
+        "planner_focus_packs": planner_focus_packs,
         "priority_candidates": [_candidate_context_item(row) for row in priority_candidates],
         "candidate_entrypoint_traces": entrypoint_traces,
         "entrypoint_traces": entrypoint_traces,
@@ -932,6 +984,341 @@ def _business_module_summaries(conn, project_id: str, snapshot_id: str, *, limit
             }
         )
     return summaries
+
+
+def _compressed_business_graph(
+    conn,
+    project_id: str,
+    snapshot_id: str,
+    module_summaries: list[dict],
+    *,
+    limit: int,
+) -> dict:
+    stats = conn.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM business_nodes WHERE project_id = ? AND source_snapshot_id = ?) AS node_count,
+            (SELECT COUNT(*)
+             FROM business_edges e
+             JOIN business_nodes n
+               ON n.id = e.from_node_id
+              AND n.project_id = e.project_id
+             WHERE e.project_id = ? AND n.source_snapshot_id = ?) AS edge_count,
+            (SELECT COUNT(*)
+             FROM business_nodes
+             WHERE project_id = ?
+               AND source_snapshot_id = ?
+               AND risk_level IN ('critical', 'high', 'unknown')) AS high_risk_node_count,
+            (SELECT COUNT(*)
+             FROM business_nodes
+             WHERE project_id = ?
+               AND source_snapshot_id = ?
+               AND risk_level IN ('critical', 'high', 'unknown')
+               AND review_status IN ('unreviewed', 'investigating', 'blocked')) AS open_high_risk_node_count
+        """,
+        (
+            project_id,
+            snapshot_id,
+            project_id,
+            snapshot_id,
+            project_id,
+            snapshot_id,
+            project_id,
+            snapshot_id,
+        ),
+    ).fetchone()
+    open_nodes = conn.execute(
+        """
+        SELECT id, node_type, title, description, risk_level, review_status,
+               coverage_note, risk_tags_json, evidence_json, source_snapshot_id,
+               confidence, created_by
+        FROM business_nodes
+        WHERE project_id = ?
+          AND source_snapshot_id = ?
+          AND risk_level IN ('critical', 'high', 'unknown')
+          AND review_status IN ('unreviewed', 'investigating', 'blocked')
+        ORDER BY
+            CASE risk_level WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'unknown' THEN 2 ELSE 3 END,
+            confidence DESC,
+            title
+        LIMIT ?
+        """,
+        (project_id, snapshot_id, max(8, limit)),
+    ).fetchall()
+    node_count = int(stats["node_count"] or 0)
+    module_count = len(module_summaries)
+    compressed_budget = module_count + int(stats["open_high_risk_node_count"] or 0)
+    return {
+        "node_count": node_count,
+        "edge_count": int(stats["edge_count"] or 0),
+        "module_count": module_count,
+        "high_risk_node_count": int(stats["high_risk_node_count"] or 0),
+        "open_high_risk_node_count": int(stats["open_high_risk_node_count"] or 0),
+        "compressed_node_budget": compressed_budget,
+        "compression_ratio": round(compressed_budget / max(1, node_count), 3) if node_count else 0.0,
+        "top_modules": [
+            {
+                "id": item["id"],
+                "title": item["title"],
+                "risk_level": item["risk_level"],
+                "review_status": item["review_status"],
+                "child_counts": item["child_counts"],
+                "semantic_boundary_count": len(item["semantic_boundaries"]),
+                "risk_thread_count": len(item["risk_threads"]),
+            }
+            for item in module_summaries[:limit]
+        ],
+        "open_high_risk_nodes": [_business_node_brief(row) for row in open_nodes],
+        "usage": (
+            "先读 top_modules 建立业务分区，再按 open_high_risk_nodes 和 planner_focus_packs 选择审计路径；"
+            "不要把压缩图当漏洞结论。"
+        ),
+    }
+
+
+def _planner_focus_packs(
+    conn,
+    project_id: str,
+    snapshot_id: str,
+    candidates,
+    entrypoint_traces: list[dict],
+    *,
+    limit: int,
+) -> list[dict]:
+    if not candidates:
+        return []
+    traces_by_candidate: dict[str, list[dict]] = {}
+    for trace in entrypoint_traces:
+        candidate_id = trace.get("candidate_id")
+        if isinstance(candidate_id, str):
+            traces_by_candidate.setdefault(candidate_id, []).append(trace)
+
+    clusters: dict[str, list] = {}
+    for row in candidates:
+        cluster_key = _candidate_priority(row)["cluster_key"]
+        clusters.setdefault(cluster_key, []).append(row)
+
+    business_nodes = _business_nodes_for_candidates(
+        conn,
+        project_id,
+        {row["business_node_id"] for row in candidates if row["business_node_id"]},
+    )
+    packs: list[dict] = []
+    for cluster_key, rows in _select_planner_pack_clusters(clusters, limit=limit):
+        sorted_rows = _sort_candidate_rows(rows)
+        candidate_ids = {row["id"] for row in sorted_rows}
+        traces = [
+            trace
+            for candidate_id in candidate_ids
+            for trace in traces_by_candidate.get(candidate_id, [])
+        ][:8]
+        source_paths = _ordered_unique(
+            [
+                *[row["file_path"] for row in sorted_rows if row["file_path"]],
+                *[
+                    path
+                    for trace in traces
+                    for path in (trace.get("path_chain") or [])
+                    if isinstance(path, str)
+                ],
+            ]
+        )[:18]
+        capabilities = _pack_boundary_capabilities(conn, snapshot_id, source_paths)
+        data_objects = _pack_data_objects(conn, snapshot_id, source_paths)
+        node_ids = [row["business_node_id"] for row in sorted_rows if row["business_node_id"]]
+        pack_nodes = [business_nodes[node_id] for node_id in _ordered_unique(node_ids) if node_id in business_nodes]
+        ordered_candidate_ids = [row["id"] for row in sorted_rows[:8]]
+        capability_family = _candidate_pack_family(sorted_rows)
+        packs.append(
+            {
+                "pack_id": _stable_audit_pack_id(snapshot_id, cluster_key, ordered_candidate_ids),
+                "pack_kind": _candidate_pack_kind(sorted_rows),
+                "capability_family": capability_family,
+                "cluster_key": cluster_key,
+                "objective": _audit_pack_objective(capability_family, sorted_rows),
+                "risk_score": max(_candidate_priority(row)["score"] for row in sorted_rows),
+                "priority_reasons": _ordered_unique(
+                    [
+                        reason
+                        for row in sorted_rows
+                        for reason in _candidate_priority(row)["reasons"]
+                    ]
+                )[:8],
+                "candidate_ids": ordered_candidate_ids,
+                "candidates": [_candidate_context_item(row) for row in sorted_rows[:6]],
+                "source_paths": source_paths,
+                "entrypoint_traces": traces,
+                "business_nodes": pack_nodes,
+                "semantic_boundaries": [_capability_with_path_context_item(row) for row in capabilities[:10]],
+                "data_objects": [_symbol_with_path_context_item(row) for row in data_objects[:10]],
+                "reading_order": _planner_reading_order(sorted_rows, traces, source_paths),
+                "audit_focus": [
+                    "确认入口是否外部可达，以及认证、角色、对象边界在哪里执行。",
+                    "沿 handler/service/model/DAO 链读取源码，核对状态变化、敏感资产和外部系统调用。",
+                    "只把索引用作导航；漏洞类型、可利用性和影响必须由源码证据闭环。",
+                ],
+            }
+        )
+    return packs
+
+
+def _select_planner_pack_clusters(clusters: dict[str, list], *, limit: int) -> list[tuple[str, list]]:
+    ranked = sorted(
+        clusters.items(),
+        key=lambda item: (
+            -max(_candidate_priority(row)["score"] for row in item[1]),
+            item[0],
+        ),
+    )
+    buckets: dict[str, list[tuple[str, list]]] = {}
+    family_order: list[str] = []
+    for cluster_key, rows in ranked:
+        family = _candidate_pack_family(rows)
+        if family not in buckets:
+            buckets[family] = []
+            family_order.append(family)
+        buckets[family].append((cluster_key, rows))
+
+    selected: list[tuple[str, list]] = []
+    while len(selected) < limit:
+        progressed = False
+        for family in family_order:
+            bucket = buckets.get(family) or []
+            if not bucket:
+                continue
+            selected.append(bucket.pop(0))
+            progressed = True
+            if len(selected) >= limit:
+                break
+        if not progressed:
+            break
+    return selected
+
+
+def _stable_audit_pack_id(snapshot_id: str, cluster_key: str, candidate_ids: list[str]) -> str:
+    seed = "\0".join([snapshot_id, cluster_key, *candidate_ids])
+    return f"pack_{hashlib.sha1(seed.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _candidate_pack_kind(rows: list) -> str:
+    types = {row["candidate_type"] for row in rows}
+    if "capability_chain" in types:
+        return "capability_family"
+    if "data_flow" in types:
+        return "data_flow"
+    if types:
+        return sorted(types)[0]
+    return "audit_candidate"
+
+
+def _candidate_pack_family(rows: list) -> str:
+    capability_rows = [row for row in rows if row["candidate_type"] == "capability_chain"]
+    if capability_rows:
+        return _candidate_title_family(capability_rows[0]["title"]) or "capability_chain"
+    data_flow_rows = [row for row in rows if row["candidate_type"] == "data_flow"]
+    if data_flow_rows:
+        return _candidate_title_family(data_flow_rows[0]["title"]) or "data_flow"
+    if rows:
+        return rows[0]["candidate_type"] or "audit_candidate"
+    return "audit_candidate"
+
+
+def _candidate_title_family(title: str | None) -> str | None:
+    if not title:
+        return None
+    text = title.strip()
+    for prefix in ("审计能力链:", "审计数据流: 外部输入到"):
+        if text.startswith(prefix):
+            rest = text[len(prefix) :].strip()
+            if not rest:
+                return None
+            return rest.split()[0]
+    return None
+
+
+def _audit_pack_objective(capability_family: str, rows: list) -> str:
+    candidate_ids = ", ".join(row["id"] for row in rows[:4])
+    return (
+        f"围绕 {capability_family} 阅读源码闭环候选 {candidate_ids}："
+        "确认入口可达性、权限/对象边界、关键数据流、能力调用前后的校验与真实影响；"
+        "索引只作为导航，不直接决定漏洞类型。"
+    )
+
+
+def _business_nodes_for_candidates(conn, project_id: str, node_ids: set[str]) -> dict[str, dict]:
+    if not node_ids:
+        return {}
+    usable_ids = sorted(node_ids)[:120]
+    rows = conn.execute(
+        f"""
+        SELECT id, node_type, title, description, risk_level, review_status,
+               coverage_note, risk_tags_json, evidence_json, source_snapshot_id,
+               confidence, created_by
+        FROM business_nodes
+        WHERE project_id = ?
+          AND id IN ({','.join('?' for _ in usable_ids)})
+        """,
+        (project_id, *usable_ids),
+    ).fetchall()
+    return {row["id"]: _business_node_brief(row) for row in rows}
+
+
+def _pack_boundary_capabilities(conn, snapshot_id: str, paths: list[str]) -> list:
+    if not paths:
+        return []
+    return _index_rows_for_paths(
+        conn,
+        snapshot_id,
+        "code_capabilities",
+        paths[:30],
+        columns="id, path, symbol, category, title, line_start, evidence, risk_level, risk_tags_json, confidence, source",
+        where_extra=(
+            "AND (risk_level IN ('critical', 'high') OR category IN ("
+            "'auth_guard', 'object_scope_guard', 'object_id_lookup', 'file_upload', "
+            "'file_write', 'file_read', 'archive_extract', 'process_execution', "
+            "'task_execution', 'credential_access', 'external_system', 'websocket_boundary'))"
+        ),
+        order_by=(
+            "CASE risk_level WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, "
+            "path, COALESCE(line_start, 0), category"
+        ),
+        limit=80,
+    )
+
+
+def _pack_data_objects(conn, snapshot_id: str, paths: list[str]) -> list:
+    if not paths:
+        return []
+    return _index_rows_for_paths(
+        conn,
+        snapshot_id,
+        "code_symbols",
+        paths[:30],
+        columns="id, path, kind, name, container, signature, line_start, line_end, confidence, source",
+        where_extra="AND kind = 'data_object'",
+        order_by="path, COALESCE(line_start, 0), name",
+        limit=80,
+    )
+
+
+def _planner_reading_order(candidates, traces: list[dict], source_paths: list[str]) -> list[str]:
+    paths = []
+    for trace in traces:
+        paths.extend(path for path in trace.get("path_chain") or [] if isinstance(path, str))
+    paths.extend(row["file_path"] for row in candidates if row["file_path"])
+    paths.extend(source_paths)
+    return _ordered_unique(paths)[:12]
+
+
+def _ordered_unique(values) -> list:
+    result: list = []
+    seen: set = set()
+    for value in values:
+        if value is None or value == "" or value in seen:
+            continue
+        result.append(value)
+        seen.add(value)
+    return result
 
 
 def _business_module_score(module, children: list) -> float:
@@ -1620,7 +2007,7 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
 
     audit_findings = conn.execute(
         """
-        SELECT id, snapshot_id, title, category, severity, status, cwe, file_path,
+        SELECT id, snapshot_id, cluster_key, title, category, severity, status, cwe, file_path,
                line_start, line_end, symbol, entry_point, business_node_id,
                evidence_level, description, impact, evidence, proof_packets_json,
                reproduction_poc_json, remediation,
@@ -1815,7 +2202,14 @@ def _focus_candidate_ids(intents, intent_id: str | None) -> set[str]:
     for intent in intents:
         if intent["id"] != intent_id:
             continue
-        return {match.group(0).lower() for match in CANDIDATE_ID_RE.finditer(intent["description"] or "")}
+        values = [intent["description"] or ""]
+        if intent["target_kind"] == "audit_candidate" and intent["target_id"]:
+            values.append(intent["target_id"])
+        return {
+            match.group(0).lower()
+            for value in values
+            for match in CANDIDATE_ID_RE.finditer(value)
+        }
     return set()
 
 

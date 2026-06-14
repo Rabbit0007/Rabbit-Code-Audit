@@ -953,7 +953,14 @@ class DispatcherLoop:
         if not task_id or not finding_id:
             return False
         discovered_by = str(task.get("discovered_by") or "").strip()
-        excluded_workers = {discovered_by} if discovered_by else set()
+        raw_excluded_workers = task.get("excluded_workers")
+        excluded_workers = {
+            str(worker).strip()
+            for worker in raw_excluded_workers
+            if isinstance(worker, str) and str(worker).strip()
+        } if isinstance(raw_excluded_workers, list) else set()
+        if discovered_by:
+            excluded_workers.add(discovered_by)
         selection = self._select_worker(project.project.id, "review", excluded_workers=excluded_workers)
         worker = selection.worker
         if worker is None:

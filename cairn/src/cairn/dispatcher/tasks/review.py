@@ -191,8 +191,7 @@ def run_review_task(
                 preview(result.stdout),
                 preview(result.stderr),
             )
-            _fail_task(client, task_id, worker.name, detail)
-            return task_outcome("failed", error_type="parse_failed", error_detail=detail, result=result)
+            return _fail_parse_review_task(client, task_id, worker.name, detail, result)
         if kind == "rejected":
             _fail_task(client, task_id, worker.name, "model rejected review task")
             return task_outcome("rejected", error_type="model_rejected", result=result)
@@ -246,6 +245,17 @@ def _single_review_decision(data: dict | None, finding_id: str) -> str:
     if data.get("findings") or data.get("finding"):
         raise ValueError("review task must not return findings")
     return decision
+
+
+def _fail_parse_review_task(
+    client: CairnClient,
+    task_id: str,
+    worker_name: str,
+    detail: str,
+    result,
+) -> TaskOutcome:
+    _fail_task(client, task_id, worker_name, detail)
+    return task_outcome("failed", error_type="parse_failed", error_detail=detail, result=result)
 
 
 def _fail_task(client: CairnClient, task_id: str, worker: str, error_message: str) -> None:

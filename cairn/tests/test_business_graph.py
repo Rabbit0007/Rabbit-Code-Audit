@@ -139,6 +139,45 @@ def test_business_graph_crud_and_export(temp_db):
     assert graph_after_delete["edges"] == []
 
 
+def test_business_graph_accepts_index_generated_inheritance_relations(temp_db):
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    base = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "feature",
+            "title": "Base serializer",
+            "created_by": "indexer",
+        },
+    ).json()
+    child = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "feature",
+            "title": "Account serializer",
+            "created_by": "indexer",
+        },
+    ).json()
+
+    for relation in ("extends", "extended_by"):
+        response = client.post(
+            f"/api/projects/{project_id}/business-graph/edges",
+            json={
+                "from_node_id": child["id"],
+                "to_node_id": base["id"],
+                "relation": relation,
+                "description": f"index generated {relation} edge",
+                "created_by": "indexer",
+            },
+        )
+        assert response.status_code == 201
+
+    graph = client.get(f"/api/projects/{project_id}/business-graph")
+    assert graph.status_code == 200
+    assert {edge["relation"] for edge in graph.json()["edges"]} == {"extends", "extended_by"}
+
+
 def test_business_edge_requires_nodes_from_same_project(temp_db):
     client = _client(temp_db)
     project_a = _create_project(client)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -116,21 +117,42 @@ def create_audit_finding(project_id: str, body: CreateAuditFindingRequest):
             body = body.model_copy(update={"business_node_id": inferred_business_node_id})
         _validate_audit_finding_quality(conn, project_id, body)
         evidence_level = _infer_evidence_level(body)
+        cluster_key = audit_finding_cluster_key(body)
+        duplicate = _find_duplicate_audit_finding(conn, project_id, body.snapshot_id, cluster_key)
+        if duplicate is not None:
+            row = _merge_duplicate_audit_finding(
+                conn,
+                duplicate,
+                body,
+                initial_status=initial_status,
+                evidence_level=evidence_level,
+                now=created_at,
+            )
+            if row["status"] == "pending_review":
+                _ensure_review_task(
+                    conn,
+                    project_id,
+                    row["id"],
+                    row["discovered_by"],
+                    excluded_workers=[body.discovered_by],
+                )
+            return _audit_finding_from_row(row)
         conn.execute(
             """
             INSERT INTO audit_findings (
-                id, project_id, snapshot_id, title, category, severity, status,
+                id, project_id, snapshot_id, cluster_key, title, category, severity, status,
                 evidence_level, cwe, file_path, line_start, line_end, symbol, entry_point,
                 business_node_id, description, impact, evidence,
                 proof_packets_json, reproduction_poc_json, remediation,
                 discovered_by, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 finding_id,
                 project_id,
                 body.snapshot_id,
+                cluster_key,
                 body.title,
                 body.category,
                 body.severity,
@@ -154,7 +176,13 @@ def create_audit_finding(project_id: str, body: CreateAuditFindingRequest):
             ),
         )
         if initial_status == "pending_review":
-            _ensure_review_task(conn, project_id, finding_id, body.discovered_by)
+            _ensure_review_task(
+                conn,
+                project_id,
+                finding_id,
+                body.discovered_by,
+                excluded_workers=[body.discovered_by],
+            )
         row = conn.execute("SELECT * FROM audit_findings WHERE id = ?", (finding_id,)).fetchone()
     assert row is not None
     return _audit_finding_from_row(row)
@@ -628,6 +656,173 @@ def _decode_json_dict(raw: str | None) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def audit_finding_cluster_key(body: CreateAuditFindingRequest) -> str:
+    route = _entry_route_key(body.entry_point or "") or "unknown_entry"
+    cwe = _normalize_cluster_text(body.cwe)
+    category = _normalize_cluster_text(body.category)
+    family = cwe or category or "unknown_category"
+    root_locator = _normalize_cluster_text(body.symbol)
+    if not root_locator and body.line_start:
+        root_locator = f"line_bucket:{body.line_start // 10}"
+    if not root_locator:
+        root_locator = route
+    parts = [
+        family,
+        _normalize_path_for_cluster(body.file_path),
+        root_locator,
+        _normalize_cluster_text(body.business_node_id) or "unknown_business_node",
+    ]
+    return hashlib.sha1("\0".join(parts).encode("utf-8")).hexdigest()[:20]
+
+
+def _find_duplicate_audit_finding(conn, project_id: str, snapshot_id: str, cluster_key: str):
+    return conn.execute(
+        """
+        SELECT *
+        FROM audit_findings
+        WHERE project_id = ?
+          AND snapshot_id = ?
+          AND cluster_key = ?
+          AND status != 'rejected'
+        ORDER BY
+          CASE status
+              WHEN 'confirmed' THEN 0
+              WHEN 'pending_review' THEN 1
+              WHEN 'needs_more_evidence' THEN 2
+              WHEN 'candidate' THEN 3
+              WHEN 'investigating' THEN 4
+              ELSE 5
+          END,
+          created_at,
+          id
+        LIMIT 1
+        """,
+        (project_id, snapshot_id, cluster_key),
+    ).fetchone()
+
+
+def _merge_duplicate_audit_finding(
+    conn,
+    existing,
+    body: CreateAuditFindingRequest,
+    *,
+    initial_status: str,
+    evidence_level: str,
+    now: str,
+):
+    merged_status = _merged_finding_status(existing["status"], initial_status)
+    merged_severity = _max_severity(existing["severity"], body.severity)
+    merged_evidence_level = _max_evidence_level(existing["evidence_level"], evidence_level)
+    current_proof_packets = _decode_json_list(existing["proof_packets_json"])
+    current_reproduction_poc = _decode_json_dict(existing["reproduction_poc_json"])
+    proof_packets = current_proof_packets or body.proof_packets
+    reproduction_poc = current_reproduction_poc or body.reproduction_poc
+    use_new_core = _evidence_level_rank(evidence_level) > _evidence_level_rank(existing["evidence_level"])
+    conn.execute(
+        """
+        UPDATE audit_findings
+        SET title = CASE WHEN ? THEN ? ELSE title END,
+            category = CASE WHEN ? THEN ? ELSE category END,
+            severity = ?,
+            status = ?,
+            evidence_level = ?,
+            cwe = COALESCE(cwe, ?),
+            file_path = COALESCE(file_path, ?),
+            line_start = COALESCE(line_start, ?),
+            line_end = COALESCE(line_end, ?),
+            symbol = COALESCE(symbol, ?),
+            entry_point = COALESCE(entry_point, ?),
+            business_node_id = COALESCE(business_node_id, ?),
+            description = CASE WHEN ? THEN ? ELSE description END,
+            impact = COALESCE(impact, ?),
+            evidence = CASE WHEN evidence IS NULL OR TRIM(evidence) = '' OR ? THEN ? ELSE evidence END,
+            proof_packets_json = ?,
+            reproduction_poc_json = ?,
+            remediation = COALESCE(remediation, ?),
+            reviewed_by = CASE WHEN ? = 'pending_review' AND status = 'needs_more_evidence' THEN NULL ELSE reviewed_by END,
+            reviewed_at = CASE WHEN ? = 'pending_review' AND status = 'needs_more_evidence' THEN NULL ELSE reviewed_at END
+        WHERE id = ?
+        """,
+        (
+            use_new_core,
+            body.title,
+            use_new_core,
+            body.category,
+            merged_severity,
+            merged_status,
+            merged_evidence_level,
+            body.cwe,
+            body.file_path,
+            body.line_start,
+            body.line_end,
+            body.symbol,
+            body.entry_point,
+            body.business_node_id,
+            use_new_core,
+            body.description,
+            body.impact,
+            use_new_core,
+            body.evidence,
+            json.dumps(proof_packets, ensure_ascii=False),
+            json.dumps(reproduction_poc, ensure_ascii=False),
+            body.remediation,
+            merged_status,
+            merged_status,
+            existing["id"],
+        ),
+    )
+    row = conn.execute("SELECT * FROM audit_findings WHERE id = ?", (existing["id"],)).fetchone()
+    assert row is not None
+    return row
+
+
+def _merged_finding_status(existing: str, incoming: str) -> str:
+    if existing == "confirmed":
+        return "confirmed"
+    if incoming == "pending_review":
+        return "pending_review"
+    return existing
+
+
+def _max_severity(left: str, right: str) -> str:
+    return left if _severity_rank(left) >= _severity_rank(right) else right
+
+
+def _severity_rank(value: str | None) -> int:
+    return {
+        "info": 0,
+        "low": 1,
+        "medium": 2,
+        "high": 3,
+        "critical": 4,
+    }.get(value or "", -1)
+
+
+def _max_evidence_level(left: str, right: str) -> str:
+    return left if _evidence_level_rank(left) >= _evidence_level_rank(right) else right
+
+
+def _evidence_level_rank(value: str | None) -> int:
+    if not value or not value.startswith("L"):
+        return -1
+    try:
+        return int(value[1:])
+    except ValueError:
+        return -1
+
+
+def _normalize_path_for_cluster(value: str | None) -> str:
+    text = (value or "").strip().replace("\\", "/").strip("/")
+    return text.lower() or "unknown_path"
+
+
+def _normalize_cluster_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = " ".join(value.strip().lower().replace("-", "_").split())
+    return text or None
+
+
 _PROOF_PLACEHOLDER_RE = re.compile(
     r"(\.\.\.|未记录|待补充|需复测|placeholder|todo|example\.com|target\.local|"
     r"<\s*(?:target|host|hostname|payload|url|path|port|项目事实[^>]*|[^>]{0,20}待补充[^>]*)\s*>)",
@@ -787,34 +982,83 @@ def _validate_business_node(conn, project_id: str, node_id: str) -> None:
         raise HTTPException(404, "Business node not found")
 
 
-def _ensure_review_task(conn, project_id: str, finding_id: str, discovered_by: str) -> None:
+def _ensure_review_task(
+    conn,
+    project_id: str,
+    finding_id: str,
+    discovered_by: str,
+    *,
+    excluded_workers: list[str] | None = None,
+) -> None:
+    excluded = _normalized_worker_list([discovered_by, *(excluded_workers or [])])
+    finding = conn.execute(
+        "SELECT status FROM audit_findings WHERE id = ? AND project_id = ?",
+        (finding_id, project_id),
+    ).fetchone()
+    completed_filter = "" if finding is not None and finding["status"] == "pending_review" else ", 'completed'"
     existing = conn.execute(
-        """
-        SELECT id
+        f"""
+        SELECT id, excluded_workers_json
         FROM review_tasks
         WHERE project_id = ?
           AND finding_id = ?
           AND status IN (
               'pending', 'running', 'waiting_for_reviewer',
-              'blocked_no_independent_worker', 'completed'
+              'blocked_no_independent_worker'{completed_filter}
           )
         LIMIT 1
         """,
         (project_id, finding_id),
     ).fetchone()
     if existing is not None:
+        merged_excluded = _normalized_worker_list(
+            [
+                *_decode_json_list(existing["excluded_workers_json"]),
+                *excluded,
+            ]
+        )
+        conn.execute(
+            """
+            UPDATE review_tasks
+            SET excluded_workers_json = ?
+            WHERE id = ?
+            """,
+            (json.dumps(merged_excluded, ensure_ascii=False), existing["id"]),
+        )
         return
     now = utcnow()
     task_id = f"rev_{uuid.uuid4().hex[:16]}"
     conn.execute(
         """
         INSERT INTO review_tasks (
-            id, project_id, finding_id, status, created_by, created_at
+            id, project_id, finding_id, status, created_by,
+            excluded_workers_json, created_at
         )
-        VALUES (?, ?, ?, 'pending', ?, ?)
+        VALUES (?, ?, ?, 'pending', ?, ?, ?)
         """,
-        (task_id, project_id, finding_id, f"finding:{discovered_by}", now),
+        (
+            task_id,
+            project_id,
+            finding_id,
+            f"finding:{discovered_by}",
+            json.dumps(excluded, ensure_ascii=False),
+            now,
+        ),
     )
+
+
+def _normalized_worker_list(values: list[object]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        text = value.strip()
+        if not text or text in seen:
+            continue
+        result.append(text)
+        seen.add(text)
+    return result
 
 
 def _complete_related_review_tasks(

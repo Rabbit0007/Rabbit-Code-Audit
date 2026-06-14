@@ -13,7 +13,7 @@ If Goal has been satisfied:
 
 If new investigation directions are needed:
 ```json
-{"accepted": true, "data": {"intents": [{"from": ["f001"], "description": "..."}]}}
+{"accepted": true, "data": {"intents": [{"from": ["f001"], "target_kind": "audit_candidate", "target_id": "cand_...", "objective": "confirm_or_reject", "evidence_gap": "source_evidence", "description": "..."}]}}
 ```
 
 If existing open intents already cover the valuable directions:
@@ -31,6 +31,7 @@ If existing open intents already cover the valuable directions:
 - If a high/critical/unknown business node has no concrete source target in the current scoped graph, propose a narrow intent to locate its source target first instead of asking for a final business-node conclusion.
 - Use `audit_candidates` as the audit object queue. If `audit_candidates.coverage.open_required`, `audit_candidates.coverage.invalid_conclusions`, or `audit_candidates.coverage.pending_high_findings` is non-empty, do not complete the project.
 - When open audit candidates exist, propose focused intents that name candidate IDs and small batches of related entry points, files, data flows, or tool findings. The intent must ask the worker to produce either structured `findings` or `candidate_conclusions`.
+- For each new intent, fill `target_kind`, `target_id`, `objective`, and `evidence_gap` when the graph exposes a concrete target. Use `target_kind: "audit_candidate"` for candidate batches, `target_kind: "business_node"` for business graph coverage, and keep `target_id` to the concrete candidate/business node id or a comma-separated small batch of related ids.
 - Treat `audit_candidates.items` from `source=index` as the coverage queue created by deterministic source indexing. `entrypoint`, `web_entrypoint`, and `data_flow` candidates are not vulnerability claims, but every critical/high/unknown open candidate must be closed by evidence-backed investigation before completion.
 - Prefer candidate batches that share the same file, route, source variable, sink family, business node, or framework layer. Keep each batch small enough that the explore worker can read the relevant source and close every named candidate in one run.
 - If many similar candidates exist, do not create one broad "audit all remaining SQL injection" intent. Create concrete batches that name candidate IDs and exact files or entry points.

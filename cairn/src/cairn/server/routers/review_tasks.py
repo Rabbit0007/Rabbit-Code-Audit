@@ -15,7 +15,11 @@ from cairn.server.review_models import (
     ReviewTaskAvailabilityRequest,
     ReviewTaskWorkerRequest,
 )
-from cairn.server.routers.findings import _apply_audit_finding_review, _ensure_review_task
+from cairn.server.routers.findings import (
+    _apply_audit_finding_review,
+    _ensure_review_task,
+    _normalized_worker_list,
+)
 from cairn.server.routers.report_enrichments import _source_snippet
 from cairn.server.services import (
     check_project_active,
@@ -66,7 +70,13 @@ def create_review_task(project_id: str, body: CreateReviewTaskRequest):
         check_project_active(conn, project_id)
         expire_review_tasks(conn, project_id)
         finding = _reviewable_finding_or_409(conn, project_id, body.finding_id)
-        _ensure_review_task(conn, project_id, body.finding_id, finding["discovered_by"])
+        _ensure_review_task(
+            conn,
+            project_id,
+            body.finding_id,
+            finding["discovered_by"],
+            excluded_workers=[finding["discovered_by"]],
+        )
         row = conn.execute(
             """
             SELECT *
@@ -195,7 +205,7 @@ def claim_review_task(task_id: str, body: ReviewTaskWorkerRequest):
         if row["status"] not in ("pending", "waiting_for_reviewer", "blocked_no_independent_worker"):
             raise HTTPException(409, f"Review task is {row['status']}")
         finding = _reviewable_finding_or_409(conn, row["project_id"], row["finding_id"])
-        if body.worker == finding["discovered_by"]:
+        if body.worker in _review_task_excluded_workers(row, finding["discovered_by"]):
             raise HTTPException(409, "Independent review must be performed by a different worker")
         conn.execute(
             """
@@ -540,7 +550,13 @@ def _ensure_pending_review_tasks(conn, project_id: str | None = None) -> None:
         params,
     ).fetchall()
     for row in rows:
-        _ensure_review_task(conn, row["project_id"], row["id"], row["discovered_by"])
+        _ensure_review_task(
+            conn,
+            row["project_id"],
+            row["id"],
+            row["discovered_by"],
+            excluded_workers=[row["discovered_by"]],
+        )
 
 
 def _reviewable_finding_or_409(conn, project_id: str, finding_id: str):
@@ -573,7 +589,11 @@ def _running_task_for_worker(conn, task_id: str, worker: str):
 
 
 def _task_from_row(row) -> ReviewTask:
-    return ReviewTask(**dict(row))
+    data = dict(row)
+    excluded_workers = _review_task_excluded_workers(data, data.get("discovered_by"))
+    data.pop("excluded_workers_json", None)
+    data["excluded_workers"] = excluded_workers
+    return ReviewTask(**data)
 
 
 def _queue_task_from_row(row) -> dict:
@@ -583,6 +603,14 @@ def _queue_task_from_row(row) -> dict:
     data["finding_severity"] = row["finding_severity"]
     data["discovered_by"] = row["discovered_by"]
     return data
+
+
+def _review_task_excluded_workers(row, discovered_by: str | None = None) -> list[str]:
+    data = dict(row)
+    excluded = _decode_json_list(data.get("excluded_workers_json"))
+    if discovered_by:
+        excluded.append(discovered_by)
+    return _normalized_worker_list(excluded)
 
 
 def _finding_packet(row) -> dict[str, object]:

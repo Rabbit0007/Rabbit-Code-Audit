@@ -313,7 +313,16 @@ def _create_reason_intents(
 ) -> TaskOutcome:
     created = 0
     for intent_data in intents:
-        response = client.create_intent(project_id, intent_data["from"], intent_data["description"], worker_name)
+        response = client.create_intent(
+            project_id,
+            intent_data["from"],
+            intent_data["description"],
+            worker_name,
+            target_kind=intent_data.get("target_kind"),
+            target_id=intent_data.get("target_id"),
+            objective=intent_data.get("objective"),
+            evidence_gap=intent_data.get("evidence_gap"),
+        )
         if response.status_code == 403:
             LOG.info("project became inactive during reason intent create project=%s worker=%s created=%s", project_id, worker_name, created)
             return task_outcome("success")
@@ -372,6 +381,18 @@ def _fallback_intents_from_graph(export_yaml: str, allowed_fact_ids: list[str], 
     from_facts = [allowed_fact_ids[-1]] if allowed_fact_ids else ["origin"]
     intents: list[dict] = []
 
+    audit_context = _nested_dict(graph, "code_index", "audit_context")
+    audit_packs = (
+        _item_list(audit_context.get("audit_packs"))
+        or _item_list(audit_context.get("planner_focus_packs"))
+    )
+    for pack in audit_packs[:max_intents]:
+        intent = _fallback_intent_from_audit_pack(pack, from_facts)
+        if intent is not None:
+            intents.append(intent)
+    if intents:
+        return intents[:max_intents]
+
     audit_coverage = _nested_dict(graph, "audit_candidates", "coverage")
     business_coverage = _nested_dict(graph, "business_graph", "coverage")
     business_items = (
@@ -386,6 +407,10 @@ def _fallback_intents_from_graph(export_yaml: str, allowed_fact_ids: list[str], 
         intents.append(
             {
                 "from": from_facts,
+                "target_kind": "business_node",
+                "target_id": ",".join(node_ids),
+                "objective": "cover_business_node",
+                "evidence_gap": "source_chain",
                 "description": (
                     "补齐高/未知风险业务节点的源码审计结论。"
                     f" business_node_ids: {', '.join(node_ids)}。"
@@ -411,6 +436,10 @@ def _fallback_intents_from_graph(export_yaml: str, allowed_fact_ids: list[str], 
         intents.append(
             {
                 "from": from_facts,
+                "target_kind": "audit_candidate",
+                "target_id": ",".join(candidate_ids),
+                "objective": "confirm_or_reject",
+                "evidence_gap": "source_evidence",
                 "description": (
                     "闭环仍需证据的审计候选项。"
                     f" candidate_ids: {', '.join(candidate_ids)}。"
@@ -421,6 +450,39 @@ def _fallback_intents_from_graph(export_yaml: str, allowed_fact_ids: list[str], 
             }
         )
     return intents[:max_intents]
+
+
+def _fallback_intent_from_audit_pack(pack: dict, from_facts: list[str]) -> dict | None:
+    candidate_ids = _string_list(pack.get("candidate_ids"))[:8]
+    reading_order = _string_list(pack.get("reading_order"))[:12]
+    source_paths = _string_list(pack.get("source_paths"))[:12]
+    pack_id = str(pack.get("pack_id") or pack.get("cluster_key") or "").strip()
+    if not pack_id and candidate_ids:
+        pack_id = ",".join(candidate_ids)
+    if not pack_id:
+        return None
+    capability_family = str(pack.get("capability_family") or pack.get("pack_kind") or "audit_pack").strip()
+    objective = str(pack.get("objective") or "").strip()
+    if not objective:
+        objective = "按审计阅读包闭环候选项，确认或排除真实源码风险。"
+    read_targets = reading_order or source_paths
+    return {
+        "from": from_facts,
+        "target_kind": "audit_pack",
+        "target_id": pack_id,
+        "objective": "close_audit_pack",
+        "evidence_gap": "source_evidence_chain",
+        "description": (
+            "按 audit_pack 闭环源码审计包。"
+            f" pack_id: {pack_id}。"
+            f" capability_family: {capability_family}。"
+            f" candidate_ids: {', '.join(candidate_ids) if candidate_ids else '未指定'}。"
+            f" reading_order: {', '.join(read_targets) if read_targets else '未指定'}。"
+            f" 目标: {objective}"
+            " 先按 reading_order 阅读源码实现链，再核对入口可达性、认证/权限、对象边界、数据流、能力调用前后校验和真实影响。"
+            " 索引只用于导航，不得把 pack 或能力族名称当作漏洞类型结论；请读取源码后输出 findings 或 candidate_conclusions。"
+        ),
+    }
 
 
 def _nested_dict(root: dict, *keys: str) -> dict:
@@ -437,6 +499,17 @@ def _item_list(value) -> list[dict]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, dict)]
+
+
+def _string_list(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        text = str(item).strip() if item is not None else ""
+        if text:
+            result.append(text)
+    return result
 
 
 def _ids(items: list[dict], fallback_prefix: str) -> list[str]:

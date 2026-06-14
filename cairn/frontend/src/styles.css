@@ -3273,7 +3273,7 @@ select:focus {
   max-height: calc(10 * 62px);
   overflow-x: visible;
   overflow-y: auto;
-  overscroll-behavior: contain;
+  overscroll-behavior-y: auto;
 }
 
 .vuln-table-item {

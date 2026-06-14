@@ -225,6 +225,9 @@ business_graph:
 
     assert len(intents) == 1
     assert intents[0]["from"] == ["f001"]
+    assert intents[0]["target_kind"] == "business_node"
+    assert intents[0]["target_id"] == "biz_1"
+    assert intents[0]["objective"] == "cover_business_node"
     assert "app/user.js" in intents[0]["description"]
     assert "biz_1" in intents[0]["description"]
 
@@ -254,10 +257,54 @@ business_graph:
     )
 
     assert len(intents) == 1
+    assert intents[0]["target_kind"] == "audit_candidate"
+    assert intents[0]["target_id"] == "cand_capability"
+    assert intents[0]["objective"] == "confirm_or_reject"
     assert "cand_capability" in intents[0]["description"]
     assert "cand_generic" not in intents[0]["description"]
     assert "不得仅确认路由" in intents[0]["description"]
     assert "apps/ops/api/playbook.py" in intents[0]["description"]
+
+
+def test_reason_parse_fallback_prefers_audit_packs():
+    intents = _fallback_intents_from_graph(
+        """
+code_index:
+  audit_context:
+    audit_packs:
+      - pack_id: pack_upload_1
+        pack_kind: capability_family
+        capability_family: 文件上传入口/接收能力
+        objective: 阅读上传链路并闭环候选。
+        candidate_ids:
+          - cand_upload
+        reading_order:
+          - apps/ops/api/upload.py
+          - apps/ops/services/storage.py
+audit_candidates:
+  coverage:
+    high_risk_unresolved:
+      - id: cand_generic
+        title: generic route
+        file_path: urls.py
+business_graph:
+  coverage:
+    high_or_unknown_without_conclusion:
+      - id: biz_1
+        title: upload module
+""",
+        ["origin", "f001"],
+        max_intents=2,
+    )
+
+    assert len(intents) == 1
+    assert intents[0]["target_kind"] == "audit_pack"
+    assert intents[0]["target_id"] == "pack_upload_1"
+    assert intents[0]["objective"] == "close_audit_pack"
+    assert "cand_upload" in intents[0]["description"]
+    assert "apps/ops/api/upload.py" in intents[0]["description"]
+    assert "cand_generic" not in intents[0]["description"]
+    assert "biz_1" not in intents[0]["description"]
 
 
 def test_report_rate_limit_cooldown_blocks_only_that_task_type():
@@ -631,6 +678,28 @@ def test_review_task_dispatch_excludes_discoverer_and_uses_review_worker():
     running = list(loop.review_futures.values())[0]
     assert running.task_type == "review"
     assert running.intent_id == "rev_1"
+
+
+def test_review_task_dispatch_excludes_all_recorded_discoverers():
+    loop = _review_dispatch_loop(
+        [
+            _worker("worker-a", task_types=["review"], priority=0),
+            _worker("worker-b", task_types=["review"], priority=1),
+            _worker("review-gpt55-1", task_types=["review"], priority=2),
+        ]
+    )
+    project = SimpleNamespace(project=SimpleNamespace(id="proj_1"))
+    task = {
+        "id": "rev_1",
+        "project_id": "proj_1",
+        "finding_id": "finding_1",
+        "discovered_by": "worker-a",
+        "excluded_workers": ["worker-a", "worker-b"],
+    }
+
+    assert loop._dispatch_review_task(project, task) is True
+
+    assert loop.client.claims == [("rev_1", "review-gpt55-1")]
 
 
 def test_review_task_marks_blocked_without_independent_worker():

@@ -284,6 +284,8 @@ const BUSINESS_EDGE_META = {
   exposes: "暴露",
   calls: "调用",
   uses: "使用",
+  extends: "继承",
+  extended_by: "被继承",
   owns: "归属",
   guards: "保护",
   transitions_to: "流转",
@@ -3500,6 +3502,10 @@ function IndexQualityPanel({ currentSource, quality, onReindexSource }) {
   const issues = quality.issues || [];
   const recommendations = quality.recommendations || [];
   const orphanEntryPoints = quality.orphan_entrypoints || [];
+  const readiness = quality.audit_readiness || {};
+  const graphCompression = quality.graph_compression || {};
+  const languageCoverage = quality.language_coverage || {};
+  const languageEntries = Object.entries(languageCoverage).sort((a, b) => Number(b[1]?.files || 0) - Number(a[1]?.files || 0));
   return (
     <section className="index-quality-panel">
       <header>
@@ -3536,8 +3542,46 @@ function IndexQualityPanel({ currentSource, quality, onReindexSource }) {
         <MiniStat label="代码文件" value={quality.code_file_count || 0} />
         <MiniStat label="数据对象" value={quality.data_object_count || 0} />
         <MiniStat label="入口数据链" value={dataPathRatio} />
+        <MiniStat label="审计就绪" value={readiness.score !== undefined ? `${readiness.score}/100` : "-"} />
+        <MiniStat label="图压缩" value={graphCompression.compression_ratio !== undefined ? `${Math.round(Number(graphCompression.compression_ratio || 0) * 100)}%` : "-"} />
         <MiniStat label="低置信关系" value={lowConfidence.relationships || 0} />
       </div>
+      {readiness.checkpoints?.length > 0 && (
+        <div className="quality-section">
+          <span>审计就绪度</span>
+          <div className="quality-pill-row">
+            {readiness.checkpoints.map((item) => (
+              <Badge key={item.key} tone={item.status === "ok" ? "success" : item.status === "missing" ? "danger" : "warning"}>
+                {item.label} {item.current}/{item.target}
+              </Badge>
+            ))}
+          </div>
+        </div>
+      )}
+      {languageEntries.length > 0 && (
+        <div className="quality-section">
+          <span>语言覆盖</span>
+          <div className="quality-pill-row">
+            {languageEntries.slice(0, 8).map(([language, item]) => (
+              <Badge key={language} tone={item.status === "strong" ? "success" : item.status === "weak" ? "warning" : "info"}>
+                {language} {item.files || 0} 文件 / {item.entrypoints || 0} 入口
+              </Badge>
+            ))}
+          </div>
+        </div>
+      )}
+      {graphCompression.top_modules?.length > 0 && (
+        <div className="quality-section">
+          <span>业务图压缩</span>
+          <div className="orphan-entrypoint-list">
+            {graphCompression.top_modules.slice(0, 5).map((item) => (
+              <p key={item.id}>
+                {item.title} · {item.child_count || 0} 节点 · {item.risk_count || 0} 风险链
+              </p>
+            ))}
+          </div>
+        </div>
+      )}
       <div className="quality-section">
         <span>框架</span>
         <div className="quality-pill-row">

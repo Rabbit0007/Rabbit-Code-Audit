@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 from cairn.dispatcher.config import DispatchConfig, WorkerConfig
@@ -25,7 +26,7 @@ from cairn.dispatcher.tasks.common import (
     verify_latest_source_available,
     write_business_graph,
     write_business_node_conclusions,
-    write_conclude_result,
+    write_conclude_result_with_fact_id,
     write_graph_snapshot_reference,
 )
 from cairn.dispatcher.workers.base import WorkerAgentError
@@ -33,6 +34,16 @@ from cairn.dispatcher.workers.registry import get_driver
 from cairn.server.models import Intent, ProjectDetail
 
 LOG = logging.getLogger(__name__)
+
+SOURCE_EVIDENCE_RE = re.compile(
+    r"\b[\w./@-]+\.(?:py|php|js|jsx|ts|tsx|java|go|rb|rs|cs|kt|scala|jsp|jspx|asp|aspx|"
+    r"vue|sql|yaml|yml|json|xml|ini|conf|toml)\b(?::\d+)?",
+    re.IGNORECASE,
+)
+UNSUPPORTED_FALLBACK_EVIDENCE_RE = re.compile(
+    r"(未读取|没有读取|未确认|未验证|仅凭图|仅凭索引|推测|猜测|可能)",
+    re.IGNORECASE,
+)
 
 
 def run_explore_task(
@@ -496,7 +507,9 @@ def _write_explore_result(
 ) -> TaskOutcome:
     if not result_data:
         return task_outcome("failed", error_type="empty_result", used_fallback=used_fallback)
-    status = write_conclude_result(
+    if used_fallback:
+        result_data = _sanitize_conclude_fallback_result(result_data, worker_name)
+    conclude_result = write_conclude_result_with_fact_id(
         client,
         project_id,
         intent_id,
@@ -506,6 +519,7 @@ def _write_explore_result(
         phase_ms=phase_ms,
         total_ms=total_ms,
     )
+    status = conclude_result.status
     if status != "success":
         return task_outcome(status, error_type="conclude_write_failed", used_fallback=used_fallback)
     ref_to_id = write_business_graph(
@@ -524,6 +538,7 @@ def _write_explore_result(
     tool_findings = result_data.get("tool_findings") or []
     audit_candidates = result_data.get("audit_candidates") or []
     candidate_conclusions = result_data.get("candidate_conclusions") or []
+    write_failures: list[str] = []
     snapshot = None
     if findings or tool_findings or audit_candidates:
         project = client.get_project(project_id)
@@ -549,6 +564,10 @@ def _write_explore_result(
             if isinstance(ref, str) and candidate_id:
                 candidate_ref_to_id[ref] = candidate_id
         else:
+            write_failures.append(
+                f"audit_candidate:{candidate.get('title') or candidate.get('candidate_type')}:"
+                f"status={response.status_code} body={response.text[:500]}"
+            )
             LOG.warning(
                 "audit candidate write failed project=%s worker=%s status=%s body=%s",
                 project_id,
@@ -566,6 +585,10 @@ def _write_explore_result(
             },
         )
         if not response.ok:
+            write_failures.append(
+                f"tool_finding:{tool_finding.get('title') or tool_finding.get('tool_name')}:"
+                f"status={response.status_code} body={response.text[:500]}"
+            )
             LOG.warning(
                 "tool finding write failed project=%s worker=%s status=%s body=%s",
                 project_id,
@@ -621,6 +644,18 @@ def _write_explore_result(
             },
         )
         if not response.ok:
+            write_failures.append(
+                f"audit_finding:{finding.get('title') or finding.get('file_path') or 'untitled'}:"
+                f"status={response.status_code} body={response.text[:500]}"
+            )
+            _create_failed_finding_candidate(
+                client,
+                project_id,
+                snapshot.id,
+                worker_name,
+                finding,
+                response,
+            )
             LOG.warning(
                 "audit finding write failed project=%s worker=%s status=%s body=%s",
                 project_id,
@@ -649,6 +684,9 @@ def _write_explore_result(
             review["decision"],
         )
         if not response.ok:
+            write_failures.append(
+                f"audit_review:{review.get('finding_id')}:status={response.status_code} body={response.text[:500]}"
+            )
             LOG.warning(
                 "audit finding review failed project=%s finding=%s worker=%s status=%s body=%s",
                 project_id,
@@ -676,6 +714,9 @@ def _write_explore_result(
             audit_finding_id=conclusion.get("audit_finding_id"),
         )
         if not response.ok:
+            write_failures.append(
+                f"candidate_conclusion:{candidate_id}:status={response.status_code} body={response.text[:500]}"
+            )
             LOG.warning(
                 "audit candidate conclusion failed project=%s candidate=%s worker=%s status=%s body=%s",
                 project_id,
@@ -692,7 +733,154 @@ def _write_explore_result(
         ref_to_id,
         source=source,
     )
+    if write_failures:
+        _create_structured_output_repair_intent(
+            client,
+            project_id,
+            conclude_result.fact_id,
+            intent_id,
+            worker_name,
+            write_failures,
+        )
+        return task_outcome(
+            "failed",
+            error_type="structured_output_write_failed",
+            error_detail="; ".join(write_failures[:3])[:2000],
+            used_fallback=used_fallback,
+        )
     return task_outcome(status, used_fallback=used_fallback)
+
+
+def _sanitize_conclude_fallback_result(result_data: dict, worker_name: str) -> dict:
+    sanitized = {**result_data}
+    candidate_conclusions = result_data.get("candidate_conclusions") or []
+    business_node_conclusions = result_data.get("business_node_conclusions") or []
+    safe_candidate_conclusions = [
+        item for item in candidate_conclusions if _source_backed_fallback_conclusion(item)
+    ]
+    safe_business_node_conclusions = [
+        item for item in business_node_conclusions if _source_backed_fallback_conclusion(item)
+    ]
+    if len(safe_candidate_conclusions) != len(candidate_conclusions):
+        LOG.info(
+            "dropped unsupported fallback candidate conclusions worker=%s kept=%s dropped=%s",
+            worker_name,
+            len(safe_candidate_conclusions),
+            len(candidate_conclusions) - len(safe_candidate_conclusions),
+        )
+    if len(safe_business_node_conclusions) != len(business_node_conclusions):
+        LOG.info(
+            "dropped unsupported fallback business node conclusions worker=%s kept=%s dropped=%s",
+            worker_name,
+            len(safe_business_node_conclusions),
+            len(business_node_conclusions) - len(safe_business_node_conclusions),
+        )
+    sanitized["candidate_conclusions"] = safe_candidate_conclusions
+    sanitized["business_node_conclusions"] = safe_business_node_conclusions
+    return sanitized
+
+
+def _source_backed_fallback_conclusion(conclusion: dict) -> bool:
+    if not isinstance(conclusion, dict):
+        return False
+    audit_finding_id = conclusion.get("audit_finding_id")
+    if isinstance(audit_finding_id, str) and audit_finding_id.strip():
+        return True
+    evidence = conclusion.get("evidence")
+    if not isinstance(evidence, str) or not evidence.strip():
+        return False
+    if UNSUPPORTED_FALLBACK_EVIDENCE_RE.search(evidence):
+        return False
+    return bool(SOURCE_EVIDENCE_RE.search(evidence))
+
+
+def _create_failed_finding_candidate(
+    client: CairnClient,
+    project_id: str,
+    snapshot_id: str,
+    worker_name: str,
+    finding: dict,
+    response,
+) -> None:
+    title = str(finding.get("title") or finding.get("file_path") or "未落库漏洞").strip()
+    description_parts = [
+        "模型已输出 finding，但服务端结构化写入失败，需要补齐缺失证据后重新输出 findings。",
+        f"写入失败: status={response.status_code} body={response.text[:800]}",
+        f"原始描述: {finding.get('description') or ''}",
+    ]
+    if finding.get("impact"):
+        description_parts.append(f"影响: {finding.get('impact')}")
+    if finding.get("evidence"):
+        description_parts.append(f"证据: {finding.get('evidence')}")
+    payload = {
+        "snapshot_id": snapshot_id,
+        "source": "model_write_failed",
+        "candidate_type": "finding_write_failed",
+        "severity": finding.get("severity") or "unknown",
+        "title": f"补齐未落库 finding: {title}"[:300],
+        "description": "\n".join(description_parts)[:4000],
+        "file_path": finding.get("file_path"),
+        "entry_point": finding.get("entry_point"),
+        "symbol": finding.get("symbol"),
+        "created_by": worker_name,
+    }
+    if isinstance(finding.get("line_start"), int) and finding["line_start"] > 0:
+        payload["line_start"] = finding["line_start"]
+    if isinstance(finding.get("line_end"), int) and finding["line_end"] > 0:
+        payload["line_end"] = finding["line_end"]
+    candidate_response = client.create_audit_candidate(project_id, payload)
+    if not candidate_response.ok:
+        LOG.warning(
+            "failed finding repair candidate write failed project=%s worker=%s status=%s body=%s",
+            project_id,
+            worker_name,
+            candidate_response.status_code,
+            candidate_response.text,
+        )
+
+
+def _create_structured_output_repair_intent(
+    client: CairnClient,
+    project_id: str,
+    fact_id: str | None,
+    failed_intent_id: str,
+    worker_name: str,
+    write_failures: list[str],
+) -> None:
+    if not fact_id:
+        LOG.warning(
+            "structured output repair intent skipped without fact id project=%s failed_intent=%s",
+            project_id,
+            failed_intent_id,
+        )
+        return
+    failure_text = "\n".join(f"- {item}" for item in write_failures[:10])
+    description = (
+        "修复上一轮 explore 结构化写入失败。上一轮 worker 已输出 finding、review、"
+        "tool finding 或 candidate conclusion，但服务端写入失败。请读取上一轮 fact 与对应源码，"
+        "补齐缺失字段或证据后重新输出合法的 structured findings / reviews / "
+        "candidate_conclusions；不要只复述上一轮结论。\n"
+        f"failed_intent_id: {failed_intent_id}\n"
+        f"write_failures:\n{failure_text}"
+    )
+    response = client.create_intent(
+        project_id,
+        [fact_id],
+        description[:6000],
+        f"repair:{worker_name}",
+        target_kind="structured_output_write_failure",
+        target_id=failed_intent_id,
+        objective="repair_structured_output",
+        evidence_gap="server_write_validation",
+    )
+    if not response.ok:
+        LOG.warning(
+            "structured output repair intent write failed project=%s failed_intent=%s status=%s body=%s",
+            project_id,
+            failed_intent_id,
+            response.status_code,
+            response.text,
+        )
 
 
 def _response_id(data) -> str | None:
