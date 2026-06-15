@@ -39,7 +39,7 @@ container:
 common_env:
   PI_MODEL: deepseek-v4-pro
   PI_BASE_URL: https://api.deepseek.com
-  PI_API_KEY: sk-bd01ea5b829246cb8f7a083e2ec1cecb
+  PI_API_KEY: 
   PI_PROVIDER_API: openai-completions
 workers:
 - name: gpt-5.5-1
@@ -53,8 +53,8 @@ workers:
   priority: 0
   env:
     PI_MODEL: gpt-5.5
-    PI_BASE_URL: https://vsllm.com/v1
-    PI_API_KEY: sk-qcTmy1lhc0MkEBKcjkuFJLo7Mo7pK0Fs9S3Axl4QZvSZ1Y6G
+    PI_BASE_URL: 
+    PI_API_KEY: 
     PI_PROVIDER_API: openai-completions
 - name: gpt-5.5-2
   type: pi
@@ -67,8 +67,8 @@ workers:
   priority: 1
   env:
     PI_MODEL: gpt-5.5
-    PI_BASE_URL: https://vsllm.com/v1
-    PI_API_KEY: sk-qcTmy1lhc0MkEBKcjkuFJLo7Mo7pK0Fs9S3Axl4QZvSZ1Y6G
+    PI_BASE_URL: 
+    PI_API_KEY: 
     PI_PROVIDER_API: openai-completions
 - name: gpt-5.5-3
   type: pi
@@ -81,8 +81,8 @@ workers:
   priority: 2
   env:
     PI_MODEL: gpt-5.5
-    PI_BASE_URL: https://vsllm.com/v1
-    PI_API_KEY: sk-qcTmy1lhc0MkEBKcjkuFJLo7Mo7pK0Fs9S3Axl4QZvSZ1Y6G
+    PI_BASE_URL: 
+    PI_API_KEY: 
     PI_PROVIDER_API: openai-completions
 - name: xplt-deepseek-v4-pro-1
   type: pi
@@ -95,8 +95,8 @@ workers:
   priority: 3
   env:
     PI_MODEL: ByteDance-volcengine/DeepSeek-V4-Pro
-    PI_BASE_URL: https://xplt.sdu.edu.cn:4000/v1
-    PI_API_KEY: sk-6p8fnM1HRV_im8LI2F1v5A
+    PI_BASE_URL: 
+    PI_API_KEY: 
     PI_PROVIDER_API: openai-completions
 - name: xplt-deepseek-v4-pro-2
   type: pi
@@ -109,8 +109,8 @@ workers:
   priority: 4
   env:
     PI_MODEL: ByteDance-volcengine/DeepSeek-V4-Pro
-    PI_BASE_URL: https://xplt.sdu.edu.cn:4000/v1
-    PI_API_KEY: sk-6p8fnM1HRV_im8LI2F1v5A
+    PI_BASE_URL: 
+    PI_API_KEY: 
     PI_PROVIDER_API: openai-completions
 - name: xplt-deepseek-v4-pro-3
   type: pi
@@ -123,8 +123,8 @@ workers:
   priority: 5
   env:
     PI_MODEL: ByteDance-volcengine/DeepSeek-V4-Pro
-    PI_BASE_URL: https://xplt.sdu.edu.cn:4000/v1
-    PI_API_KEY: sk-6p8fnM1HRV_im8LI2F1v5A
+    PI_BASE_URL: 
+    PI_API_KEY: 
     PI_PROVIDER_API: openai-completions
 - name: claude-sonnet-4-6-1
   type: pi
@@ -137,8 +137,8 @@ workers:
   priority: 6
   env:
     PI_MODEL: claude-sonnet-4-6
-    PI_BASE_URL: https://vsllm.com/v1
-    PI_API_KEY: sk-qcTmy1lhc0MkEBKcjkuFJLo7Mo7pK0Fs9S3Axl4QZvSZ1Y6G
+    PI_BASE_URL:
+    PI_API_KEY: 
     PI_PROVIDER_API: openai-completions
 - name: claude-sonnet-4-6-2
   type: pi
@@ -151,8 +151,8 @@ workers:
   priority: 7
   env:
     PI_MODEL: claude-sonnet-4-6
-    PI_BASE_URL: https://vsllm.com/v1
-    PI_API_KEY: sk-qcTmy1lhc0MkEBKcjkuFJLo7Mo7pK0Fs9S3Axl4QZvSZ1Y6G
+    PI_BASE_URL:
+    PI_API_KEY: 
     PI_PROVIDER_API: openai-completions
 - name: claude-sonnet-4-6-3
   type: pi
@@ -165,8 +165,8 @@ workers:
   priority: 8
   env:
     PI_MODEL: claude-sonnet-4-6
-    PI_BASE_URL: https://vsllm.com/v1
-    PI_API_KEY: sk-qcTmy1lhc0MkEBKcjkuFJLo7Mo7pK0Fs9S3Axl4QZvSZ1Y6G
+    PI_BASE_URL: 
+    PI_API_KEY: sk-
     PI_PROVIDER_API: openai-completions
 - name: deepseek-v4-pro-1
   type: pi
@@ -180,7 +180,7 @@ workers:
   env:
     PI_MODEL: deepseek-v4-pro
     PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: sk-bd01ea5b829246cb8f7a083e2ec1cecb
+    PI_API_KEY: sk-
     PI_PROVIDER_API: openai-completions
 - name: deepseek-v4-pro-2
   type: pi
@@ -194,7 +194,7 @@ workers:
   env:
     PI_MODEL: deepseek-v4-pro
     PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: sk-bd01ea5b829246cb8f7a083e2ec1cecb
+    PI_API_KEY: sk-
     PI_PROVIDER_API: openai-completions
 - name: deepseek-v4-pro-3
   type: pi
@@ -208,7 +208,7 @@ workers:
   env:
     PI_MODEL: deepseek-v4-pro
     PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: sk-bd01ea5b829246cb8f7a083e2ec1cecb
+    PI_API_KEY: sk-
     PI_PROVIDER_API: openai-completions
 - name: glm-5-1
   type: pi
@@ -221,7 +221,7 @@ workers:
   env:
     PI_MODEL: glm-5
     PI_BASE_URL: http://10.2.8.77:3000/v1
-    PI_API_KEY: sk-c8I3u5nHDsQpnMsT737071E106E34076A9B9140964Ac13B1
+    PI_API_KEY: sk-
     PI_PROVIDER_API: openai-completions
 - name: glm-5-2
   type: pi
@@ -234,7 +234,7 @@ workers:
   env:
     PI_MODEL: glm-5
     PI_BASE_URL: http://10.2.8.77:3000/v1
-    PI_API_KEY: sk-c8I3u5nHDsQpnMsT737071E106E34076A9B9140964Ac13B1
+    PI_API_KEY: sk-
     PI_PROVIDER_API: openai-completions
 - name: glm-5-3
   type: pi
@@ -247,7 +247,7 @@ workers:
   env:
     PI_MODEL: glm-5
     PI_BASE_URL: http://10.2.8.77:3000/v1
-    PI_API_KEY: sk-c8I3u5nHDsQpnMsT737071E106E34076A9B9140964Ac13B1
+    PI_API_KEY: sk-
     PI_PROVIDER_API: openai-completions
 - name: report-enrichment-1
   type: pi
@@ -259,7 +259,7 @@ workers:
   env:
     PI_MODEL: deepseek-v4-pro
     PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: sk-bd01ea5b829246cb8f7a083e2ec1cecb
+    PI_API_KEY: sk-
     PI_PROVIDER_API: openai-completions
 - name: report-enrichment-gpt55-1
   type: pi
@@ -271,7 +271,7 @@ workers:
   env:
     PI_MODEL: gpt-5.5
     PI_BASE_URL: https://vsllm.com/v1
-    PI_API_KEY: sk-qcTmy1lhc0MkEBKcjkuFJLo7Mo7pK0Fs9S3Axl4QZvSZ1Y6G
+    PI_API_KEY: sk-
     PI_PROVIDER_API: openai-completions
 - name: review-gpt55-1
   type: pi
@@ -282,6 +282,6 @@ workers:
   priority: 17
   env:
     PI_MODEL: gpt-5.5
-    PI_BASE_URL: https://vsllm.com/v1
-    PI_API_KEY: sk-qcTmy1lhc0MkEBKcjkuFJLo7Mo7pK0Fs9S3Axl4QZvSZ1Y6G
+    PI_BASE_URL: 
+    PI_API_KEY: sk-
     PI_PROVIDER_API: openai-completions
