@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from cairn.server import db
 
 # Product feature tables (vulnerability reports, and future product tables).
@@ -80,6 +82,23 @@ CREATE INDEX IF NOT EXISTS idx_worker_history_worker
 CREATE INDEX IF NOT EXISTS idx_worker_history_time
     ON worker_task_history(completed_at);
 
+CREATE TABLE IF NOT EXISTS model_usage_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    request_id TEXT,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_usage_project_time
+    ON model_usage_records(project_id, created_at);
+
 CREATE TABLE IF NOT EXISTS templates (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -116,6 +135,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     action TEXT NOT NULL,
     target_type TEXT,
     target_id TEXT,
+    project_id TEXT,
     summary TEXT NOT NULL,
     detail TEXT
 );
@@ -130,6 +150,7 @@ CREATE TABLE IF NOT EXISTS notifications (
     title TEXT NOT NULL,
     body TEXT,
     link TEXT,
+    project_id TEXT,
     read INTEGER NOT NULL DEFAULT 0
 );
 
@@ -346,6 +367,15 @@ CREATE TABLE IF NOT EXISTS business_nodes (
     risk_tags_json TEXT NOT NULL DEFAULT '[]',
     evidence_json TEXT NOT NULL DEFAULT '[]',
     source_snapshot_id TEXT,
+    semantic_key TEXT,
+    graph_layer TEXT NOT NULL DEFAULT 'semantic'
+        CHECK(graph_layer IN ('evidence', 'semantic', 'audit')),
+    source_kind TEXT NOT NULL DEFAULT 'model'
+        CHECK(source_kind IN ('static_index', 'model', 'human', 'mixed')),
+    evidence_status TEXT NOT NULL DEFAULT 'unverified'
+        CHECK(evidence_status IN ('source_backed', 'inferred', 'unverified')),
+    contributors_json TEXT NOT NULL DEFAULT '[]',
+    revision INTEGER NOT NULL DEFAULT 1,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -364,9 +394,15 @@ CREATE TABLE IF NOT EXISTS business_edges (
             'contains', 'exposes', 'calls', 'uses', 'owns',
             'guards', 'transitions_to', 'depends_on', 'risk_of',
             'implements', 'implemented_by', 'extends', 'extended_by',
-            'relates_to'
+            'evidenced_by', 'relates_to'
         )),
     description TEXT,
+    graph_layer TEXT NOT NULL DEFAULT 'semantic'
+        CHECK(graph_layer IN ('evidence', 'semantic', 'audit')),
+    source_kind TEXT NOT NULL DEFAULT 'model'
+        CHECK(source_kind IN ('static_index', 'model', 'human', 'mixed')),
+    contributors_json TEXT NOT NULL DEFAULT '[]',
+    revision INTEGER NOT NULL DEFAULT 1,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -383,6 +419,8 @@ CREATE TABLE IF NOT EXISTS business_node_conclusions (
     summary TEXT NOT NULL,
     evidence TEXT,
     audit_finding_id TEXT REFERENCES audit_findings(id) ON DELETE SET NULL,
+    is_current INTEGER NOT NULL DEFAULT 1 CHECK(is_current IN (0, 1)),
+    superseded_at TEXT,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -556,10 +594,35 @@ BUSINESS_NODE_COLUMNS: dict[str, str] = {
     "last_intent_id": "TEXT",
     "source_snapshot_id": "TEXT",
     "confidence": "REAL NOT NULL DEFAULT 0.7",
+    "semantic_key": "TEXT",
+    "graph_layer": (
+        "TEXT NOT NULL DEFAULT 'semantic' "
+        "CHECK(graph_layer IN ('evidence', 'semantic', 'audit'))"
+    ),
+    "source_kind": (
+        "TEXT NOT NULL DEFAULT 'model' "
+        "CHECK(source_kind IN ('static_index', 'model', 'human', 'mixed'))"
+    ),
+    "evidence_status": (
+        "TEXT NOT NULL DEFAULT 'unverified' "
+        "CHECK(evidence_status IN ('source_backed', 'inferred', 'unverified'))"
+    ),
+    "contributors_json": "TEXT NOT NULL DEFAULT '[]'",
+    "revision": "INTEGER NOT NULL DEFAULT 1",
 }
 
 BUSINESS_EDGE_COLUMNS: dict[str, str] = {
     "confidence": "REAL NOT NULL DEFAULT 0.7",
+    "graph_layer": (
+        "TEXT NOT NULL DEFAULT 'semantic' "
+        "CHECK(graph_layer IN ('evidence', 'semantic', 'audit'))"
+    ),
+    "source_kind": (
+        "TEXT NOT NULL DEFAULT 'model' "
+        "CHECK(source_kind IN ('static_index', 'model', 'human', 'mixed'))"
+    ),
+    "contributors_json": "TEXT NOT NULL DEFAULT '[]'",
+    "revision": "INTEGER NOT NULL DEFAULT 1",
 }
 
 CODE_SYMBOL_COLUMNS: dict[str, str] = {
@@ -587,6 +650,16 @@ WORKER_TASK_HISTORY_COLUMNS: dict[str, str] = {
     "used_fallback": "INTEGER NOT NULL DEFAULT 0",
     "stdout_preview": "TEXT",
     "stderr_preview": "TEXT",
+    "model_call_count": "INTEGER NOT NULL DEFAULT 1",
+    "estimated_input_tokens": "INTEGER NOT NULL DEFAULT 0",
+}
+
+AUDIT_LOG_COLUMNS: dict[str, str] = {
+    "project_id": "TEXT",
+}
+
+NOTIFICATION_COLUMNS: dict[str, str] = {
+    "project_id": "TEXT",
 }
 
 REPORT_ENRICHMENT_COLUMNS: dict[str, str] = {
@@ -601,6 +674,11 @@ REVIEW_TASK_COLUMNS: dict[str, str] = {
     "excluded_workers_json": "TEXT NOT NULL DEFAULT '[]'",
     "blocked_reason": "TEXT",
     "retry_count": "INTEGER NOT NULL DEFAULT 0",
+}
+
+BUSINESS_NODE_CONCLUSION_COLUMNS: dict[str, str] = {
+    "is_current": "INTEGER NOT NULL DEFAULT 1 CHECK(is_current IN (0, 1))",
+    "superseded_at": "TEXT",
 }
 
 
@@ -677,11 +755,12 @@ def _ensure_code_relationship_relation_values(conn) -> None:
 
 def _ensure_business_edge_relation_values(conn) -> None:
     sql = _table_create_sql(conn, "business_edges")
-    if not sql or "implemented_by" in sql:
+    if not sql or "evidenced_by" in sql:
         return
     conn.executescript(
         """
         DROP INDEX IF EXISTS idx_business_edges_project;
+        DROP INDEX IF EXISTS idx_business_edges_identity;
         ALTER TABLE business_edges RENAME TO business_edges_legacy;
         CREATE TABLE business_edges (
             id TEXT PRIMARY KEY,
@@ -693,19 +772,28 @@ def _ensure_business_edge_relation_values(conn) -> None:
                     'contains', 'exposes', 'calls', 'uses', 'owns',
                     'guards', 'transitions_to', 'depends_on', 'risk_of',
                     'implements', 'implemented_by', 'extends', 'extended_by',
-                    'relates_to'
+                    'evidenced_by', 'relates_to'
                 )),
             description TEXT,
+            confidence REAL NOT NULL DEFAULT 0.7,
+            graph_layer TEXT NOT NULL DEFAULT 'semantic'
+                CHECK(graph_layer IN ('evidence', 'semantic', 'audit')),
+            source_kind TEXT NOT NULL DEFAULT 'model'
+                CHECK(source_kind IN ('static_index', 'model', 'human', 'mixed')),
+            contributors_json TEXT NOT NULL DEFAULT '[]',
+            revision INTEGER NOT NULL DEFAULT 1,
             created_by TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
         INSERT OR IGNORE INTO business_edges (
             id, project_id, from_node_id, to_node_id, relation,
-            description, created_by, created_at
+            description, confidence, graph_layer, source_kind,
+            contributors_json, revision, created_by, created_at
         )
         SELECT
             id, project_id, from_node_id, to_node_id, relation,
-            description, created_by, created_at
+            description, confidence, graph_layer, source_kind,
+            contributors_json, revision, created_by, created_at
         FROM business_edges_legacy;
         DROP TABLE business_edges_legacy;
         CREATE INDEX IF NOT EXISTS idx_business_edges_project
@@ -727,17 +815,28 @@ def configure_product_db() -> None:
     with db.get_conn() as conn:
         conn.executescript(PRODUCT_SCHEMA)
         _ensure_code_relationship_relation_values(conn)
+        _ensure_columns(conn, "business_edges", BUSINESS_EDGE_COLUMNS)
         _ensure_business_edge_relation_values(conn)
         _ensure_vulnerability_columns(conn)
         _ensure_columns(conn, "audit_findings", AUDIT_FINDING_COLUMNS)
+        _normalize_and_merge_audit_findings(conn)
         _ensure_audit_finding_indexes(conn)
         _ensure_columns(conn, "business_nodes", BUSINESS_NODE_COLUMNS)
-        _ensure_columns(conn, "business_edges", BUSINESS_EDGE_COLUMNS)
+        _ensure_columns(
+            conn,
+            "business_node_conclusions",
+            BUSINESS_NODE_CONCLUSION_COLUMNS,
+        )
+        _ensure_business_node_conclusion_state(conn)
+        _ensure_business_graph_indexes(conn)
         _ensure_columns(conn, "code_symbols", CODE_SYMBOL_COLUMNS)
         _ensure_columns(conn, "code_entrypoints", CODE_ENTRYPOINT_COLUMNS)
         _ensure_columns(conn, "code_capabilities", CODE_CAPABILITY_COLUMNS)
         _ensure_columns(conn, "worker_task_history", WORKER_TASK_HISTORY_COLUMNS)
+        _ensure_columns(conn, "audit_log", AUDIT_LOG_COLUMNS)
+        _ensure_columns(conn, "notifications", NOTIFICATION_COLUMNS)
         _ensure_columns(conn, "report_enrichment_tasks", REPORT_ENRICHMENT_COLUMNS)
+        _backfill_failed_report_enrichments(conn)
         _ensure_columns(conn, "review_tasks", REVIEW_TASK_COLUMNS)
         from cairn.server.services import sync_business_node_coverage_from_latest_conclusions
 
@@ -749,5 +848,233 @@ def _ensure_audit_finding_indexes(conn) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_audit_findings_cluster
             ON audit_findings(project_id, snapshot_id, cluster_key, status)
+        """
+    )
+
+
+def _backfill_failed_report_enrichments(conn) -> None:
+    rows = conn.execute(
+        """
+        SELECT t.id, f.title, f.description, f.impact, f.evidence, f.remediation,
+               f.proof_packets_json, f.reproduction_poc_json
+        FROM report_enrichment_tasks t
+        JOIN audit_findings f ON f.id = t.finding_id AND f.project_id = t.project_id
+        WHERE t.status = 'failed' AND f.status = 'confirmed'
+        """
+    ).fetchall()
+    for row in rows:
+        proof_packets = _safe_json_value(row["proof_packets_json"], [])
+        reproduction_poc = _safe_json_value(row["reproduction_poc_json"], {})
+        evidence_chain = [
+            value
+            for value in (row["evidence"], row["impact"])
+            if isinstance(value, str) and value.strip()
+        ]
+        report_sections = {
+            "summary": row["description"] or row["title"],
+            "impact": row["impact"] or "未单独记录影响说明",
+            "evidence": row["evidence"] or "请按源码位置复核",
+            "remediation": row["remediation"] or "根据根因补充输入校验、边界控制和安全 API",
+            "generation_mode": "deterministic_static_fallback",
+        }
+        conn.execute(
+            """
+            UPDATE report_enrichment_tasks
+            SET status = 'completed',
+                completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+                error_message = NULL,
+                packet_templates_json = ?,
+                reproduction_poc_json = ?,
+                evidence_chain_json = ?,
+                report_sections_json = ?,
+                delivery_notes_json = ?
+            WHERE id = ? AND status = 'failed'
+            """,
+            (
+                json.dumps(proof_packets, ensure_ascii=False),
+                json.dumps(reproduction_poc, ensure_ascii=False),
+                json.dumps(evidence_chain, ensure_ascii=False),
+                json.dumps(report_sections, ensure_ascii=False),
+                json.dumps(
+                    ["历史模型补全失败，已使用确定性静态证据生成，不代表动态抓包结果。"],
+                    ensure_ascii=False,
+                ),
+                row["id"],
+            ),
+        )
+
+
+def _safe_json_value(raw: str | None, default):
+    if not raw:
+        return default
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return default
+    return value
+
+
+def _normalize_and_merge_audit_findings(conn) -> None:
+    """Canonicalize taxonomy and merge only exact source identities."""
+    from cairn.server.finding_taxonomy import (
+        canonical_cwe,
+        canonical_finding_category,
+        finding_cluster_key,
+    )
+
+    rows = conn.execute(
+        """
+        SELECT id, project_id, snapshot_id, category, cwe, file_path, symbol,
+               line_start, entry_point, status, evidence_level, created_at
+        FROM audit_findings
+        ORDER BY project_id, snapshot_id, created_at, id
+        """
+    ).fetchall()
+    groups: dict[tuple[str, str, str], list] = {}
+    for row in rows:
+        cwe = canonical_cwe(row["cwe"])
+        category = canonical_finding_category(row["category"], cwe)
+        cluster_key = finding_cluster_key(
+            category=category,
+            cwe=cwe,
+            file_path=row["file_path"],
+            symbol=row["symbol"],
+            line_start=row["line_start"],
+            entry_point=row["entry_point"],
+        )
+        conn.execute(
+            "UPDATE audit_findings SET category = ?, cwe = ?, cluster_key = ? WHERE id = ?",
+            (category, cwe, cluster_key, row["id"]),
+        )
+        if row["status"] != "rejected":
+            groups.setdefault(
+                (row["project_id"], row["snapshot_id"], cluster_key), []
+            ).append(row)
+
+    status_rank = {
+        "confirmed": 5,
+        "pending_review": 4,
+        "needs_more_evidence": 3,
+        "investigating": 2,
+        "candidate": 1,
+    }
+    for duplicates in groups.values():
+        if len(duplicates) < 2:
+            continue
+        survivor = max(
+            duplicates,
+            key=lambda row: (
+                status_rank.get(row["status"], 0),
+                _evidence_level_value(row["evidence_level"]),
+                -duplicates.index(row),
+            ),
+        )
+        for duplicate in duplicates:
+            if duplicate["id"] == survivor["id"]:
+                continue
+            _replace_audit_finding_reference(conn, duplicate["id"], survivor["id"])
+            conn.execute("DELETE FROM audit_findings WHERE id = ?", (duplicate["id"],))
+
+
+def _evidence_level_value(value: str | None) -> int:
+    if value and value.startswith("L") and value[1:].isdigit():
+        return int(value[1:])
+    return -1
+
+
+def _replace_audit_finding_reference(conn, old_id: str, new_id: str) -> None:
+    conn.execute(
+        "UPDATE audit_candidates SET audit_finding_id = ? WHERE audit_finding_id = ?",
+        (new_id, old_id),
+    )
+    conn.execute(
+        "UPDATE business_node_conclusions SET audit_finding_id = ? WHERE audit_finding_id = ?",
+        (new_id, old_id),
+    )
+    conn.execute(
+        "UPDATE review_tasks SET finding_id = ? WHERE finding_id = ?",
+        (new_id, old_id),
+    )
+    conn.execute(
+        "UPDATE report_enrichment_tasks SET finding_id = ? WHERE finding_id = ?",
+        (new_id, old_id),
+    )
+
+
+def _ensure_business_graph_indexes(conn) -> None:
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_business_nodes_semantic_key
+            ON business_nodes(project_id, semantic_key)
+            WHERE semantic_key IS NOT NULL
+        """
+    )
+    conn.execute(
+        """
+        DELETE FROM business_edges
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid)
+            FROM business_edges
+            GROUP BY project_id, from_node_id, to_node_id, relation
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_business_edges_identity
+            ON business_edges(project_id, from_node_id, to_node_id, relation)
+        """
+    )
+
+
+def _ensure_business_node_conclusion_state(conn) -> None:
+    """Select one decisive current conclusion while retaining full history."""
+    conn.execute("UPDATE business_node_conclusions SET is_current = 0")
+    rows = conn.execute(
+        """
+        SELECT c.id, c.project_id, c.business_node_id
+        FROM business_node_conclusions c
+        LEFT JOIN audit_findings af
+          ON af.id = c.audit_finding_id
+         AND af.project_id = c.project_id
+        ORDER BY
+          c.project_id,
+          c.business_node_id,
+          CASE
+            WHEN c.conclusion = 'confirmed_finding' AND af.status = 'confirmed' THEN 0
+            WHEN c.conclusion = 'rejected' THEN 1
+            WHEN c.conclusion = 'needs_more_evidence' THEN 2
+            ELSE 3
+          END,
+          c.created_at DESC,
+          c.rowid DESC
+        """
+    ).fetchall()
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        key = (row["project_id"], row["business_node_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        conn.execute(
+            """
+            UPDATE business_node_conclusions
+            SET is_current = 1, superseded_at = NULL
+            WHERE id = ?
+            """,
+            (row["id"],),
+        )
+    conn.execute(
+        """
+        UPDATE business_node_conclusions
+        SET superseded_at = COALESCE(superseded_at, created_at)
+        WHERE is_current = 0
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_business_node_conclusions_current
+        ON business_node_conclusions(project_id, business_node_id)
+        WHERE is_current = 1
         """
     )

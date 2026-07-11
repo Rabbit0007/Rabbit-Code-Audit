@@ -63,6 +63,14 @@ def test_pi_driver_extracts_assistant_text_from_agent_end():
     assert PiDriver().extract_response_text(stdout, "") == '{"accepted": true, "data": {"description": "ok"}}'
 
 
+def test_pi_driver_does_not_put_api_key_in_process_arguments():
+    worker = _worker()
+    argv = PiDriver().build_execute(worker, "prompt", None).argv
+
+    assert "secret" not in "\n".join(argv)
+    assert "os.environ[\"PI_API_KEY\"]" in argv[2]
+
+
 def test_pi_driver_surfaces_agent_error_instead_of_returning_jsonl():
     stdout = _jsonl(
         {"type": "session", "id": "session-1"},

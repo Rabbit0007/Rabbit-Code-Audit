@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 import logging
+import os
 import threading
 
 from pydantic import TypeAdapter
@@ -12,6 +13,8 @@ from requests.adapters import HTTPAdapter
 from cairn.server.models import Intent, ProjectDetail, ProjectSummary, RuntimeInfo, Settings
 
 LOG = logging.getLogger(__name__)
+INTERNAL_TOKEN_ENV = "CAIRN_INTERNAL_TOKEN"
+INTERNAL_TOKEN_HEADER = "X-Cairn-Internal-Token"
 
 
 class ProtocolError(RuntimeError):
@@ -115,11 +118,23 @@ class CairnClient:
             json={"worker": worker},
         )
 
-    def conclude(self, project_id: str, intent_id: str, worker: str, description: str) -> ApiResult:
+    def conclude(
+        self,
+        project_id: str,
+        intent_id: str,
+        worker: str,
+        description: str,
+        *,
+        evidence_refs: list[str] | None = None,
+    ) -> ApiResult:
         return self._request_json(
             "POST",
             f"/projects/{project_id}/intents/{intent_id}/conclude",
-            json={"worker": worker, "description": description},
+            json={
+                "worker": worker,
+                "description": description,
+                "evidence_refs": evidence_refs or [],
+            },
         )
 
     def complete(self, project_id: str, from_ids: list[str], description: str, worker: str) -> ApiResult:
@@ -159,6 +174,13 @@ class CairnClient:
             "POST",
             f"/projects/{project_id}/intents",
             json=payload,
+        )
+
+    def supersede_intent(self, project_id: str, intent_id: str, superseded_by: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/intents/{intent_id}/supersede",
+            json={"superseded_by": superseded_by},
         )
 
     def create_audit_finding(self, project_id: str, payload: dict[str, Any]) -> ApiResult:
@@ -203,6 +225,15 @@ class CairnClient:
         response.raise_for_status()
         payload = response.json()
         return payload if isinstance(payload, list) else []
+
+    def get_source_bootstrap_brief(self, project_id: str, snapshot_id: str) -> dict[str, Any]:
+        response = self._session().get(
+            self._url(f"/api/projects/{project_id}/sources/{snapshot_id}/bootstrap-brief"),
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
 
     def conclude_audit_candidate(
         self,
@@ -262,6 +293,32 @@ class CairnClient:
 
     def record_worker_task_history(self, payload: dict[str, Any]) -> ApiResult:
         return self._request_json("POST", "/api/workers/history", json=payload)
+
+    def get_project_worker_usage(self, project_id: str) -> dict[str, int | float]:
+        response = self._session().get(
+            self._url("/api/workers/history/project-usage"),
+            params={"project_id": project_id},
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return {
+            str(key): float(value) if key == "cost_usd" else int(value)
+            for key, value in payload.items()
+        }
+
+    def record_model_usage(self, payload: dict[str, Any]) -> ApiResult:
+        return self._request_json("POST", "/api/workers/model-usage", json=payload)
+
+    def list_explore_retry_failures(self, project_id: str) -> list[dict[str, Any]]:
+        response = self._session().get(
+            self._url("/api/workers/history/explore-retry-failures"),
+            params={"project_id": project_id},
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
 
     def list_pending_report_enrichments(self, project_id: str, limit: int = 10) -> list[dict[str, Any]]:
         response = self._session().get(
@@ -531,13 +588,22 @@ class CairnClient:
     def _session(self) -> requests.Session:
         session = getattr(self._local, "session", None)
         if session is not None:
+            self._apply_internal_token(session)
             return session
 
         session = requests.Session()
         adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64, pool_block=False)
         session.mount("http://", adapter)
         session.mount("https://", adapter)
+        self._apply_internal_token(session)
         self._local.session = session
         with self._sessions_lock:
             self._sessions[threading.get_ident()] = session
         return session
+
+    def _apply_internal_token(self, session: requests.Session) -> None:
+        token = os.environ.get(INTERNAL_TOKEN_ENV, "").strip()
+        if token:
+            session.headers[INTERNAL_TOKEN_HEADER] = token
+        else:
+            session.headers.pop(INTERNAL_TOKEN_HEADER, None)

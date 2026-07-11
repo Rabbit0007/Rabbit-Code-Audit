@@ -47,13 +47,15 @@ flowchart LR
 ## 快速启动
 
 ```bash
+export CAIRN_INTERNAL_TOKEN="$(openssl rand -hex 32)"
+export CAIRN_DISPATCHER_INTERNAL_TOKEN="$(openssl rand -hex 32)"
 docker compose up --build
 ```
 
 访问：
 
 ```text
-http://127.0.0.1:8000/
+http://127.0.0.1:8765/
 ```
 
 首次使用时在登录页注册账号，然后创建代码审计项目并导入公开 Git 仓库或 ZIP 文件。

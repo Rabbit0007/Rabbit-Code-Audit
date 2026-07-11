@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 
@@ -54,7 +55,10 @@ def run_bootstrap_task(
     lease = HeartbeatLease.for_intent(client, project.project.id, intent.id, worker.name, config.runtime.interval)
     lease.start()
     try:
-        container_name = container_manager.ensure_running(project.project.id)
+        container_name = container_manager.ensure_running(
+            project.project.id,
+            [source.id for source in getattr(project, "sources", []) if source.status == "ready"],
+        )
         source_check = verify_latest_source_available(
             container_manager,
             container_name,
@@ -121,9 +125,10 @@ def run_bootstrap_task(
             best_effort_release(client, project.project.id, intent.id, worker.name)
             return task_outcome("unhealthy", error_type="healthcheck_failed", error_detail=healthcheck_error, result=healthcheck.result)
 
+        source_inventory = _bootstrap_source_inventory(client, project)
         prompt = render_prompt(
             load_prompt(config.runtime.prompt_group, "bootstrap.md"),
-            _bootstrap_prompt_replacements(project),
+            _bootstrap_prompt_replacements(project, source_inventory=source_inventory),
         )
 
         session = driver.prepare_session()
@@ -216,6 +221,7 @@ def run_bootstrap_task(
                     session,
                     lease,
                     cancellation,
+                    source_inventory=source_inventory,
                     cause_result=first,
                     cause_error_type="parse_failed",
                     cause_error_detail=str(exc),
@@ -242,6 +248,7 @@ def run_bootstrap_task(
                     source="bootstrap",
                     phase_ms=execute_ms,
                     total_ms=int((time.perf_counter() - task_started) * 1000),
+                    evidence_refs=_bootstrap_fact_evidence(data),
                 )
                 if status == "success":
                     write_business_graph(
@@ -263,6 +270,7 @@ def run_bootstrap_task(
                 source="bootstrap",
                 phase_ms=execute_ms,
                 total_ms=int((time.perf_counter() - task_started) * 1000),
+                evidence_refs=_bootstrap_fact_evidence(data),
             )
             if status == "success":
                 write_business_graph(
@@ -297,6 +305,7 @@ def run_bootstrap_task(
                 session,
                 lease,
                 cancellation,
+                source_inventory=source_inventory,
                 cause_result=first,
                 cause_error_type="timeout",
             )
@@ -333,6 +342,7 @@ def _try_conclude_fallback(
     session: str | None,
     lease: HeartbeatLease,
     cancellation: TaskCancellation,
+    source_inventory: str,
     cause_result=None,
     cause_error_type: str | None = None,
     cause_error_detail: str | None = None,
@@ -382,11 +392,14 @@ def _try_conclude_fallback(
         best_effort_release(client, project.project.id, intent.id, worker.name)
         return task_outcome("failed", error_type="fallback_project_inactive", result=cause_result)
 
-    container_name = container_manager.ensure_running(project.project.id)
+    container_name = container_manager.ensure_running(
+        project.project.id,
+        [source.id for source in getattr(project, "sources", []) if source.status == "ready"],
+    )
 
     prompt = render_prompt(
         load_prompt(config.runtime.prompt_group, "bootstrap_conclude.md"),
-        _bootstrap_prompt_replacements(project),
+        _bootstrap_prompt_replacements(project, source_inventory=source_inventory),
     )
     conclude_argv = driver.build_conclude(worker, prompt, session)
     LOG.info("starting bootstrap conclude fallback project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
@@ -508,7 +521,11 @@ def _try_conclude_fallback(
     return task_outcome(status, error_type=None if status == "success" else "conclude_write_failed", used_fallback=True)
 
 
-def _bootstrap_prompt_replacements(project: ProjectDetail) -> dict[str, str]:
+def _bootstrap_prompt_replacements(
+    project: ProjectDetail,
+    *,
+    source_inventory: str = "",
+) -> dict[str, str]:
     facts = {fact.id: fact.description for fact in project.facts}
     hints = [
         {
@@ -524,7 +541,93 @@ def _bootstrap_prompt_replacements(project: ProjectDetail) -> dict[str, str]:
         "goal": facts.get("goal", ""),
         "hints": format_hints(hints),
         "source_path": latest_ready_source_path(project) or "",
+        "source_inventory": source_inventory,
     }
+
+
+def _bootstrap_source_inventory(client: CairnClient, project: ProjectDetail) -> str:
+    ready_sources = [source for source in project.sources if source.status == "ready"]
+    if not ready_sources:
+        return json.dumps({"status": "unavailable", "reason": "no ready source snapshot"}, ensure_ascii=False)
+    snapshot = ready_sources[0]
+    fallback = {
+        "snapshot_id": snapshot.id,
+        "source_path": latest_ready_source_path(project) or "",
+        "file_count": snapshot.file_count,
+        "total_bytes": snapshot.total_bytes,
+        "detected_languages": snapshot.detected_languages,
+    }
+    try:
+        brief = client.get_source_bootstrap_brief(project.project.id, snapshot.id)
+    except Exception as exc:
+        LOG.warning(
+            "bootstrap source inventory unavailable project=%s snapshot=%s error=%s",
+            project.project.id,
+            snapshot.id,
+            exc,
+        )
+        fallback["status"] = "partial"
+        fallback["reason"] = "source index brief request failed"
+        return json.dumps(fallback, ensure_ascii=False, sort_keys=True)
+
+    manifests = []
+    for item in brief.get("manifests") or []:
+        if not isinstance(item, dict):
+            continue
+        manifests.append(
+            {
+                "path": item.get("path"),
+                "manifest_type": item.get("manifest_type"),
+                "package_name": item.get("package_name"),
+                "dependencies": list(item.get("dependencies") or [])[:20],
+                "dev_dependencies": list(item.get("dev_dependencies") or [])[:10],
+            }
+        )
+    entrypoints = []
+    for item in brief.get("entrypoints") or []:
+        if not isinstance(item, dict):
+            continue
+        entrypoints.append(
+            {
+                "path": item.get("path"),
+                "kind": item.get("kind"),
+                "framework": item.get("framework"),
+                "method": item.get("method"),
+                "route": item.get("route"),
+                "handler": item.get("handler"),
+                "line_start": item.get("line_start"),
+            }
+        )
+    candidates = []
+    for item in brief.get("priority_candidates") or []:
+        if not isinstance(item, dict):
+            continue
+        candidates.append(
+            {
+                "candidate_type": item.get("candidate_type"),
+                "severity": item.get("severity"),
+                "priority_score": item.get("priority_score"),
+                "priority_reasons": item.get("priority_reasons") or [],
+                "title": item.get("title"),
+                "file_path": item.get("file_path"),
+                "line_start": item.get("line_start"),
+                "entry_point": item.get("entry_point"),
+                "symbol": item.get("symbol"),
+            }
+        )
+    inventory = {
+        **fallback,
+        "status": "ready",
+        "index_summary": brief.get("index_summary") or {},
+        "index_quality": {
+            "score": brief.get("quality_score"),
+            "grade": brief.get("quality_grade"),
+        },
+        "manifests": manifests,
+        "priority_entrypoints": entrypoints,
+        "priority_candidates": candidates,
+    }
+    return json.dumps(inventory, ensure_ascii=False, sort_keys=True)
 
 
 def _write_bootstrap_complete_result(
@@ -538,6 +641,7 @@ def _write_bootstrap_complete_result(
     source: str,
     phase_ms: int,
     total_ms: int | None = None,
+    evidence_refs: list[str] | None = None,
 ) -> str:
     conclude = write_conclude_result_with_fact_id(
         client,
@@ -548,6 +652,7 @@ def _write_bootstrap_complete_result(
         source=source,
         phase_ms=phase_ms,
         total_ms=total_ms,
+        evidence_refs=evidence_refs,
     )
     if conclude.status != "success":
         return "failed"
@@ -607,3 +712,17 @@ def _write_bootstrap_complete_result(
             total_ms,
         )
     return "success"
+
+
+def _bootstrap_fact_evidence(data: dict) -> list[str]:
+    refs: list[str] = []
+    for node in data.get("business_nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        for item in node.get("evidence") or []:
+            value = str(item).strip()
+            if value and value not in refs:
+                refs.append(value)
+            if len(refs) >= 20:
+                return refs
+    return refs

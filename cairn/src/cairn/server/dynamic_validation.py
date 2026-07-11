@@ -47,7 +47,7 @@ def build_dynamic_validation_plan(project_id: str, snapshot_id: str) -> DynamicV
         "仅在隔离容器或测试环境中执行后续验证",
         "优先执行配置检查、依赖枚举、单元测试等低侵入动作",
         "只针对已确认候选的入口构造最小化请求，不做全站爬扫",
-        "需要人工确认基础镜像、网络、凭据、数据脱敏和资源限制后再启动服务",
+        "只有显式配置授权范围、网络白名单、临时凭据、数据脱敏和资源限制后才允许启动服务",
     ]
     blocked_actions = [
         "默认不执行 install/build/start/up 等会运行目标代码的命令",
@@ -84,6 +84,9 @@ def build_dynamic_validation_plan(project_id: str, snapshot_id: str) -> DynamicV
         allowed_actions=allowed_actions,
         blocked_actions=blocked_actions,
         warnings=warnings,
+        safety_policy=_safety_policy(),
+        preflight_checks=_preflight_checks(indicators),
+        retest_targets=_retest_targets(project_id, snapshot_id),
     )
 
 
@@ -363,6 +366,118 @@ def _warnings(large_project: bool, indicators: list[dict[str, Any]]) -> list[str
     if not indicators:
         warnings.append("没有发现可靠启动入口，动态验证不可作为当前审计质量前置条件。")
     return warnings
+
+
+def _safety_policy() -> dict[str, Any]:
+    return {
+        "authorization_required": True,
+        "execution_default": "disabled",
+        "network_default": "none",
+        "allowed_network_targets": "explicit_test_environment_allowlist_only",
+        "credentials": "temporary_least_privilege_only",
+        "data_policy": "synthetic_or_desensitized_test_data_only",
+        "container_controls": {
+            "privileged": False,
+            "host_network": False,
+            "docker_socket": False,
+            "root_filesystem": "read_only_where_possible",
+            "cpu_limit_required": True,
+            "memory_limit_required": True,
+            "timeout_required": True,
+        },
+        "result_policy": (
+            "动态结果只能补充证据；失败、超时或环境缺失不得自动覆盖静态已确认结论。"
+        ),
+    }
+
+
+def _preflight_checks(indicators: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = [
+        {
+            "id": "authorization_scope",
+            "required": True,
+            "check": "已配置授权测试目标、允许路径和有效时间窗口",
+        },
+        {
+            "id": "network_allowlist",
+            "required": True,
+            "check": "出站网络默认为禁止，仅放行测试环境地址",
+        },
+        {
+            "id": "rollback",
+            "required": True,
+            "check": "已配置临时数据、状态回滚和凭据撤销步骤",
+        },
+    ]
+    for index, indicator in enumerate(indicators, start=1):
+        command = indicator.get("preflight_command")
+        if not command:
+            continue
+        checks.append(
+            {
+                "id": f"manifest_preflight_{index}",
+                "required": True,
+                "check": f"仅解析启动清单，不启动目标服务：{indicator.get('path')}",
+                "command": command,
+                "executes_target_service": False,
+            }
+        )
+    return checks
+
+
+def _retest_targets(project_id: str, snapshot_id: str) -> list[dict[str, Any]]:
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, title, category, severity, evidence_level, file_path,
+                   line_start, line_end, entry_point, reproduction_poc_json
+            FROM audit_findings
+            WHERE project_id = ? AND snapshot_id = ? AND status = 'confirmed'
+            ORDER BY
+                CASE severity
+                    WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                    WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4
+                END,
+                file_path,
+                line_start,
+                id
+            LIMIT 200
+            """,
+            (project_id, snapshot_id),
+        ).fetchall()
+    targets: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            poc = json.loads(row["reproduction_poc_json"] or "{}")
+        except json.JSONDecodeError:
+            poc = {}
+        if not isinstance(poc, dict):
+            poc = {}
+        targets.append(
+            {
+                "finding_id": row["id"],
+                "title": row["title"],
+                "category": row["category"],
+                "severity": row["severity"],
+                "evidence_level": row["evidence_level"],
+                "entry_point": row["entry_point"],
+                "source_location": (
+                    f"{row['file_path']}:{row['line_start']}"
+                    if row["file_path"] and row["line_start"]
+                    else row["file_path"]
+                ),
+                "request_template": poc.get("request_template")
+                or poc.get("curl")
+                or poc.get("command"),
+                "steps": poc.get("steps") or [],
+                "expected_result": poc.get("expected_result")
+                or poc.get("expected_response"),
+                "fixed_result": poc.get("fixed_result")
+                or poc.get("remediated_expected_result"),
+                "cleanup_steps": poc.get("cleanup_steps") or [],
+            }
+        )
+    return targets
 
 
 def _recommended_strategy(indicators: list[dict[str, Any]]) -> str:

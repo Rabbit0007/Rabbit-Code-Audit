@@ -38,6 +38,7 @@ from fastapi import APIRouter, HTTPException, Path
 
 from cairn.server.db import get_conn
 from cairn.server.workers_models import (
+    CreateModelUsageRequest,
     CreateWorkerTaskHistoryRequest,
     WorkerConfigResponse,
     WorkerConfigUpdate,
@@ -64,6 +65,8 @@ INTERNAL_TIMEOUT_ENV = "CAIRN_DISPATCHER_INTERNAL_TIMEOUT"
 # latency-sensitive status poll. The 30.0s default comfortably exceeds the
 # dispatcher's own 20s healthcheck_timeout (dispatch.yaml).
 TEST_TIMEOUT_ENV = "CAIRN_DISPATCHER_INTERNAL_TEST_TIMEOUT"
+INTERNAL_TOKEN_ENV = "CAIRN_DISPATCHER_INTERNAL_TOKEN"
+INTERNAL_TOKEN_HEADER = "X-Cairn-Dispatcher-Internal-Token"
 DEFAULT_INTERNAL_URL = "http://127.0.0.1:8989"
 DEFAULT_INTERNAL_TIMEOUT = 2.0
 DEFAULT_INTERNAL_TEST_TIMEOUT = 30.0
@@ -131,6 +134,13 @@ def _test_timeout() -> float:
     return _resolve_timeout(TEST_TIMEOUT_ENV, DEFAULT_INTERNAL_TEST_TIMEOUT)
 
 
+def _internal_headers() -> dict[str, str] | None:
+    token = os.environ.get(INTERNAL_TOKEN_ENV, "").strip()
+    if not token:
+        return None
+    return {INTERNAL_TOKEN_HEADER: token}
+
+
 def _fetch_status_snapshot() -> dict[str, Any]:
     """Proxy to the dispatcher internal status endpoint and return its JSON.
 
@@ -142,7 +152,7 @@ def _fetch_status_snapshot() -> dict[str, Any]:
     """
     url = _status_url()
     try:
-        response = requests.get(url, timeout=_status_timeout())
+        response = requests.get(url, timeout=_status_timeout(), headers=_internal_headers())
     except requests.RequestException as exc:
         LOG.warning("dispatcher internal status unreachable url=%s error=%s", url, exc)
         raise _unavailable_exception()
@@ -177,7 +187,7 @@ def _request_internal_json(
 ) -> dict[str, Any]:
     url = _internal_url(path)
     try:
-        response = requests.request(method, url, json=payload, timeout=timeout)
+        response = requests.request(method, url, json=payload, timeout=timeout, headers=_internal_headers())
     except requests.RequestException as exc:
         LOG.warning("dispatcher internal request unreachable method=%s url=%s error=%s", method, url, exc)
         raise HTTPException(status_code=503, detail={"message": unavailable_message, "last_updated": None})
@@ -430,9 +440,9 @@ def create_worker_history_entry(body: CreateWorkerTaskHistoryRequest) -> dict[st
                 worker_name, project_id, task_type, intent_id, started_at,
                 completed_at, duration_seconds, outcome, error_type,
                 error_detail, rate_limited, used_fallback, stdout_preview,
-                stderr_preview
+                stderr_preview, model_call_count, estimated_input_tokens
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 body.worker_name,
@@ -449,10 +459,133 @@ def create_worker_history_entry(body: CreateWorkerTaskHistoryRequest) -> dict[st
                 1 if body.used_fallback else 0,
                 body.stdout_preview,
                 body.stderr_preview,
+                body.model_call_count,
+                body.estimated_input_tokens,
             ),
         )
         row_id = int(cursor.lastrowid)
     return {"id": row_id}
+
+
+@router.get("/history/project-usage")
+def project_worker_usage(project_id: str) -> dict[str, int | float]:
+    with get_conn() as conn:
+        first_usage = conn.execute(
+            "SELECT MIN(created_at) AS created_at FROM model_usage_records WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()["created_at"]
+        history_clause = ""
+        params: list[object] = [project_id]
+        if first_usage:
+            history_clause = "AND (completed_at IS NULL OR completed_at < ?)"
+            params.append(first_usage)
+        task_totals = conn.execute(
+            """
+            SELECT COUNT(*) AS task_count,
+                   COALESCE(SUM(CASE WHEN task_type = 'reason' THEN 1 ELSE 0 END), 0)
+                       AS reason_round_count
+            FROM worker_task_history
+            WHERE project_id = ?
+            """,
+            (project_id,),
+        ).fetchone()
+        history_baseline = conn.execute(
+            """
+            SELECT COALESCE(SUM(model_call_count), 0) AS model_call_count,
+                   COALESCE(SUM(estimated_input_tokens), 0) AS estimated_input_tokens
+            FROM worker_task_history
+            WHERE project_id = ?
+            """
+            + history_clause,
+            params,
+        ).fetchone()
+        actual = conn.execute(
+            """
+            SELECT COUNT(*) AS model_call_count,
+                   COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                   COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                   COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                   COALESCE(SUM(cost_usd), 0) AS cost_usd,
+                   COALESCE(SUM(CASE WHEN estimated = 1 THEN 1 ELSE 0 END), 0)
+                       AS estimated_record_count
+            FROM model_usage_records
+            WHERE project_id = ?
+            """,
+            (project_id,),
+        ).fetchone()
+    return {
+        "task_count": int(task_totals["task_count"]),
+        "model_call_count": int(history_baseline["model_call_count"])
+        + int(actual["model_call_count"]),
+        "estimated_input_tokens": int(history_baseline["estimated_input_tokens"])
+        + int(actual["prompt_tokens"]),
+        "reason_round_count": int(task_totals["reason_round_count"]),
+        "prompt_tokens": int(actual["prompt_tokens"]),
+        "completion_tokens": int(actual["completion_tokens"]),
+        "total_tokens": int(actual["total_tokens"]),
+        "cost_usd": float(actual["cost_usd"]),
+        "estimated_record_count": int(actual["estimated_record_count"]),
+    }
+
+
+@router.post("/model-usage", status_code=201)
+def create_model_usage(body: CreateModelUsageRequest) -> dict[str, int]:
+    with get_conn() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO model_usage_records (
+                project_id, model, request_id, prompt_tokens, completion_tokens,
+                total_tokens, cached_prompt_tokens, estimated, cost_usd, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                body.project_id,
+                body.model,
+                body.request_id,
+                body.prompt_tokens,
+                body.completion_tokens,
+                body.total_tokens,
+                body.cached_prompt_tokens,
+                1 if body.estimated else 0,
+                body.cost_usd,
+                body.created_at,
+            ),
+        )
+    return {"id": int(cursor.lastrowid)}
+
+
+@router.get("/history/explore-retry-failures")
+def list_explore_retry_failures(project_id: str) -> list[dict[str, object]]:
+    """Return consecutive retryable explore failures after each intent's last success."""
+    retryable = ("parse_failed", "fallback_parse_failed", "timeout", "fallback_timeout")
+    placeholders = ", ".join("?" for _ in retryable)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT h.intent_id,
+                   COUNT(*) AS failures,
+                   MAX(h.completed_at) AS last_failed_at,
+                   MAX(h.error_detail) AS last_error
+            FROM worker_task_history h
+            WHERE h.project_id = ?
+              AND h.task_type = 'explore'
+              AND h.intent_id IS NOT NULL
+              AND h.outcome = 'failed'
+              AND h.error_type IN ({placeholders})
+              AND h.id > COALESCE((
+                    SELECT MAX(s.id)
+                    FROM worker_task_history s
+                    WHERE s.project_id = h.project_id
+                      AND s.task_type = 'explore'
+                      AND s.intent_id = h.intent_id
+                      AND s.outcome = 'success'
+              ), 0)
+            GROUP BY h.intent_id
+            ORDER BY h.intent_id
+            """,
+            (project_id, *retryable),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def _build_history_description(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -97,6 +98,27 @@ def test_settings_health_reports_dispatcher_and_database(temp_db, monkeypatch):
     assert body["summary"]["online_workers"] == 2
     assert body["summary"]["offline_workers"] == 0
     assert {check["key"] for check in body["checks"]} >= {"server", "database", "dispatcher", "workers", "auth", "retention"}
+
+
+def test_dispatcher_health_requests_include_internal_token(monkeypatch):
+    monkeypatch.setenv("CAIRN_DISPATCHER_INTERNAL_TOKEN", "dispatcher-secret")
+    seen: list[dict[str, str]] = []
+
+    def fake_get(url, *, timeout, headers):
+        seen.append(dict(headers))
+        payload = {"workers": []} if url.endswith("/internal/status") else {"ok": True}
+        return SimpleNamespace(status_code=200, json=lambda: payload)
+
+    monkeypatch.setattr(settings_router.requests, "get", fake_get)
+
+    snapshot, error = settings_router._fetch_dispatcher_snapshot()
+
+    assert error is None
+    assert snapshot == {"workers": []}
+    assert seen == [
+        {"X-Cairn-Dispatcher-Internal-Token": "dispatcher-secret"},
+        {"X-Cairn-Dispatcher-Internal-Token": "dispatcher-secret"},
+    ]
 
 
 def test_configure_migrates_legacy_settings_columns(tmp_path, monkeypatch):

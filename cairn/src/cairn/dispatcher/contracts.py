@@ -103,6 +103,7 @@ BUSINESS_EDGE_RELATION_ALIASES = {
 }
 BUSINESS_NODE_RISK_LEVELS = {"critical", "high", "medium", "low", "unknown"}
 BUSINESS_NODE_REVIEW_STATUSES = {"unreviewed", "investigating", "covered", "blocked"}
+BUSINESS_GRAPH_LAYERS = {"evidence", "semantic", "audit"}
 BUSINESS_NODE_CONCLUSIONS = {"confirmed_finding", "rejected", "needs_more_evidence"}
 BUSINESS_NODE_CONCLUSION_ALIASES = {
     "no_finding": "rejected",
@@ -123,6 +124,11 @@ BUSINESS_NODE_CONFIRMED_ALIASES = {
     "confirmed_vulnerability",
 }
 SEVERITIES = {"critical", "high", "medium", "low", "info"}
+MAX_REASON_INTENT_SOURCE_FILES = 5
+REASON_SOURCE_FILE_RE = re.compile(
+    r"(?<![\w.-])(?:[\w@.-]+/)*[\w@.-]+\.(?:py|php|js|jsx|ts|tsx|java|go|rb|rs|cs|kt|scala|jsp|jspx|asp|aspx|vue|sql|yaml|yml|json|xml|ini|conf|toml)\b",
+    re.IGNORECASE,
+)
 AUDIT_CANDIDATE_SEVERITIES = {"critical", "high", "medium", "low", "info", "unknown"}
 AUDIT_CANDIDATE_STATUSES = {"confirmed", "rejected", "needs_more_evidence"}
 
@@ -307,6 +313,18 @@ def _validate_business_nodes(value: Any) -> list[dict[str, Any]]:
         ref = item.get("ref")
         if ref is not None and (not isinstance(ref, str) or not ref.strip()):
             raise ValueError(f"business node at index {index} ref must be a non-empty string")
+        evidence = _string_list(item.get("evidence"), f"business node {index} evidence")
+        semantic_key = item.get("semantic_key")
+        if semantic_key is not None and (not isinstance(semantic_key, str) or not semantic_key.strip()):
+            raise ValueError(f"business node at index {index} semantic_key must be a non-empty string")
+        key_seed = semantic_key or f"{node_type}:{ref or title}"
+        normalized_key = re.sub(r"[^\w:./-]+", "_", str(key_seed).strip().lower(), flags=re.UNICODE).strip("_.:-/")
+        graph_layer = item.get("graph_layer", "audit" if node_type == "risk" else "semantic")
+        if graph_layer not in BUSINESS_GRAPH_LAYERS:
+            raise ValueError(f"business node at index {index} has invalid graph_layer")
+        confidence = item.get("confidence", 0.7)
+        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not 0 <= confidence <= 1:
+            raise ValueError(f"business node at index {index} confidence must be between 0 and 1")
         node = {
             "node_type": node_type,
             "title": title.strip(),
@@ -316,7 +334,10 @@ def _validate_business_nodes(value: Any) -> list[dict[str, Any]]:
             "coverage_note": coverage_note.strip() if isinstance(coverage_note, str) and coverage_note.strip() else None,
             "last_intent_id": last_intent_id.strip() if isinstance(last_intent_id, str) and last_intent_id.strip() else None,
             "risk_tags": _string_list(item.get("risk_tags"), f"business node {index} risk_tags"),
-            "evidence": _string_list(item.get("evidence"), f"business node {index} evidence"),
+            "evidence": evidence,
+            "semantic_key": normalized_key[:240],
+            "graph_layer": graph_layer,
+            "confidence": float(confidence),
         }
         if isinstance(ref, str):
             node["ref"] = ref.strip()
@@ -343,12 +364,20 @@ def _validate_business_edges(value: Any) -> list[dict[str, Any]]:
         description = item.get("description")
         if description is not None and not isinstance(description, str):
             raise ValueError(f"business edge at index {index} description must be a string")
+        graph_layer = item.get("graph_layer", "audit" if relation == "risk_of" else "semantic")
+        if graph_layer not in BUSINESS_GRAPH_LAYERS:
+            raise ValueError(f"business edge at index {index} has invalid graph_layer")
+        confidence = item.get("confidence", 0.7)
+        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not 0 <= confidence <= 1:
+            raise ValueError(f"business edge at index {index} confidence must be between 0 and 1")
         edges.append(
             {
                 "from": from_ref.strip(),
                 "to": to_ref.strip(),
                 "relation": relation,
                 "description": description.strip() if isinstance(description, str) and description.strip() else None,
+                "graph_layer": graph_layer,
+                "confidence": float(confidence),
             }
         )
     return edges
@@ -775,6 +804,12 @@ def _validate_reason_intent(item: Any, index: int) -> dict[str, Any]:
     description = item.get("description")
     if not isinstance(description, str) or not description.strip():
         raise ValueError(f"intent at index {index} requires description")
+    source_files = {match.group(0) for match in REASON_SOURCE_FILE_RE.finditer(description)}
+    if len(source_files) > MAX_REASON_INTENT_SOURCE_FILES:
+        raise ValueError(
+            f"intent at index {index} references {len(source_files)} source files; "
+            f"maximum is {MAX_REASON_INTENT_SOURCE_FILES}"
+        )
     from_ids = _string_list(item.get("from"), f"intent at index {index}.from")
     if not from_ids:
         raise ValueError(f"intent at index {index} requires at least one source fact")
@@ -1007,3 +1042,66 @@ def validate_explore_payload(payload: dict[str, Any]) -> tuple[str, dict[str, An
         "business_edges": business_edges,
         "business_node_conclusions": business_node_conclusions,
     }
+
+
+def salvage_unproven_explore_findings(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert high-risk findings without proof material into open candidates."""
+    accepted, wrapped_data = _unwrap_wrapped_payload(payload)
+    if accepted is False:
+        return None
+    data = wrapped_data if accepted is True else payload
+    if not isinstance(data, dict):
+        return None
+    raw_findings: list[Any] = []
+    if data.get("finding") is not None:
+        raw_findings.append(data["finding"])
+    if data.get("findings") is not None:
+        if not isinstance(data["findings"], list):
+            return None
+        raw_findings.extend(data["findings"])
+    if not raw_findings:
+        return None
+
+    valid_findings: list[dict[str, Any]] = []
+    candidates = list(data.get("audit_candidates") or [])
+    converted = 0
+    for index, finding in enumerate(raw_findings):
+        try:
+            valid_findings.append(_validate_one_finding(finding, index))
+            continue
+        except ValueError as exc:
+            if "requires complete proof_packets or reproduction_poc" not in str(exc):
+                return None
+        if not isinstance(finding, dict):
+            return None
+        candidates.append(
+            {
+                "source": "model_unproven_finding",
+                "candidate_type": "finding_needs_proof",
+                "severity": finding.get("severity", "unknown"),
+                "title": str(finding.get("title") or "待补证高风险发现"),
+                "description": (
+                    f"模型发现尚缺少完整复现材料，未作为确认漏洞落库。原始描述: "
+                    f"{finding.get('description') or ''} 现有证据: {finding.get('evidence') or ''}"
+                ),
+                "file_path": finding.get("file_path"),
+                "line_start": finding.get("line_start"),
+                "line_end": finding.get("line_end"),
+                "entry_point": finding.get("entry_point"),
+                "symbol": finding.get("symbol"),
+                "business_node_id": finding.get("business_node_id"),
+            }
+        )
+        converted += 1
+    if converted == 0:
+        return None
+
+    salvaged = dict(data)
+    salvaged.pop("finding", None)
+    salvaged["findings"] = valid_findings
+    salvaged["audit_candidates"] = candidates
+    description = str(salvaged.get("description") or "").strip()
+    salvaged["description"] = (
+        f"{description}\n系统将 {converted} 个缺少完整复现材料的高风险发现降级为待补证候选。"
+    ).strip()
+    return {"accepted": True, "data": salvaged}

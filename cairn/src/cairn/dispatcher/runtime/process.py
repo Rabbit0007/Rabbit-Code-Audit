@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import suppress
+from collections import deque
 from dataclasses import dataclass
 import logging
 import threading
@@ -12,6 +13,42 @@ from docker.models.containers import Container
 
 LOG = logging.getLogger(__name__)
 EXEC_KILL_JOIN_TIMEOUT_SECONDS = 5.0
+DEFAULT_CAPTURE_LIMIT_CHARS = 8 * 1024 * 1024
+TRUNCATION_MARKER = "[dispatcher output truncated; retained tail]\n"
+
+
+class _BoundedTextBuffer:
+    def __init__(self, limit: int = DEFAULT_CAPTURE_LIMIT_CHARS):
+        self.limit = max(1, limit)
+        self._chunks: deque[str] = deque()
+        self._length = 0
+        self.truncated = False
+
+    def append(self, value: str) -> None:
+        if not value:
+            return
+        if len(value) >= self.limit:
+            self._chunks.clear()
+            self._chunks.append(value[-self.limit :])
+            self._length = self.limit
+            self.truncated = True
+            return
+        self._chunks.append(value)
+        self._length += len(value)
+        while self._length > self.limit and self._chunks:
+            overflow = self._length - self.limit
+            head = self._chunks[0]
+            if len(head) <= overflow:
+                self._chunks.popleft()
+                self._length -= len(head)
+            else:
+                self._chunks[0] = head[overflow:]
+                self._length -= overflow
+            self.truncated = True
+
+    def render(self) -> str:
+        content = "".join(self._chunks)
+        return f"{TRUNCATION_MARKER}{content}" if self.truncated else content
 
 
 @dataclass(slots=True)
@@ -32,8 +69,8 @@ class ManagedProcess:
         self._api = container.client.api
         self._exec_id: str | None = None
         self._reader: threading.Thread | None = None
-        self._stdout: list[str] = []
-        self._stderr: list[str] = []
+        self._stdout = _BoundedTextBuffer()
+        self._stderr = _BoundedTextBuffer()
         self._returncode: int | None = None
         self._timed_out = False
         self._cancel_reason: str | None = None
@@ -66,12 +103,12 @@ class ManagedProcess:
                 self._returncode = 137
             self._done.set()
         self._done.wait(timeout=0)
-        if self._read_error and not self._stderr:
+        if self._read_error and not self._stderr.render():
             self._stderr.append(self._read_error)
         return ProcessResult(
             returncode=self._returncode if self._returncode is not None else 1,
-            stdout="".join(self._stdout),
-            stderr="".join(self._stderr),
+            stdout=self._stdout.render(),
+            stderr=self._stderr.render(),
             timed_out=self._timed_out,
             cancelled=self._cancel_reason is not None,
             cancel_reason=self._cancel_reason,

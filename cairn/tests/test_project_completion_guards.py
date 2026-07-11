@@ -101,6 +101,35 @@ def test_complete_rejects_open_intents(temp_db):
     assert detail["open_intents"][0]["description"] == "review upload endpoint"
 
 
+def test_complete_ignores_superseded_intents_without_result_fact(temp_db):
+    client = _client()
+    project_id = _create_project(client)
+
+    create_intent = client.post(
+        f"/projects/{project_id}/intents",
+        json={
+            "from": ["origin"],
+            "description": "obsolete investigation",
+            "creator": "worker-1",
+        },
+    )
+    assert create_intent.status_code == 201
+    intent_id = create_intent.json()["id"]
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE intents SET status = 'superseded' WHERE id = ? AND project_id = ?",
+            (intent_id, project_id),
+        )
+
+    complete = client.post(
+        f"/projects/{project_id}/complete",
+        json={"from": ["origin"], "description": "done", "worker": "worker-1"},
+    )
+
+    assert complete.status_code == 200
+    assert complete.json()["to"] == "goal"
+
+
 def test_complete_rejects_unreviewed_high_risk_business_nodes(temp_db):
     client = _client()
     project_id = _create_project(client)
@@ -173,6 +202,122 @@ def test_complete_rejects_open_required_audit_candidates(temp_db):
         "Critical, high, or unknown audit candidates require closure before completion"
     )
     assert detail["audit_candidates"][0]["id"] == "cand_1"
+
+
+def test_complete_ignores_required_candidate_from_stale_snapshot(temp_db):
+    client = _client()
+    project_id = _create_project(client)
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO source_snapshots (
+                id, project_id, source_type, status, file_count, total_bytes,
+                detected_languages_json, created_at
+            )
+            VALUES ('snap_old', ?, 'zip', 'ready', 1, 10, '{}', '2026-01-01T00:00:00Z')
+            """,
+            (project_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO source_snapshots (
+                id, project_id, source_type, status, file_count, total_bytes,
+                detected_languages_json, created_at
+            )
+            VALUES ('snap_new', ?, 'zip', 'ready', 1, 10, '{}', '2026-01-02T00:00:00Z')
+            """,
+            (project_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_candidates (
+                id, project_id, snapshot_id, source, candidate_type, severity,
+                title, description, file_path, line_start, entry_point,
+                status, created_by, created_at, updated_at
+            )
+            VALUES (
+                'cand_old', ?, 'snap_old', 'index', 'data_flow', 'high',
+                'stale high-risk candidate', 'old upload flow',
+                'old.js', 9, 'POST /old-upload', 'candidate',
+                'source_index', '2026-01-01T00:00:01Z', '2026-01-01T00:00:01Z'
+            )
+            """,
+            (project_id,),
+        )
+
+    complete = client.post(
+        f"/projects/{project_id}/complete",
+        json={"from": ["origin"], "description": "done", "worker": "worker-1"},
+    )
+
+    assert complete.status_code == 200
+    assert complete.json()["to"] == "goal"
+
+
+def test_complete_does_not_use_stale_snapshot_business_node_as_seed(temp_db):
+    client = _client()
+    project_id = _create_project(client)
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO source_snapshots (
+                id, project_id, source_type, status, file_count, total_bytes,
+                detected_languages_json, created_at
+            )
+            VALUES ('snap_old', ?, 'zip', 'ready', 1, 10, '{}', '2026-01-01T00:00:00Z')
+            """,
+            (project_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO source_snapshots (
+                id, project_id, source_type, status, file_count, total_bytes,
+                detected_languages_json, created_at
+            )
+            VALUES ('snap_new', ?, 'zip', 'ready', 1, 10, '{}', '2026-01-02T00:00:00Z')
+            """,
+            (project_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO business_nodes (
+                id, project_id, source_snapshot_id, node_type, title, risk_level,
+                review_status, coverage_note, risk_tags_json, evidence_json,
+                created_by, created_at, updated_at
+            )
+            VALUES (
+                'biz_old', ?, 'snap_old', 'endpoint', 'old upload',
+                'low', 'covered', 'old snapshot only', '[]', '[]',
+                'source_index', '2026-01-01T00:00:01Z', '2026-01-01T00:00:01Z'
+            )
+            """,
+            (project_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO code_entrypoints (
+                id, snapshot_id, path, language, kind, method, route, handler,
+                line_start, evidence, confidence, source
+            )
+            VALUES (
+                'entry_new', 'snap_new', 'app.py', 'python', 'http_route',
+                'GET', '/new', 'new_handler', 10, 'route decorator', 0.9,
+                'heuristic'
+            )
+            """
+        )
+
+    complete = client.post(
+        f"/projects/{project_id}/complete",
+        json={"from": ["origin"], "description": "done", "worker": "worker-1"},
+    )
+
+    assert complete.status_code == 409
+    detail = complete.json()["detail"]
+    assert detail["message"] == "Ready source index requires business graph seed before completion"
+    assert detail["snapshot_id"] == "snap_new"
 
 
 def test_complete_allows_index_entrypoint_navigation_candidate(temp_db):

@@ -3,7 +3,9 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 import json
 from importlib import resources
+import os
 from pathlib import Path
+import re
 from typing import Any, Literal
 
 import yaml
@@ -13,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 TaskType = Literal["reason", "explore", "bootstrap", "report_enrichment", "review"]
 WorkerType = Literal["claudecode", "codex", "pi", "mock"]
 CompletedAction = Literal["remove", "stop"]
+ENV_REFERENCE_RE = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*)\}$")
 
 PI_PROVIDER_API_ALIASES: dict[str, str] = {
     "openai": "openai-completions",
@@ -71,6 +74,19 @@ MOCK_ALLOWED_OUTCOMES: dict[str, frozenset[str]] = {
     "bootstrap": frozenset({"complete", "fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
     "bootstrap_conclude": frozenset({"fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
 }
+
+
+def _resolve_env_reference(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    match = ENV_REFERENCE_RE.fullmatch(value.strip())
+    if match is None:
+        return value
+    name = match.group(1)
+    resolved = os.environ.get(name, "").strip()
+    if not resolved:
+        raise ValueError(f"required worker environment variable {name} is not set")
+    return resolved
 
 MOCK_DEFAULT_BEHAVIOR: dict[str, dict[str, Any]] = {
     "healthcheck": {
@@ -307,6 +323,10 @@ class DispatchConfig(BaseModel):
         if not isinstance(common_env, dict) or not isinstance(workers, list):
             return data
 
+        resolved_common_env = {
+            str(key): _resolve_env_reference(value)
+            for key, value in common_env.items()
+        }
         merged = dict(data)
         merged_workers: list[Any] = []
         for worker in workers:
@@ -320,7 +340,11 @@ class DispatchConfig(BaseModel):
                 merged_workers.append(worker)
                 continue
             worker_copy = dict(worker)
-            worker_copy["env"] = {**common_env, **worker_env}
+            resolved_worker_env = {
+                str(key): _resolve_env_reference(value)
+                for key, value in worker_env.items()
+            }
+            worker_copy["env"] = {**resolved_common_env, **resolved_worker_env}
             merged_workers.append(worker_copy)
         merged["workers"] = merged_workers
         return merged

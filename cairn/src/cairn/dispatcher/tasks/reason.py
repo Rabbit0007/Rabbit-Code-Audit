@@ -51,7 +51,10 @@ def run_reason_task(
     lease = HeartbeatLease.for_reason(client, project.project.id, worker.name, config.runtime.interval)
     lease.start()
     try:
-        container_name = container_manager.ensure_running(project.project.id)
+        container_name = container_manager.ensure_running(
+            project.project.id,
+            [source.id for source in getattr(project, "sources", []) if source.status == "ready"],
+        )
 
         LOG.info(
             "starting container exec project=%s worker=%s phase=reason_healthcheck timeout=%ss",
@@ -108,6 +111,7 @@ def run_reason_task(
             }
             for intent in project.intents
             if intent.to is None
+            and getattr(intent, "status", "open") in {"open", "claimed", "cooldown"}
         ]
         allowed_fact_ids = [fact.id for fact in project.facts if fact.id != "goal"]
         LOG.debug(

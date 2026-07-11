@@ -89,6 +89,7 @@ class ProjectMeta(BaseModel):
     status: Literal["active", "stopped", "completed"]
     created_at: str
     reason: ProjectReason | None = None
+    pause_reason: str | None = None
 
 
 class ProjectSummary(ProjectMeta):
@@ -258,10 +259,28 @@ class ReasonClaimRequest(BaseModel):
 class ConcludeRequest(BaseModel):
     worker: str
     description: str
+    evidence_refs: list[str] = Field(default_factory=list)
 
     @field_validator("worker", "description")
     @classmethod
     def validate_non_empty_text(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("must not be empty")
+        return text
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def normalize_evidence_refs(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(text for item in value if (text := str(item).strip())))
+
+
+class SupersedeIntentRequest(BaseModel):
+    superseded_by: str
+
+    @field_validator("superseded_by")
+    @classmethod
+    def validate_superseded_by(cls, value: str) -> str:
         text = value.strip()
         if not text:
             raise ValueError("must not be empty")
@@ -302,6 +321,15 @@ class ConcludeResponse(BaseModel):
 
 class UpdateProjectStatusRequest(BaseModel):
     status: Literal["active", "stopped"]
+    pause_reason: str | None = None
+
+    @field_validator("pause_reason")
+    @classmethod
+    def normalize_pause_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        return text or None
 
 
 class UpdateProjectTitleRequest(BaseModel):

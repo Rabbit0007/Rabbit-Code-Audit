@@ -12,12 +12,14 @@ from cairn.server.source_models import (
     DependencyManifest,
     DynamicValidationPlan,
     GitSourceImportRequest,
+    SourceBootstrapBrief,
     SourceIndexQuality,
     SourceIndexSummary,
     SourceSnapshot,
 )
 from cairn.server.source_service import (
     get_snapshot,
+    get_source_bootstrap_brief,
     get_source_index_quality,
     get_source_index_summary,
     import_git_source,
@@ -93,6 +95,16 @@ def get_source_quality(project_id: str, snapshot_id: str):
     try:
         return get_source_index_quality(project_id, snapshot_id)
     except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.get("/{snapshot_id}/bootstrap-brief", response_model=SourceBootstrapBrief)
+def get_bootstrap_brief(project_id: str, snapshot_id: str):
+    try:
+        return get_source_bootstrap_brief(project_id, snapshot_id)
+    except ValueError as exc:
+        if "not ready" in str(exc).lower():
+            raise HTTPException(409, str(exc)) from exc
         raise HTTPException(404, str(exc)) from exc
 
 

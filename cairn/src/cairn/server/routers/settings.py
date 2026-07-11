@@ -9,7 +9,7 @@ from cairn.server import db
 from cairn.server.activity_service import record_audit, record_notification
 from cairn.server.db import get_conn
 from cairn.server.models import RuntimeInfo, Settings
-from cairn.server.routers.workers import _internal_url, _status_timeout
+from cairn.server.routers.workers import _internal_headers, _internal_url, _status_timeout
 from cairn.server.settings_models import (
     SettingsAlert,
     SettingsCleanupResult,
@@ -61,10 +61,19 @@ def _summary_status(checks: list[SettingsHealthCheck], alerts: list[SettingsAler
 
 def _fetch_dispatcher_snapshot() -> tuple[dict | None, str | None]:
     try:
-        health = requests.get(_internal_url("/internal/health"), timeout=_status_timeout())
+        headers = _internal_headers()
+        health = requests.get(
+            _internal_url("/internal/health"),
+            timeout=_status_timeout(),
+            headers=headers,
+        )
         if health.status_code != 200:
             return None, f"调度器健康检查返回 {health.status_code}"
-        response = requests.get(_internal_url("/internal/status"), timeout=_status_timeout())
+        response = requests.get(
+            _internal_url("/internal/status"),
+            timeout=_status_timeout(),
+            headers=headers,
+        )
         if response.status_code != 200:
             return None, f"调度器状态接口返回 {response.status_code}"
         payload = response.json()
@@ -223,15 +232,28 @@ def health() -> SettingsHealthResponse:
         )
     else:
         runtime = dispatcher_snapshot.get("runtime") if isinstance(dispatcher_snapshot, dict) else {}
+        dispatcher_uptime = float(runtime.get("uptime_seconds") or 0)
+        dispatcher_recent_start = stats.active_projects > 0 and dispatcher_uptime < 300
         checks.append(
             SettingsHealthCheck(
                 key="dispatcher",
                 label="调度器联通性",
-                status="ok",
+                status="warning" if dispatcher_recent_start else "ok",
                 summary=f"轮询间隔 {runtime.get('interval', '-')}s，运行任务 {runtime.get('running_task_count', 0)}",
-                detail=f"最大并发 {runtime.get('max_workers', 0)}，运行项目 {runtime.get('running_project_count', 0)}。",
+                detail=(
+                    f"最大并发 {runtime.get('max_workers', 0)}，运行项目 {runtime.get('running_project_count', 0)}，"
+                    f"本次实例已运行 {int(dispatcher_uptime)} 秒。"
+                ),
             )
         )
+        if dispatcher_recent_start:
+            alerts.append(
+                SettingsAlert(
+                    level="warning",
+                    title="调度器最近重新启动",
+                    detail="活动项目存在时调度器运行不足 5 分钟；系统已清理遗留执行进程，避免同一任务重复调用模型。",
+                )
+            )
         worker_status = "ok" if worker_offline == 0 else "warning"
         checks.append(
             SettingsHealthCheck(

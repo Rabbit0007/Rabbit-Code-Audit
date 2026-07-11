@@ -94,7 +94,7 @@ class _FakeContainerManager:
         self._execute_stdout = execute_stdout
         self._execute_result = execute_result
 
-    def ensure_running(self, project_id: str) -> str:
+    def ensure_running(self, project_id: str, snapshot_ids=None) -> str:
         return "container-1"
 
     def write_text_file(self, container_name: str, path: str, content: str) -> None:
@@ -259,3 +259,38 @@ def test_report_enrichment_connection_error_releases_task(monkeypatch):
     assert client.released is True
     assert client.failed is None
     assert client.completed_payload is None
+
+
+def test_report_enrichment_parse_failure_completes_with_static_fallback(monkeypatch):
+    evidence_packet = {
+        "finding": {
+            "id": "finding_1",
+            "title": "SQL 注入",
+            "status": "confirmed",
+            "file_path": "Less-1/index.php",
+            "line_start": 29,
+            "entry_point": "/Less-1/",
+            "description": "id 参数进入 SQL 拼接",
+            "impact": "攻击者可读取数据库内容",
+            "evidence": "Less-1/index.php:29",
+        },
+        "code_index": {"entrypoints": [{"method": "GET", "route": "/Less-1/"}]},
+    }
+    driver = _FakeDriver()
+    monkeypatch.setattr(report_enrichment, "get_driver", lambda worker_type: driver)
+    client = _FakeClient(evidence_packet)
+
+    outcome = report_enrichment.run_report_enrichment_task(
+        _config(),
+        client,
+        _FakeContainerManager("analysis only; no final JSON"),
+        SimpleNamespace(project=SimpleNamespace(id="proj_1")),
+        {"id": "rpt_1", "finding_id": "finding_1"},
+        _config().workers[0],
+        TaskCancellation(),
+    )
+
+    assert outcome.status == "success"
+    assert outcome.used_fallback is True
+    assert client.failed is None
+    assert client.completed_payload["packet_templates"][0]["request"].startswith("GET /Less-1/ HTTP/1.1")

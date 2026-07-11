@@ -28,16 +28,17 @@ def record_audit(
     actor: str = "admin",
     target_type: str | None = None,
     target_id: str | None = None,
+    project_id: str | None = None,
     detail: str | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> None:
     """Append a single audit-log row. Best-effort; never raises."""
     try:
         if conn is not None:
-            _insert_audit(conn, action, summary, actor, target_type, target_id, detail)
+            _insert_audit(conn, action, summary, actor, target_type, target_id, project_id, detail)
             return
         with get_conn() as own_conn:
-            _insert_audit(own_conn, action, summary, actor, target_type, target_id, detail)
+            _insert_audit(own_conn, action, summary, actor, target_type, target_id, project_id, detail)
     except Exception:  # pragma: no cover - logging must not break the operation
         pass
 
@@ -48,6 +49,7 @@ def record_notification(
     level: str = "info",
     body: str | None = None,
     link: str | None = None,
+    project_id: str | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> None:
     """Append a single notification row. Best-effort; never raises."""
@@ -55,10 +57,10 @@ def record_notification(
         level = "info"
     try:
         if conn is not None:
-            _insert_notification(conn, title, level, body, link)
+            _insert_notification(conn, title, level, body, link, project_id)
             return
         with get_conn() as own_conn:
-            _insert_notification(own_conn, title, level, body, link)
+            _insert_notification(own_conn, title, level, body, link, project_id)
     except Exception:  # pragma: no cover - logging must not break the operation
         pass
 
@@ -70,15 +72,16 @@ def _insert_audit(
     actor: str,
     target_type: str | None,
     target_id: str | None,
+    project_id: str | None,
     detail: str | None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO audit_log
-            (created_at, actor, action, target_type, target_id, summary, detail)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (created_at, actor, action, target_type, target_id, project_id, summary, detail)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (_now(), actor or "admin", action, target_type, target_id, summary, detail),
+        (_now(), actor or "admin", action, target_type, target_id, project_id, summary, detail),
     )
 
 
@@ -88,11 +91,12 @@ def _insert_notification(
     level: str,
     body: str | None,
     link: str | None,
+    project_id: str | None,
 ) -> None:
     conn.execute(
         """
-        INSERT INTO notifications (created_at, level, title, body, link, read)
-        VALUES (?, ?, ?, ?, ?, 0)
+        INSERT INTO notifications (created_at, level, title, body, link, project_id, read)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
         """,
-        (_now(), level, title, body, link),
+        (_now(), level, title, body, link, project_id),
     )

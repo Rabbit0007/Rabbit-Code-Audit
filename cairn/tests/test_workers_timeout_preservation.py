@@ -267,10 +267,10 @@ def _install_fakes(monkeypatch, *, scenario: str, latency: float, captured: list
             raise requests.Timeout(f"simulated latency {latency}s > timeout {timeout}s")
         return _success_response(url)
 
-    def fake_get(url, timeout=None):  # noqa: ARG001
+    def fake_get(url, timeout=None, headers=None):  # noqa: ARG001
         return behave(url, timeout)
 
-    def fake_request(method, url, json=None, timeout=None):  # noqa: ARG001
+    def fake_request(method, url, json=None, timeout=None, headers=None):  # noqa: ARG001
         return behave(url, timeout)
 
     monkeypatch.setattr(workers.requests, "get", fake_get)

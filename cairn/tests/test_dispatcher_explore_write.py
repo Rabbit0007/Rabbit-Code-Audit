@@ -142,7 +142,7 @@ class _FallbackClient:
 
 
 class _FallbackContainerManager:
-    def ensure_running(self, project_id: str) -> str:
+    def ensure_running(self, project_id: str, snapshot_ids=None) -> str:
         return f"container-{project_id}"
 
     def write_text_file(self, container_name: str, path: str, content: str) -> None:

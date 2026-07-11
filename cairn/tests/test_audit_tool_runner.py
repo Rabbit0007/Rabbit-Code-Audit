@@ -326,6 +326,9 @@ def test_dynamic_validation_plan_is_plan_only(temp_db, monkeypatch, tmp_path):
     assert plan["mode"] == "plan_only"
     assert plan["execution_default"] == "disabled"
     assert plan["status"] == "ready"
+    assert plan["safety_policy"]["network_default"] == "none"
+    assert plan["safety_policy"]["container_controls"]["docker_socket"] is False
+    assert any(item["id"] == "authorization_scope" for item in plan["preflight_checks"])
     assert any(item["type"] == "docker_compose" for item in plan["launch_indicators"])
     assert any("不会自动执行目标项目命令" in warning for warning in plan["warnings"])
 

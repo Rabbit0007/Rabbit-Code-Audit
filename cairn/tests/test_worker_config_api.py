@@ -8,7 +8,13 @@ from fastapi.testclient import TestClient
 import yaml
 
 from cairn.dispatcher.config import DispatchConfig
-from cairn.dispatcher.internal_api import SECRET_MASK, _write_dispatch_config, create_internal_app
+from cairn.dispatcher.internal_api import (
+    SECRET_MASK,
+    TOKEN_ENV,
+    TOKEN_HEADER,
+    _write_dispatch_config,
+    create_internal_app,
+)
 
 
 def _config(workers: list[dict]) -> DispatchConfig:
@@ -64,6 +70,31 @@ def _client(tmp_path, config: DispatchConfig) -> tuple[TestClient, _Loop]:
     path.write_text("workers: []\n", encoding="utf-8")
     loop = _Loop(path, config)
     return TestClient(create_internal_app(loop)), loop
+
+
+def test_internal_api_requires_token_when_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv(TOKEN_ENV, "dispatcher-secret")
+    client, _loop = _client(
+        tmp_path,
+        _config(
+            [
+                {
+                    "name": "mock-1",
+                    "type": "mock",
+                    "enabled": True,
+                    "task_types": ["bootstrap"],
+                    "max_running": 1,
+                    "priority": 0,
+                    "env": {},
+                }
+            ]
+        ),
+    )
+
+    assert client.get("/internal/health").status_code == 200
+    assert client.get("/internal/status").status_code == 401
+    assert client.get("/internal/status", headers={TOKEN_HEADER: "wrong"}).status_code == 401
+    assert client.get("/internal/status", headers={TOKEN_HEADER: "dispatcher-secret"}).status_code == 200
 
 
 def test_internal_worker_config_masks_secret_env_values(tmp_path):
@@ -321,3 +352,57 @@ def test_write_dispatch_config_falls_back_when_bind_mount_replace_is_busy(
     text = path.read_text(encoding="utf-8")
     assert "mock-1" in text
     assert not (tmp_path / ".dispatch.yaml.tmp").exists()
+
+
+def test_dispatch_config_resolves_worker_secret_from_process_env(monkeypatch):
+    monkeypatch.setenv("PI_API_KEY", "process-secret")
+    config = _config(
+        [
+            {
+                "name": "deepseek-1",
+                "type": "pi",
+                "enabled": True,
+                "task_types": ["bootstrap"],
+                "max_running": 1,
+                "priority": 1,
+                "env": {
+                    "PI_MODEL": "deepseek-v4-pro",
+                    "PI_BASE_URL": "https://api.deepseek.com",
+                    "PI_API_KEY": "${PI_API_KEY}",
+                    "PI_PROVIDER_API": "openai-completions",
+                },
+            }
+        ]
+    )
+
+    assert config.workers[0].env["PI_API_KEY"] == "process-secret"
+
+
+def test_write_dispatch_config_persists_matching_secret_as_env_reference(tmp_path, monkeypatch):
+    monkeypatch.setenv("PI_API_KEY", "process-secret")
+    config = _config(
+        [
+            {
+                "name": "deepseek-1",
+                "type": "pi",
+                "enabled": True,
+                "task_types": ["bootstrap"],
+                "max_running": 1,
+                "priority": 1,
+                "env": {
+                    "PI_MODEL": "deepseek-v4-pro",
+                    "PI_BASE_URL": "https://api.deepseek.com",
+                    "PI_API_KEY": "process-secret",
+                    "PI_PROVIDER_API": "openai-completions",
+                },
+            }
+        ]
+    )
+    path = tmp_path / "dispatch.yaml"
+    path.write_text("workers: []\n", encoding="utf-8")
+
+    _write_dispatch_config(_Loop(path, config), config)
+
+    saved = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert saved["workers"][0]["env"]["PI_API_KEY"] == "${PI_API_KEY}"
+    assert "process-secret" not in path.read_text(encoding="utf-8")

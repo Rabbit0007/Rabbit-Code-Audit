@@ -29,12 +29,16 @@ BusinessEdgeRelation = Literal[
     "transitions_to",
     "depends_on",
     "risk_of",
+    "evidenced_by",
     "relates_to",
 ]
 
 BusinessNodeRiskLevel = Literal["critical", "high", "medium", "low", "unknown"]
 BusinessNodeReviewStatus = Literal["unreviewed", "investigating", "covered", "blocked"]
 BusinessNodeConclusionType = Literal["confirmed_finding", "rejected", "needs_more_evidence"]
+BusinessGraphLayer = Literal["evidence", "semantic", "audit"]
+BusinessSourceKind = Literal["static_index", "model", "human", "mixed"]
+BusinessEvidenceStatus = Literal["source_backed", "inferred", "unverified"]
 
 
 class BusinessNode(BaseModel):
@@ -51,6 +55,12 @@ class BusinessNode(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     source_snapshot_id: str | None = None
     confidence: float = 0.7
+    semantic_key: str | None = None
+    graph_layer: BusinessGraphLayer = "semantic"
+    source_kind: BusinessSourceKind = "model"
+    evidence_status: BusinessEvidenceStatus = "unverified"
+    contributors: list[str] = Field(default_factory=list)
+    revision: int = 1
     created_by: str
     created_at: str
     updated_at: str
@@ -64,6 +74,10 @@ class BusinessEdge(BaseModel):
     relation: BusinessEdgeRelation
     description: str | None = None
     confidence: float = 0.7
+    graph_layer: BusinessGraphLayer = "semantic"
+    source_kind: BusinessSourceKind = "model"
+    contributors: list[str] = Field(default_factory=list)
+    revision: int = 1
     created_by: str
     created_at: str
 
@@ -76,6 +90,8 @@ class BusinessNodeConclusion(BaseModel):
     summary: str
     evidence: str | None = None
     audit_finding_id: str | None = None
+    is_current: bool = True
+    superseded_at: str | None = None
     created_by: str
     created_at: str
 
@@ -95,6 +111,10 @@ class CreateBusinessNodeRequest(BaseModel):
     last_intent_id: str | None = None
     risk_tags: list[str] = Field(default_factory=list)
     evidence: list[str] = Field(default_factory=list)
+    semantic_key: str | None = None
+    graph_layer: BusinessGraphLayer = "semantic"
+    source_snapshot_id: str | None = None
+    confidence: float = Field(default=0.7, ge=0, le=1)
     created_by: str
 
     @field_validator("title", "created_by")
@@ -105,7 +125,7 @@ class CreateBusinessNodeRequest(BaseModel):
             raise ValueError("must not be empty")
         return text
 
-    @field_validator("description", "coverage_note", "last_intent_id")
+    @field_validator("description", "coverage_note", "last_intent_id", "semantic_key", "source_snapshot_id")
     @classmethod
     def normalize_optional_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -169,6 +189,8 @@ class CreateBusinessEdgeRequest(BaseModel):
     to_node_id: str
     relation: BusinessEdgeRelation = "relates_to"
     description: str | None = None
+    graph_layer: BusinessGraphLayer = "semantic"
+    confidence: float = Field(default=0.7, ge=0, le=1)
     created_by: str
 
     @field_validator("from_node_id", "to_node_id", "created_by")

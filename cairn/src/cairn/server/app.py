@@ -54,10 +54,9 @@ app.include_router(auth.router)
 # applied at include time, WITHOUT modifying the router modules themselves.
 #
 # ``require_auth`` is a dual-auth dependency: it accepts either a browser session
-# cookie or the dispatcher's ``X-Cairn-Internal-Token`` header. When
-# ``CAIRN_INTERNAL_TOKEN`` is unset it allows requests through unchanged, so the
-# cookieless dispatcher and existing deployments keep working. See
-# ``cairn.server.middleware.auth`` for the full rationale.
+# cookie or the dispatcher's ``X-Cairn-Internal-Token`` header. Protected routers
+# are closed by default; local/test compatibility can be explicitly enabled with
+# ``CAIRN_AUTH_OPEN_MODE=1``. See ``cairn.server.middleware.auth`` for details.
 _protected = [Depends(require_auth)]
 
 app.include_router(settings.router, dependencies=_protected)

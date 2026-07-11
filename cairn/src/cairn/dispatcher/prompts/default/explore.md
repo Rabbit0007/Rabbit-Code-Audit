@@ -24,7 +24,7 @@ When the investigation confirms business functions, roles, endpoints, data
 objects, state transitions, control points, assets, or risk relationships,
 include incremental business graph objects:
 ```json
-{"accepted": true, "data": {"description": "...", "business_nodes": [{"ref": "refund_feature", "node_type": "feature", "title": "订单退款", "description": "...", "risk_level": "high", "review_status": "covered", "coverage_note": "...", "risk_tags": ["越权", "重复退款"], "evidence": ["path/to/file.java:88"]}], "business_edges": [{"from": "refund_feature", "to": "existing_or_new_ref", "relation": "guards", "description": "..."}]}}
+{"accepted": true, "data": {"description": "...", "business_nodes": [{"ref": "refund_feature", "semantic_key": "feature:order_refund", "graph_layer": "semantic", "node_type": "feature", "title": "订单退款", "description": "...", "risk_level": "high", "review_status": "covered", "coverage_note": "...", "risk_tags": ["越权", "重复退款"], "evidence": ["path/to/file.java:88"], "confidence": 0.9}], "business_edges": [{"from": "refund_feature", "to": "existing_or_new_ref", "relation": "guards", "graph_layer": "semantic", "description": "...", "confidence": 0.84}]}}
 ```
 
 When code evidence reveals audit objects that still need investigation but are
@@ -91,7 +91,9 @@ If a candidate is proven vulnerable, prefer adding a `findings` item with that
 - Use `rejected` when the reviewed code path is not vulnerable; include the code evidence and the control or data-flow reason.
 - Use `needs_more_evidence` when the code path could not be fully proven safe or vulnerable; include exactly what evidence is missing or what blocked analysis.
 - Use the `business_graph` section when present to choose code paths and reason about roles, resources, states, and trust boundaries.
+- Treat `evidence` layer nodes as deterministic code navigation, `semantic` layer nodes as source-backed business meaning, and `audit` layer nodes as risk/coverage state. Do not duplicate an existing concept across layers; reference its existing node ID when possible.
 - Extend `business_nodes` and `business_edges` only with source-backed business knowledge learned in this investigation. Node `ref` values are temporary labels used only to connect edges in this response.
+- Every new model-created node must include a stable lowercase `semantic_key`, `graph_layer: "semantic"` (or `"audit"` for an audit-risk concept), calibrated `confidence`, and at least one exact `path:line` evidence item. Do not create a role, state, control, or business rule from naming conventions alone.
 - For each `business_nodes` item, set `node_type` to exactly one of `feature`, `role`, `endpoint`, `data_object`, `state`, `control`, `asset`, `risk`, or `external_system`. If no precise type fits, use `feature` for business behavior and `risk` for risk points.
 - For each `business_nodes` item, set `risk_level` to one of `critical`, `high`, `medium`, `low`, or `unknown`, and `review_status` to one of `unreviewed`, `investigating`, `covered`, or `blocked`. Use `covered` only when this investigation actually reviewed the relevant code path; use `blocked` only with a concrete `coverage_note`.
 - For each `business_edges` item, set `relation` to exactly one of `contains`, `exposes`, `calls`, `uses`, `owns`, `guards`, `transitions_to`, `depends_on`, `risk_of`, or `relates_to`. Use `relates_to` when no precise relation fits.

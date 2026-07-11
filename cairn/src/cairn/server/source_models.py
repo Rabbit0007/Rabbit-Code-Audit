@@ -129,6 +129,32 @@ class SourceIndexSummary(BaseModel):
     manifest_count: int = 0
 
 
+class SourceBootstrapCandidate(BaseModel):
+    candidate_type: str
+    severity: Literal["critical", "high", "medium", "low", "info", "unknown"] = "unknown"
+    priority_score: int = Field(ge=0, le=100)
+    priority_reasons: list[str] = Field(default_factory=list)
+    title: str
+    file_path: str | None = None
+    line_start: int | None = None
+    entry_point: str | None = None
+    symbol: str | None = None
+
+
+class SourceBootstrapBrief(BaseModel):
+    snapshot_id: str
+    source_path: str
+    file_count: int = 0
+    total_bytes: int = 0
+    detected_languages: dict[str, int] = Field(default_factory=dict)
+    index_summary: SourceIndexSummary = Field(default_factory=SourceIndexSummary)
+    quality_score: int = Field(default=0, ge=0, le=100)
+    quality_grade: Literal["strong", "usable", "weak", "poor"] = "poor"
+    manifests: list[DependencyManifest] = Field(default_factory=list)
+    entrypoints: list[CodeEntrypoint] = Field(default_factory=list)
+    priority_candidates: list[SourceBootstrapCandidate] = Field(default_factory=list)
+
+
 class SourceIndexQualityIssue(BaseModel):
     severity: Literal["info", "warning", "critical"] = "info"
     code: str
@@ -380,6 +406,9 @@ class DynamicValidationPlan(BaseModel):
     allowed_actions: list[str] = Field(default_factory=list)
     blocked_actions: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    safety_policy: dict[str, Any] = Field(default_factory=dict)
+    preflight_checks: list[dict[str, Any]] = Field(default_factory=list)
+    retest_targets: list[dict[str, Any]] = Field(default_factory=list)
     created_by: str | None = None
     created_at: str | None = None
     updated_at: str | None = None

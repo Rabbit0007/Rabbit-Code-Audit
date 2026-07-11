@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS projects (
     reason_trigger TEXT,
     reason_started_at TEXT,
     reason_last_heartbeat_at TEXT
+    ,pause_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS facts (
@@ -157,6 +158,10 @@ HINT_COLUMNS: dict[str, str] = {
     "use_count": "INTEGER NOT NULL DEFAULT 0",
 }
 
+PROJECT_COLUMNS: dict[str, str] = {
+    "pause_reason": "TEXT",
+}
+
 CORE_INDEXES = (
     """
     CREATE INDEX IF NOT EXISTS idx_intents_project_fingerprint
@@ -185,6 +190,7 @@ def configure(path: Path) -> None:
     with get_conn() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        _ensure_columns(conn, "projects", PROJECT_COLUMNS)
         _ensure_columns(conn, "facts", FACT_COLUMNS)
         _ensure_columns(conn, "intents", INTENT_COLUMNS)
         _ensure_columns(conn, "hints", HINT_COLUMNS)

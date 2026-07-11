@@ -4,17 +4,20 @@ import sqlite3
 from fastapi import APIRouter, HTTPException
 
 from cairn.server.db import get_conn
+from cairn.server.business_graph_service import validate_model_evidence_refs
 from cairn.server.models import (
     ConcludeRequest,
     ConcludeResponse,
     CreateIntentRequest,
     HeartbeatRequest,
     Intent,
+    SupersedeIntentRequest,
 )
 from cairn.server.services import (
     build_intent_fingerprint,
     check_project_active,
     fact_to_model,
+    get_project_or_404,
     get_equivalent_open_intent,
     get_claimable_open_intent_or_404,
     get_releasable_open_intent_or_404,
@@ -179,6 +182,39 @@ def release(project_id: str, intent_id: str, body: HeartbeatRequest):
 
 
 @router.post(
+    "/projects/{project_id}/intents/{intent_id}/supersede",
+    response_model=Intent,
+)
+def supersede_intent(project_id: str, intent_id: str, body: SupersedeIntentRequest):
+    with get_conn() as conn:
+        get_project_or_404(conn, project_id)
+        row = conn.execute(
+            "SELECT * FROM intents WHERE id = ? AND project_id = ?",
+            (intent_id, project_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "Intent not found")
+        if row["to_fact_id"] is not None:
+            raise HTTPException(409, "Intent already concluded")
+        if row["worker"] is not None:
+            raise HTTPException(409, "Claimed intent cannot be superseded")
+        if row["status"] != "superseded":
+            conn.execute(
+                """
+                UPDATE intents
+                SET status = 'superseded', superseded_by = ?, worker = NULL
+                WHERE id = ? AND project_id = ? AND to_fact_id IS NULL
+                """,
+                (body.superseded_by, intent_id, project_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM intents WHERE id = ? AND project_id = ?",
+                (intent_id, project_id),
+            ).fetchone()
+        return intent_to_model(conn, row, project_id)
+
+
+@router.post(
     "/projects/{project_id}/intents/{intent_id}/conclude",
     response_model=ConcludeResponse,
 )
@@ -194,6 +230,20 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
             (intent_id, project_id),
         ).fetchall()
         source_ids = [row["fact_id"] for row in source_rows]
+        snapshot = conn.execute(
+            """
+            SELECT id FROM source_snapshots
+            WHERE project_id = ? AND status = 'ready'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+        evidence_refs = validate_model_evidence_refs(
+            conn,
+            snapshot["id"] if snapshot is not None else None,
+            body.evidence_refs,
+        )
 
         updated_count = conn.execute(
             """
@@ -226,15 +276,16 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
             """
             INSERT INTO facts (
                 id, project_id, description, fact_type, source, confidence,
-                parent_fact_ids_json
+                evidence_refs_json, parent_fact_ids_json
             )
-            VALUES (?, ?, ?, 'observation', ?, 0.7, ?)
+            VALUES (?, ?, ?, 'observation', ?, 0.7, ?, ?)
             """,
             (
                 fid,
                 project_id,
                 body.description,
                 body.worker,
+                json.dumps(evidence_refs, ensure_ascii=False),
                 json.dumps(source_ids, ensure_ascii=False),
             ),
         )

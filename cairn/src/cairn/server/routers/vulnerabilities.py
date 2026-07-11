@@ -15,6 +15,7 @@ Response shapes follow :mod:`cairn.server.vulnerabilities_models`.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import re
@@ -115,6 +116,25 @@ def _vulnerability_select(where_sql: str) -> str:
             {where_sql}
             ORDER BY {_SEVERITY_RANK_SQL}, v.discovered_at DESC, v.id
             """
+
+
+def _remove_non_audit_report_rows() -> int:
+    """Delete legacy report rows not backed by confirmed audit findings.
+
+    Modern code-audit reporting writes ``vulnerabilities.id`` from
+    ``audit_findings.id`` via the audit-finding review flow. Older keyword/fact
+    extraction could leave rows in the same table without a corresponding audit
+    finding; refresh is the operator-facing reconciliation point that removes
+    those stale rows.
+    """
+    with get_conn() as conn:
+        cursor = conn.execute(
+            """
+            DELETE FROM vulnerabilities
+            WHERE id NOT IN (SELECT id FROM audit_findings)
+            """
+        )
+        return int(cursor.rowcount if cursor.rowcount is not None else 0)
 
 
 def _row_to_vulnerability(row) -> Vulnerability:
@@ -381,8 +401,9 @@ def _load_audit_finding_report_details(vulnerabilities: list[Vulnerability]) -> 
     with get_conn() as conn:
         rows = conn.execute(
             f"""
-            SELECT id, cwe, file_path, line_start, line_end, symbol,
-                   entry_point, remediation
+            SELECT id, category, severity, status, evidence_level, cwe,
+                   file_path, line_start, line_end, symbol, entry_point,
+                   impact, evidence, remediation, reviewed_by, reviewed_at
             FROM audit_findings
             WHERE id IN ({placeholders})
             """,
@@ -391,13 +412,21 @@ def _load_audit_finding_report_details(vulnerabilities: list[Vulnerability]) -> 
     return {
         row["id"]: {
             "id": row["id"],
+            "category": row["category"],
+            "severity": row["severity"],
+            "status": row["status"],
+            "evidence_level": row["evidence_level"],
             "cwe": row["cwe"],
             "file_path": row["file_path"],
             "line_start": row["line_start"],
             "line_end": row["line_end"],
             "symbol": row["symbol"],
             "entry_point": row["entry_point"],
+            "impact": row["impact"],
+            "evidence": row["evidence"],
             "remediation": row["remediation"],
+            "reviewed_by": row["reviewed_by"],
+            "reviewed_at": row["reviewed_at"],
         }
         for row in rows
     }
@@ -418,6 +447,44 @@ def _remediation_text(vuln: Vulnerability, detail: dict[str, object]) -> str:
     if remediation:
         return remediation
     return "未记录明确修复建议；需结合该条发现的代码证据、入口点和影响面补充修复动作。"
+
+
+def _finding_location(detail: dict[str, object]) -> str:
+    path = str(detail.get("file_path") or "").strip()
+    if not path:
+        return "未记录"
+    start = detail.get("line_start")
+    end = detail.get("line_end")
+    if start and end and end != start:
+        return f"{path}:{start}-{end}"
+    return f"{path}:{start}" if start else path
+
+
+def _fixed_acceptance_criteria(
+    vuln: Vulnerability,
+    detail: dict[str, object],
+) -> list[str]:
+    category = str(detail.get("category") or "").lower()
+    family_criteria = {
+        "sql_injection": "使用原 payload 复测时，输入不得改变 SQL 语义；查询必须参数化且不返回额外数据、SQL 错误或可控时间差。",
+        "xss": "原 payload 在所有输出上下文中必须被正确编码，不得形成可执行 HTML、属性或 JavaScript。",
+        "open_redirect": "外部或协议相对跳转目标必须被拒绝，响应只能跳转到经过白名单校验的站内地址。",
+        "authorization": "低权限账号访问他人对象或越权动作必须被拒绝，且目标对象状态保持不变。",
+        "command_injection": "元字符和命令替换 payload 不得影响进程参数边界，不得产生额外命令执行副作用。",
+        "path_traversal": "目录穿越 payload 必须被拒绝，规范化后的路径必须始终位于允许根目录内。",
+        "ssrf": "内网、环回、云元数据和非白名单目标必须被拒绝，并在重定向后再次校验目标。",
+    }
+    criteria = [
+        family_criteria.get(
+            category,
+            "按原复测步骤执行时，不再出现报告描述的未授权行为、敏感数据泄露或危险操作。",
+        ),
+        "正常业务请求仍可完成，修复不得依赖前端校验或仅隐藏错误信息。",
+        "增加覆盖原 payload、边界值和编码变体的自动化回归测试，并保存测试结果。",
+    ]
+    if detail.get("file_path"):
+        criteria.append(f"复核修复提交已覆盖源码位置 `{_finding_location(detail)}` 及其同类调用点。")
+    return criteria
 
 
 def _report_enrichments_for_vulnerability(
@@ -1115,6 +1182,12 @@ def _md_escape(text: str) -> str:
 
 
 def _append_static_poc_lines(lines: list[str], poc: dict[str, object]) -> None:
+    environment_setup = _poc_list(poc, "environment_setup")
+    if environment_setup:
+        lines.extend(["环境准备：", ""])
+        for step_index, step in enumerate(environment_setup, start=1):
+            lines.append(f"{step_index}. {step}")
+        lines.append("")
     payload = _poc_text(poc, "payload")
     if payload:
         lines.extend(["Payload：", "", "```text", payload, "```", ""])
@@ -1137,6 +1210,11 @@ def _append_static_poc_lines(lines: list[str], poc: dict[str, object]) -> None:
     verification = _poc_text(poc, "verification")
     if verification:
         lines.extend(["判断标准：", "", verification, ""])
+    fixed_result = _poc_text(poc, "fixed_result") or _poc_text(
+        poc, "remediated_expected_result"
+    )
+    if fixed_result:
+        lines.extend(["修复后验收标准：", "", fixed_result, ""])
     prerequisites = _poc_list(poc, "prerequisites")
     if prerequisites:
         lines.extend(["利用前提：", ""])
@@ -1148,6 +1226,12 @@ def _append_static_poc_lines(lines: list[str], poc: dict[str, object]) -> None:
         lines.extend(["限制与说明：", ""])
         for item in limitations:
             lines.append(f"- {item}")
+        lines.append("")
+    cleanup_steps = _poc_list(poc, "cleanup_steps")
+    if cleanup_steps:
+        lines.extend(["复测后清理：", ""])
+        for step_index, step in enumerate(cleanup_steps, start=1):
+            lines.append(f"{step_index}. {step}")
         lines.append("")
 
 
@@ -1260,6 +1344,9 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
     counts = _summarize(vulnerabilities)
     report_enrichments = _load_report_enrichments(vulnerabilities)
     audit_details = _load_audit_finding_report_details(vulnerabilities)
+    delivery_quality = _delivery_quality(vulnerabilities, report_enrichments)
+    coverage = _load_delivery_coverage(vulnerabilities)
+    report_id = _delivery_report_id(vulnerabilities)
     project_count = len(_unique([v.project_id for v in vulnerabilities]))
     severity_scope = "、".join(
         _SEVERITY_LABELS.get(level, level)
@@ -1269,11 +1356,18 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
     lines: list[str] = [
         f"# {_report_title(vulnerabilities)}",
         "",
-        "> Rabbit Code Audit 生成的代码审计报告。报告仅包含已确认的发现，并保留关键证据与审计过程。",
+        "> Rabbit Code Audit 自动生成的代码审计交付报告。报告仅包含系统已确认的发现，"
+        "并区分静态源码证据与真实动态证明材料。",
+        "",
+        f"**报告编号：`{report_id}`　版本：`1.0`　生成时间："
+        f"`{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}`**",
         "",
         "## 目录",
         "",
+        "- [执行摘要](#执行摘要)",
+        "- [审计范围与方法](#审计范围与方法)",
         "- [报告概览](#报告概览)",
+        "- [交付质量与剩余风险](#交付质量与剩余风险)",
         "- [漏洞清单](#漏洞清单)",
         "- [修复建议汇总](#修复建议汇总)",
     ]
@@ -1285,6 +1379,54 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
             "",
             "---",
             "",
+        "## 执行摘要",
+        "",
+        f"本报告共记录 **{len(vulnerabilities)}** 项已确认代码安全发现，"
+        f"其中严重 {counts['critical']} 项、高危 {counts['high']} 项、"
+        f"中危 {counts['medium']} 项、低危 {counts['low']} 项。",
+        "",
+        "交付结论基于源码索引、业务图、数据流审计、自动复核和已保存证据形成。"
+        "未标记为真实响应的请求、PoC 和预期结果均属于源码静态推导，"
+        "复测人员应在授权测试环境执行本报告中的步骤并记录实际结果。",
+        "",
+        "## 审计范围与方法",
+        "",
+        f"- **报告生成时间**：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        f"- **项目范围**：{project_count} 个项目",
+        "- **审计方法**：源码静态索引、入口与调用关系分析、业务图建模、"
+        "候选数据流验证、自动独立 Worker 复核、报告证据补全",
+        "- **证据口径**：L3 表示源码证据和静态 PoC 已闭环；L5 仅用于真实动态验证或等价实测证据",
+        "- **范围限制**：未提供的运行配置、生产网关策略、外部依赖、账号权限和真实数据不在静态结论覆盖范围内",
+        "- **复测要求**：仅在取得授权的隔离测试环境执行，先备份数据并准备可回滚账号",
+        "",
+        "## 交付质量与剩余风险",
+        "",
+        "| 质量指标 | 数量 |",
+        "| --- | ---: |",
+        f"| 可按静态 PoC 复测的漏洞 | {delivery_quality['retestable']} / {delivery_quality['total']} |",
+        f"| 含真实动态证明数据包 | {delivery_quality['dynamic_proof']} |",
+        f"| 缺少完整复测材料 | {delivery_quality['missing_retest']} |",
+        f"| 未闭合严重/高危/未知候选 | {coverage['open_required_candidates']} |",
+        f"| 未覆盖高风险业务节点 | {coverage['open_high_risk_business_nodes']} |",
+        f"| 待自动复核 Finding | {coverage['pending_review_findings']} |",
+        f"| 待报告补全任务 | {coverage['pending_report_tasks']} |",
+        "",
+        (
+            "**交付状态：可作为已确认漏洞的复测交付件。**"
+            if delivery_quality["missing_retest"] == 0
+            else "**交付状态：部分漏洞缺少完整复测材料，报告中已逐项标记。**"
+        ),
+        "",
+        (
+            "> 注意：当前仍存在未闭合候选或业务覆盖缺口，本报告不应表述为全量审计终稿。"
+            if coverage["open_required_candidates"]
+            or coverage["open_high_risk_business_nodes"]
+            or coverage["pending_review_findings"]
+            else "> 当前数据库中未发现阻止全量审计结论的高风险覆盖缺口。"
+        ),
+        "",
+        "---",
+        "",
         "## 报告概览",
         "",
         "**摘要页**",
@@ -1363,6 +1505,13 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
                     f"| 来源意图 | {_md_escape(vuln.source_intent_id or '未记录')} |",
                     f"| 工作节点 | {_md_escape(vuln.source_worker or '未记录')} |",
                     f"| 发现时间 | {_md_escape(vuln.discovered_at)} |",
+                    f"| Finding ID | `{_md_escape(str(audit_detail.get('id') or vuln.fact_id))}` |",
+                    f"| 漏洞分类 | {_md_escape(str(audit_detail.get('category') or '未记录'))} |",
+                    f"| CWE | {_md_escape(str(audit_detail.get('cwe') or '未记录'))} |",
+                    f"| 证据等级 | {_md_escape(str(audit_detail.get('evidence_level') or '未记录'))} |",
+                    f"| 自动复核节点 | {_md_escape(str(audit_detail.get('reviewed_by') or '未记录'))} |",
+                    f"| 入口 | {_md_escape(str(audit_detail.get('entry_point') or '未记录'))} |",
+                    f"| 源码位置 | {_md_escape(_finding_location(audit_detail))} |",
                     "",
                     "#### 漏洞描述",
                     "",
@@ -1376,7 +1525,27 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
                 lines.append(f"- {evidence}")
             lines.append("")
 
-            lines.extend(["#### 修复建议", "", _remediation_text(vuln, audit_detail), ""])
+            detail_evidence = str(audit_detail.get("evidence") or "").strip()
+            if detail_evidence and detail_evidence not in (vuln.evidence or []):
+                lines.extend(["源码闭环证据：", "", f"- {detail_evidence}", ""])
+
+            lines.extend(
+                [
+                    "#### 风险影响",
+                    "",
+                    str(audit_detail.get("impact") or "未单独记录影响说明；请结合漏洞描述和受影响入口评估。"),
+                    "",
+                    "#### 修复建议",
+                    "",
+                    _remediation_text(vuln, audit_detail),
+                    "",
+                    "#### 修复验收标准",
+                    "",
+                ]
+            )
+            for criterion in _fixed_acceptance_criteria(vuln, audit_detail):
+                lines.append(f"- {criterion}")
+            lines.append("")
 
             lines.extend(["#### 漏洞证明数据包", ""])
             packets = vuln.proof_packets or []
@@ -1412,7 +1581,7 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
 
             _append_report_enrichment_packet_templates(lines, vuln_report_enrichments)
 
-            lines.extend(["#### 静态复现 PoC", ""])
+            lines.extend(["#### 复测操作手册", "", "##### 静态复现 PoC", ""])
             poc = vuln.reproduction_poc or {}
             if poc:
                 lines.extend([f"> {_STATIC_POC_NOTE}", ""])
@@ -1425,6 +1594,21 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
 
             _append_report_enrichment_pocs(lines, vuln_report_enrichments)
             _append_report_enrichment_notes(lines, vuln_report_enrichments)
+
+            lines.extend(
+                [
+                    "#### 复测记录模板",
+                    "",
+                    "- 复测环境：`________________`",
+                    "- 复测时间：`________________`",
+                    "- 执行人员：`________________`",
+                    "- 实际请求/命令：`________________`",
+                    "- 实际响应/结果：`________________`",
+                    "- 结论：`[ ] 已修复  [ ] 未修复  [ ] 条件不足`",
+                    "- 附件/抓包编号：`________________`",
+                    "",
+                ]
+            )
 
             lines.extend(["#### 漏洞浮现过程", ""])
             for step_index, step in enumerate(vuln.process or [], start=1):
@@ -1455,6 +1639,111 @@ def _report_title(vulnerabilities: list[Vulnerability]) -> str:
     if len(projects) == 1:
         return f"{projects[0]} - 代码审计报告"
     return "Rabbit Code Audit 代码审计报告"
+
+
+def _delivery_report_id(vulnerabilities: list[Vulnerability]) -> str:
+    payload = "\0".join(
+        sorted(
+            f"{vuln.project_id}:{vuln.fact_id}:{vuln.discovered_at}"
+            for vuln in vulnerabilities
+        )
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12].upper()
+    return f"RCA-{digest}"
+
+
+def _delivery_quality(
+    vulnerabilities: list[Vulnerability],
+    report_enrichments: dict[str, dict[str, object]],
+) -> dict[str, int]:
+    retestable = 0
+    dynamic_proof = 0
+    for vuln in vulnerabilities:
+        if any(_is_complete_proof_packet(packet) for packet in (vuln.proof_packets or [])):
+            dynamic_proof += 1
+        pocs = [vuln.reproduction_poc]
+        pocs.extend(
+            enrichment.get("reproduction_poc")
+            for enrichment in _report_enrichments_for_vulnerability(
+                vuln, report_enrichments
+            )
+        )
+        if any(
+            isinstance(poc, dict) and _is_complete_reproduction_poc(poc)
+            for poc in pocs
+        ):
+            retestable += 1
+    return {
+        "total": len(vulnerabilities),
+        "retestable": retestable,
+        "missing_retest": max(0, len(vulnerabilities) - retestable),
+        "dynamic_proof": dynamic_proof,
+    }
+
+
+def _load_delivery_coverage(
+    vulnerabilities: list[Vulnerability],
+) -> dict[str, int]:
+    project_ids = _unique([vuln.project_id for vuln in vulnerabilities])
+    empty = {
+        "open_required_candidates": 0,
+        "open_high_risk_business_nodes": 0,
+        "pending_review_findings": 0,
+        "pending_report_tasks": 0,
+    }
+    if not project_ids:
+        return empty
+    placeholders = ",".join("?" for _ in project_ids)
+    with get_conn() as conn:
+        open_candidates = conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM audit_candidates
+            WHERE project_id IN ({placeholders})
+              AND severity IN ('critical', 'high', 'unknown')
+              AND status IN ('candidate', 'investigating', 'needs_more_evidence')
+              AND NOT (
+                  source = 'index'
+                  AND candidate_type IN ('entrypoint', 'web_entrypoint')
+              )
+            """,
+            project_ids,
+        ).fetchone()["count"]
+        open_nodes = conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM business_nodes
+            WHERE project_id IN ({placeholders})
+              AND graph_layer != 'evidence'
+              AND risk_level IN ('critical', 'high', 'unknown')
+              AND review_status != 'covered'
+            """,
+            project_ids,
+        ).fetchone()["count"]
+        pending_findings = conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM audit_findings
+            WHERE project_id IN ({placeholders})
+              AND status = 'pending_review'
+            """,
+            project_ids,
+        ).fetchone()["count"]
+        pending_reports = conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM report_enrichment_tasks
+            WHERE project_id IN ({placeholders})
+              AND status IN ('pending', 'running')
+            """,
+            project_ids,
+        ).fetchone()["count"]
+    return {
+        "open_required_candidates": int(open_candidates),
+        "open_high_risk_business_nodes": int(open_nodes),
+        "pending_review_findings": int(pending_findings),
+        "pending_report_tasks": int(pending_reports),
+    }
 
 
 def _project_groups(vulnerabilities: list[Vulnerability]) -> list[tuple[str, str, list[Vulnerability]]]:
@@ -1577,8 +1866,26 @@ def _report_lines(vulnerabilities: list[Vulnerability]) -> list[str]:
 
 def _report_plain_lines(vulnerabilities: list[Vulnerability]) -> list[str]:
     counts = _summarize(vulnerabilities)
+    audit_details = _load_audit_finding_report_details(vulnerabilities)
+    report_enrichments = _load_report_enrichments(vulnerabilities)
+    delivery_quality = _delivery_quality(vulnerabilities, report_enrichments)
+    coverage = _load_delivery_coverage(vulnerabilities)
     lines = [
         _report_title(vulnerabilities),
+        f"报告编号：{_delivery_report_id(vulnerabilities)}  版本：1.0",
+        "执行摘要",
+        f"本报告记录 {len(vulnerabilities)} 项系统已确认代码安全发现。",
+        "证据口径：静态 PoC 和预期结果来自源码推导；真实动态请求/响应会单独标记。",
+        "审计方法：源码索引、业务图、数据流验证、自动复核和报告证据补全。",
+        "复测要求：仅在授权隔离测试环境执行，先备份数据并准备回滚方案。",
+        "交付质量与剩余风险",
+        f"静态可复测：{delivery_quality['retestable']}/{delivery_quality['total']}  "
+        f"动态证明：{delivery_quality['dynamic_proof']}  "
+        f"缺少复测材料：{delivery_quality['missing_retest']}",
+        f"未闭合高风险候选：{coverage['open_required_candidates']}  "
+        f"未覆盖高风险业务节点：{coverage['open_high_risk_business_nodes']}  "
+        f"待自动复核：{coverage['pending_review_findings']}",
+        "",
         "报告概览",
         f"漏洞总数：{len(vulnerabilities)}",
         f"严重：{counts['critical']}    高危：{counts['high']}    中危：{counts['medium']}    低危：{counts['low']}",
@@ -1598,6 +1905,8 @@ def _report_plain_lines(vulnerabilities: list[Vulnerability]) -> list[str]:
     for project_id, project_name, items in _project_groups(vulnerabilities):
         lines.extend([f"项目：{project_name}（{project_id}）", "-" * 72])
         for index, vuln in enumerate(items, start=1):
+            detail = _audit_detail_for_vulnerability(vuln, audit_details)
+            enrichments = _report_enrichments_for_vulnerability(vuln, report_enrichments)
             lines.extend(
                 [
                     f"{index}. {vuln.title}",
@@ -1605,13 +1914,22 @@ def _report_plain_lines(vulnerabilities: list[Vulnerability]) -> list[str]:
                     f"确认事实：{vuln.fact_id}",
                     f"关联事实：{', '.join(vuln.related_fact_ids or [vuln.fact_id])}",
                     f"发现时间：{vuln.discovered_at}",
+                    f"漏洞分类：{detail.get('category') or '未记录'}",
+                    f"CWE：{detail.get('cwe') or '未记录'}",
+                    f"证据等级：{detail.get('evidence_level') or '未记录'}",
+                    f"入口：{detail.get('entry_point') or '未记录'}",
+                    f"源码位置：{_finding_location(detail)}",
                     "漏洞描述：",
                     vuln.description,
+                    "风险影响：",
+                    str(detail.get("impact") or "未单独记录影响说明。"),
                     "关键证据：",
                 ]
             )
             for evidence in vuln.evidence or ["未记录"]:
                 lines.append(f"- {evidence}")
+            lines.extend(["修复建议：", _remediation_text(vuln, detail), "修复验收标准："])
+            lines.extend(f"- {item}" for item in _fixed_acceptance_criteria(vuln, detail))
             lines.append("漏洞证明数据包：")
             packets = vuln.proof_packets or []
             if not packets:
@@ -1628,6 +1946,14 @@ def _report_plain_lines(vulnerabilities: list[Vulnerability]) -> list[str]:
                 )
                 if packet.get("note"):
                     lines.append(f"说明：{packet['note']}")
+            lines.extend(_plain_retest_guide(vuln, enrichments))
+            lines.extend(
+                [
+                    "复测记录模板：",
+                    "环境=________ 时间=________ 执行人=________",
+                    "结论=[ ]已修复 [ ]未修复 [ ]条件不足  附件编号=________",
+                ]
+            )
             lines.append("漏洞浮现过程：")
             for step_index, step in enumerate(vuln.process or [], start=1):
                 lines.append(
@@ -1635,6 +1961,53 @@ def _report_plain_lines(vulnerabilities: list[Vulnerability]) -> list[str]:
                     f"{step.get('id') or ''}：{step.get('description') or '无描述'}"
                 )
             lines.append("")
+    return lines
+
+
+def _plain_retest_guide(
+    vuln: Vulnerability,
+    report_enrichments: list[dict[str, object]],
+) -> list[str]:
+    pocs: list[dict[str, object]] = []
+    if vuln.reproduction_poc:
+        pocs.append(vuln.reproduction_poc)
+    for enrichment in report_enrichments:
+        poc = enrichment.get("reproduction_poc")
+        if isinstance(poc, dict) and poc:
+            pocs.append(poc)
+    lines = ["复测操作手册："]
+    if not pocs:
+        return [*lines, "当前证据未形成可执行静态 PoC；请根据源码位置补充授权测试环境参数。"]
+    for index, poc in enumerate(pocs, start=1):
+        lines.append(f"复测方案 {index}：")
+        for title, key in (
+            ("环境准备", "environment_setup"),
+            ("利用前提", "prerequisites"),
+            ("执行步骤", "steps"),
+        ):
+            values = _poc_list(poc, key)
+            if values:
+                lines.append(f"{title}：")
+                lines.extend(f"- {value}" for value in values)
+        request_template = (
+            _poc_text(poc, "request_template")
+            or _poc_text(poc, "curl")
+            or _poc_text(poc, "command")
+        )
+        if request_template:
+            lines.extend(["请求/命令：", request_template])
+        for title, keys in (
+            ("漏洞存在时预期结果", ("expected_result", "expected_response")),
+            ("修复后验收结果", ("fixed_result", "remediated_expected_result")),
+            ("判断标准", ("verification",)),
+        ):
+            value = next((_poc_text(poc, key) for key in keys if _poc_text(poc, key)), "")
+            if value:
+                lines.extend([f"{title}：", value])
+        cleanup = _poc_list(poc, "cleanup_steps")
+        if cleanup:
+            lines.append("复测后清理：")
+            lines.extend(f"- {value}" for value in cleanup)
     return lines
 
 
@@ -1776,8 +2149,39 @@ def _docx_pre_block(text: str) -> str:
 
 def _render_docx_export(vulnerabilities: list[Vulnerability]) -> bytes:
     counts = _summarize(vulnerabilities)
+    audit_details = _load_audit_finding_report_details(vulnerabilities)
+    report_enrichments = _load_report_enrichments(vulnerabilities)
+    delivery_quality = _delivery_quality(vulnerabilities, report_enrichments)
+    coverage = _load_delivery_coverage(vulnerabilities)
     body: list[str] = [
         _docx_paragraph(_report_title(vulnerabilities), style="Title", color="0F172A"),
+        _docx_paragraph(
+            f"报告编号：{_delivery_report_id(vulnerabilities)}　版本：1.0　"
+            f"生成时间：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        ),
+        _docx_paragraph("执行摘要", style="Heading1"),
+        _docx_paragraph(
+            f"本报告记录 {len(vulnerabilities)} 项系统已确认代码安全发现。"
+            "静态 PoC 与预期结果来自源码推导，真实动态请求/响应会单独标记。"
+        ),
+        _docx_paragraph("交付质量与剩余风险", style="Heading1"),
+        _docx_table(
+            [
+                ["指标", "数量"],
+                ["静态可复测", f"{delivery_quality['retestable']} / {delivery_quality['total']}"],
+                ["真实动态证明", str(delivery_quality["dynamic_proof"])],
+                ["缺少完整复测材料", str(delivery_quality["missing_retest"])],
+                ["未闭合高风险候选", str(coverage["open_required_candidates"])],
+                ["未覆盖高风险业务节点", str(coverage["open_high_risk_business_nodes"])],
+                ["待自动复核 Finding", str(coverage["pending_review_findings"])],
+            ],
+            header=True,
+        ),
+        _docx_paragraph("审计范围与方法", style="Heading1"),
+        _docx_paragraph(
+            "采用源码索引、业务图、数据流验证、自动复核和报告证据补全。"
+            "仅应在授权隔离测试环境执行复测，并提前准备数据备份和回滚方案。"
+        ),
         _docx_paragraph("报告概览", style="Heading1"),
         _docx_table(
             [
@@ -1810,6 +2214,8 @@ def _render_docx_export(vulnerabilities: list[Vulnerability]) -> bytes:
     for project_id, project_name, items in _project_groups(vulnerabilities):
         body.append(_docx_paragraph(f"项目：{project_name}（{project_id}）", style="Heading1"))
         for idx, vuln in enumerate(items, start=1):
+            detail = _audit_detail_for_vulnerability(vuln, audit_details)
+            enrichments = _report_enrichments_for_vulnerability(vuln, report_enrichments)
             body.extend(
                 [
                     _docx_paragraph(f"{idx}. {vuln.title}", style="Heading2"),
@@ -1821,6 +2227,11 @@ def _render_docx_export(vulnerabilities: list[Vulnerability]) -> bytes:
                             ["关联事实", ", ".join(vuln.related_fact_ids or [vuln.fact_id])],
                             ["发现时间", vuln.discovered_at],
                             ["工作节点", vuln.source_worker or "未记录"],
+                            ["漏洞分类", str(detail.get("category") or "未记录")],
+                            ["CWE", str(detail.get("cwe") or "未记录")],
+                            ["证据等级", str(detail.get("evidence_level") or "未记录")],
+                            ["入口", str(detail.get("entry_point") or "未记录")],
+                            ["源码位置", _finding_location(detail)],
                         ],
                         header=True,
                     ),
@@ -1830,6 +2241,20 @@ def _render_docx_export(vulnerabilities: list[Vulnerability]) -> bytes:
                 ]
             )
             body.append(_docx_table([["证据"]] + [[item] for item in (vuln.evidence or ["未记录"])], header=True))
+            body.extend(
+                [
+                    _docx_paragraph("风险影响", style="Heading3"),
+                    _docx_paragraph(str(detail.get("impact") or "未单独记录影响说明。")),
+                    _docx_paragraph("修复建议", style="Heading3"),
+                    _docx_paragraph(_remediation_text(vuln, detail)),
+                    _docx_paragraph("修复验收标准", style="Heading3"),
+                    _docx_table(
+                        [["验收项"]]
+                        + [[item] for item in _fixed_acceptance_criteria(vuln, detail)],
+                        header=True,
+                    ),
+                ]
+            )
             body.append(_docx_paragraph("漏洞证明数据包", style="Heading3"))
             packets = vuln.proof_packets or []
             if not packets:
@@ -1839,6 +2264,27 @@ def _render_docx_export(vulnerabilities: list[Vulnerability]) -> bytes:
                 body.append(_docx_table([["请求数据包", "响应/回显"], [packet.get("request") or "未记录", packet.get("response") or "未记录"]], header=True))
                 if packet.get("note"):
                     body.append(_docx_paragraph(f"说明：{packet['note']}"))
+            body.append(_docx_paragraph("复测操作手册", style="Heading3"))
+            for line in _plain_retest_guide(vuln, enrichments)[1:]:
+                body.append(_docx_paragraph(line))
+            body.extend(
+                [
+                    _docx_paragraph("复测记录模板", style="Heading3"),
+                    _docx_table(
+                        [
+                            ["字段", "记录"],
+                            ["复测环境", ""],
+                            ["复测时间", ""],
+                            ["执行人员", ""],
+                            ["实际请求/命令", ""],
+                            ["实际响应/结果", ""],
+                            ["结论", "已修复 / 未修复 / 条件不足"],
+                            ["附件/抓包编号", ""],
+                        ],
+                        header=True,
+                    ),
+                ]
+            )
             body.append(_docx_paragraph("漏洞浮现过程", style="Heading3"))
             body.append(
                 _docx_table(
@@ -2110,4 +2556,14 @@ def refresh_vulnerabilities() -> VulnerabilitySummary:
     confirmed. Facts remain navigation evidence and are never promoted by a
     keyword classifier.
     """
+    removed = _remove_non_audit_report_rows()
+    if removed:
+        try:
+            record_audit(
+                "vulnerability.refresh",
+                f"清理旧版事实分类报告项（{removed} 条）",
+                target_type="vulnerability",
+            )
+        except Exception:
+            pass
     return vulnerabilities_summary()

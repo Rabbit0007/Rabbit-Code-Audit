@@ -80,7 +80,7 @@ class _FakeResponse:
 def _patch_proxy(monkeypatch, *, response=None, exc: Exception | None = None) -> None:
     """Monkeypatch the router's ``requests.get`` to avoid any real network call."""
 
-    def fake_get(url, timeout=None):  # noqa: ARG001 - signature mirrors requests.get
+    def fake_get(url, timeout=None, headers=None):  # noqa: ARG001 - signature mirrors requests.get
         if exc is not None:
             raise exc
         return response
@@ -91,7 +91,7 @@ def _patch_proxy(monkeypatch, *, response=None, exc: Exception | None = None) ->
 def _patch_internal_request(monkeypatch, *, response=None, exc: Exception | None = None) -> None:
     """Monkeypatch ``requests.request`` for worker config proxy endpoints."""
 
-    def fake_request(method, url, json=None, timeout=None):  # noqa: ARG001
+    def fake_request(method, url, json=None, timeout=None, headers=None):  # noqa: ARG001
         if exc is not None:
             raise exc
         return response
@@ -316,7 +316,7 @@ def test_worker_config_proxy_returns_masked_config(client, monkeypatch):
 def test_worker_config_update_proxies_payload(client, monkeypatch):
     seen = {}
 
-    def fake_request(method, url, json=None, timeout=None):  # noqa: ARG001
+    def fake_request(method, url, json=None, timeout=None, headers=None):  # noqa: ARG001
         seen["method"] = method
         seen["json"] = json
         return _FakeResponse(json)
@@ -342,6 +342,22 @@ def test_worker_config_update_proxies_payload(client, monkeypatch):
     assert resp.status_code == 200
     assert seen["method"] == "PUT"
     assert seen["json"]["workers"][0]["name"] == "mock-1"
+
+
+def test_worker_config_proxy_sends_dispatcher_internal_token(client, monkeypatch):
+    seen = {}
+    monkeypatch.setenv(workers.INTERNAL_TOKEN_ENV, "dispatcher-secret")
+
+    def fake_request(method, url, json=None, timeout=None, headers=None):  # noqa: ARG001
+        seen["headers"] = headers
+        return _FakeResponse({"workers": []})
+
+    monkeypatch.setattr(workers.requests, "request", fake_request)
+
+    resp = client.get("/api/workers/config")
+
+    assert resp.status_code == 200
+    assert seen["headers"] == {workers.INTERNAL_TOKEN_HEADER: "dispatcher-secret"}
 
 
 def test_worker_config_test_proxy_returns_result(client, monkeypatch):
@@ -608,3 +624,51 @@ def test_history_only_returns_rows_for_requested_worker(client, temp_db):
 
     body = client.get("/api/workers/alpha/history").json()
     assert len(body) == 1
+
+
+def test_project_usage_combines_historical_baseline_with_exact_model_usage(client, temp_db):
+    with db.get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO worker_task_history (
+                worker_name, project_id, task_type, started_at, completed_at,
+                outcome, model_call_count, estimated_input_tokens
+            ) VALUES ('alpha', 'proj-usage', 'reason', '2026-01-01T00:00:00Z',
+                      '2026-01-01T00:01:00Z', 'success', 2, 1000)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO model_usage_records (
+                project_id, model, request_id, prompt_tokens, completion_tokens,
+                total_tokens, estimated, cost_usd, created_at
+            ) VALUES ('proj-usage', 'model-a', 'req-1', 300, 50, 350, 0, 0.25,
+                      '2026-01-02T00:00:00Z')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO worker_task_history (
+                worker_name, project_id, task_type, started_at, completed_at,
+                outcome, model_call_count, estimated_input_tokens
+            ) VALUES ('alpha', 'proj-usage', 'reason', '2026-01-03T00:00:00Z',
+                      '2026-01-03T00:01:00Z', 'success', 9, 9000)
+            """
+        )
+
+    response = client.get(
+        "/api/workers/history/project-usage", params={"project_id": "proj-usage"}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "task_count": 2,
+        "model_call_count": 3,
+        "estimated_input_tokens": 1300,
+        "reason_round_count": 2,
+        "prompt_tokens": 300,
+        "completion_tokens": 50,
+        "total_tokens": 350,
+        "cost_usd": 0.25,
+        "estimated_record_count": 0,
+    }

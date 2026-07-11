@@ -20,12 +20,11 @@ Three endpoints are provided:
   an ownership error and left in place. Requirements 13.4, 13.5.
 
 User identity is read from ``request.state.user`` (a ``{"id", "username", ...}``
-mapping) which the auth middleware injects on an authenticated request. The
-dual-auth scheme means that when ``CAIRN_INTERNAL_TOKEN`` is unset the protected
-routers preserve their pre-auth (open) behaviour and ``request.state.user`` is
-never set; in that case custom templates are scoped to a single shared
-``ANONYMOUS_USER_ID`` so the endpoints remain usable without a session. Built-in
-templates are always returned regardless of the authenticated user.
+mapping) which the auth middleware injects on an authenticated request. In
+explicit local/test open-auth mode, no user is injected; custom templates are
+then scoped to a single shared ``ANONYMOUS_USER_ID`` so the endpoints remain
+usable without a session. Built-in templates are always returned regardless of
+the authenticated user.
 """
 
 from __future__ import annotations
@@ -47,10 +46,9 @@ router = APIRouter(prefix="/api/templates", tags=["templates"])
 MAX_TEMPLATES_PER_USER = 50
 
 # Fallback owner used when no authenticated user is present on the request. The
-# auth middleware only injects ``request.state.user`` once an operator opts into
-# enforcement by setting ``CAIRN_INTERNAL_TOKEN``; without it the routers run in
-# their pre-auth (open) mode, so custom templates are scoped to this single
-# shared identity rather than failing the request.
+# auth middleware only injects ``request.state.user`` for browser-session
+# requests; explicit local/test open-auth mode uses this shared identity instead
+# of failing the request.
 ANONYMOUS_USER_ID = "anonymous"
 
 # Timestamp format used throughout the codebase (matches ``services.utcnow``).
@@ -61,10 +59,9 @@ def _current_user_id(request: Request) -> str:
     """Resolve the requesting user's id, falling back to the anonymous owner.
 
     The auth middleware injects ``request.state.user`` as a mapping carrying the
-    user ``id`` on an authenticated request. When that state is absent (the
-    dispatcher-safe open mode, where ``CAIRN_INTERNAL_TOKEN`` is unset) custom
-    templates are scoped to :data:`ANONYMOUS_USER_ID` so the endpoints stay
-    usable without a session.
+    user ``id`` on an authenticated request. When that state is absent in
+    explicit local/test open-auth mode, custom templates are scoped to
+    :data:`ANONYMOUS_USER_ID` so the endpoints stay usable without a session.
     """
     user = getattr(request.state, "user", None)
     if isinstance(user, dict):

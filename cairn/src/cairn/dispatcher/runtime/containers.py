@@ -7,6 +7,8 @@ from pathlib import PurePosixPath
 import tarfile
 import threading
 import uuid
+import re
+import shlex
 
 import docker
 from docker.errors import APIError, DockerException, NotFound
@@ -37,14 +39,15 @@ class ContainerManager:
         sanitized = project_id.replace("/", "-")
         return f"{self._prefix}{sanitized}"
 
-    def ensure_running(self, project_id: str) -> str:
+    def ensure_running(self, project_id: str, snapshot_ids: list[str] | None = None) -> str:
         name = self.container_name(project_id)
         with self._ensure_running_lock(name):
+            self._sync_project_artifacts(project_id, snapshot_ids or [])
             return self._ensure_running_locked(project_id, name)
 
     def _ensure_running_locked(self, project_id: str, name: str) -> str:
         state = self.inspect_state(name)
-        if state is not None and not self._has_current_artifact_mount(name):
+        if state is not None and not self._has_current_artifact_mount(name, project_id):
             LOG.info("recreating container with stale artifact mount project=%s container=%s state=%s", project_id, name, state)
             self.remove_container(name, force=True)
             state = None
@@ -64,7 +67,7 @@ class ContainerManager:
                 name=name,
                 network_mode=self._config.network_mode,
                 cap_add=self._config.cap_add or None,
-                volumes=self._container_volumes(),
+                volumes=self._container_volumes(project_id),
             )
             LOG.info("created container project=%s container=%s", project_id, name)
             return name
@@ -100,7 +103,7 @@ class ContainerManager:
                 name=name,
                 network_mode=self._config.network_mode,
                 cap_add=self._config.cap_add or None,
-                volumes=self._container_volumes(),
+                volumes=None,
             )
         except DockerException as exc:
             raise RuntimeError(f"failed to create startup container {name}: {exc}") from exc
@@ -132,7 +135,10 @@ class ContainerManager:
             except DockerException as exc:
                 LOG.warning("failed to remove container=%s error=%s", name, exc)
                 return False
-            return self.inspect_state(name) is None
+            removed = self.inspect_state(name) is None
+            if removed:
+                self._remove_project_artifact_volume(project_id)
+            return removed
         elif state == "running":
             LOG.info("stopping completed project container project=%s container=%s", project_id, name)
             try:
@@ -161,6 +167,26 @@ class ContainerManager:
             return False
         return self.inspect_state(name) != "running"
 
+    def restart_for_dispatcher_recovery(self, project_id: str) -> bool:
+        """Restart an active project container to terminate orphaned execs."""
+        name = self.container_name(project_id)
+        if self.inspect_state(name) != "running":
+            return True
+        LOG.warning(
+            "restarting project container after dispatcher recovery project=%s container=%s",
+            project_id,
+            name,
+        )
+        container = self._require_container(name)
+        try:
+            container.restart(timeout=1)
+        except NotFound:
+            return True
+        except DockerException as exc:
+            LOG.warning("failed to restart recovered project container=%s error=%s", name, exc)
+            return False
+        return self.inspect_state(name) == "running"
+
     def cleanup_orphan(self, name: str) -> bool:
         state = self.inspect_state(name)
         if state is None:
@@ -174,7 +200,10 @@ class ContainerManager:
         except DockerException as exc:
             LOG.warning("failed to remove orphan container=%s error=%s", name, exc)
             return False
-        return self.inspect_state(name) is None
+        removed = self.inspect_state(name) is None
+        if removed and name.startswith(self._prefix):
+            self._remove_project_artifact_volume(name[len(self._prefix) :])
+        return removed
 
     def managed_container_names(self) -> list[str]:
         try:
@@ -183,6 +212,26 @@ class ContainerManager:
             LOG.warning("failed to list managed containers error=%s", exc)
             return []
         return sorted(container.name for container in containers if container.name.startswith(self._prefix))
+
+    def project_id_for_ip(self, ip_address: str) -> str | None:
+        if not ip_address:
+            return None
+        try:
+            managed = self._client.containers.list(all=True)
+        except DockerException:
+            LOG.debug("failed to map worker container IP", exc_info=True)
+            return None
+        for container in managed:
+            if not container.name.startswith(self._prefix):
+                continue
+            try:
+                container.reload()
+            except (NotFound, DockerException):
+                continue
+            networks = container.attrs.get("NetworkSettings", {}).get("Networks", {}) or {}
+            if any(network.get("IPAddress") == ip_address for network in networks.values()):
+                return container.name[len(self._prefix) :]
+        return None
 
     def needs_completed_cleanup(self, project_id: str) -> bool:
         name = self.container_name(project_id)
@@ -286,8 +335,8 @@ class ContainerManager:
             raise RuntimeError(f"container not found: {name}")
         return container
 
-    def _container_volumes(self) -> dict[str, dict[str, str]] | None:
-        mount = self._expected_artifact_mount()
+    def _container_volumes(self, project_id: str) -> dict[str, dict[str, str]] | None:
+        mount = self._expected_artifact_mount(project_id)
         if mount is None:
             return None
         mount_type, source = mount
@@ -300,8 +349,8 @@ class ContainerManager:
             }
         }
 
-    def _has_current_artifact_mount(self, name: str) -> bool:
-        expected = self._expected_artifact_mount()
+    def _has_current_artifact_mount(self, name: str, project_id: str) -> bool:
+        expected = self._expected_artifact_mount(project_id)
         if expected is None:
             return True
         expected_type, expected_source = expected
@@ -326,13 +375,79 @@ class ContainerManager:
                 return current_source == expected_source
         return False
 
-    def _expected_artifact_mount(self) -> tuple[str, str] | None:
+    def _expected_artifact_mount(self, project_id: str | None = None) -> tuple[str, str] | None:
         if self._config.artifact_host_path:
+            if project_id is not None:
+                raise RuntimeError(
+                    "artifact_host_path cannot provide project-isolated worker mounts; use artifact_volume"
+                )
             host_path = Path(self._config.artifact_host_path).expanduser().resolve()
             return ("bind", str(host_path))
         if self._config.artifact_volume:
-            return ("volume", self._config.artifact_volume)
+            source = (
+                self._project_artifact_volume_name(project_id)
+                if project_id is not None
+                else self._config.artifact_volume
+            )
+            return ("volume", source)
         return None
+
+    def _project_artifact_volume_name(self, project_id: str) -> str:
+        sanitized = re.sub(r"[^a-zA-Z0-9_.-]+", "-", project_id).strip("-.")
+        if not sanitized:
+            raise ValueError("project_id cannot produce an empty volume name")
+        return f"{self._config.artifact_volume}-{sanitized}"
+
+    def _sync_project_artifacts(self, project_id: str, snapshot_ids: list[str]) -> None:
+        if not self._config.artifact_volume:
+            if snapshot_ids:
+                raise RuntimeError("project artifact isolation requires artifact_volume")
+            return
+        normalized: list[str] = []
+        for snapshot_id in snapshot_ids:
+            if not re.fullmatch(r"[a-zA-Z0-9_.-]+", snapshot_id):
+                raise ValueError(f"invalid snapshot id: {snapshot_id}")
+            if snapshot_id not in normalized:
+                normalized.append(snapshot_id)
+        project_volume = self._project_artifact_volume_name(project_id)
+        self._client.volumes.create(name=project_volume)
+        if not normalized:
+            return
+        copy_commands = ["mkdir -p /target/artifacts/snapshots"]
+        for snapshot_id in normalized:
+            quoted = shlex.quote(snapshot_id)
+            copy_commands.append(
+                f"rm -rf /target/artifacts/snapshots/{quoted} && "
+                f"cp -a /source/artifacts/snapshots/{quoted} /target/artifacts/snapshots/{quoted}"
+            )
+        try:
+            self._client.containers.run(
+                self._config.image,
+                ["sh", "-c", " && ".join(copy_commands)],
+                remove=True,
+                user="0:0",
+                network_mode="none",
+                volumes={
+                    self._config.artifact_volume: {"bind": "/source", "mode": "ro"},
+                    project_volume: {"bind": "/target", "mode": "rw"},
+                },
+            )
+        except DockerException as exc:
+            raise RuntimeError(
+                f"failed to prepare isolated artifacts for project {project_id}: {exc}"
+            ) from exc
+
+    def _remove_project_artifact_volume(self, project_id: str) -> None:
+        if not self._config.artifact_volume:
+            return
+        name = self._project_artifact_volume_name(project_id)
+        try:
+            volume = self._client.volumes.get(name)
+            volume.remove(force=True)
+        except NotFound:
+            return
+        except DockerException as exc:
+            LOG.warning("failed to remove project artifact volume=%s error=%s", name, exc)
 
     @staticmethod
     def _is_name_conflict(exc: APIError) -> bool:

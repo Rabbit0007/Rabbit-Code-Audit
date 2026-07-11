@@ -10,5 +10,15 @@ export default defineConfig({
     outDir,
     emptyOutDir: false,
     assetsDir: "assets",
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          react: ["react", "react-dom"],
+          "graph-core": ["cytoscape"],
+          "graph-layout": ["cytoscape-dagre", "dagre"],
+          icons: ["lucide-react"],
+        },
+      },
+    },
   },
 });

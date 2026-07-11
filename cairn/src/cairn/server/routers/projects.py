@@ -43,7 +43,7 @@ from cairn.server.services import (
     validate_goal_not_in_sources,
     validate_project_ready_to_complete,
 )
-from cairn.server.source_service import list_snapshots
+from cairn.server.source_service import delete_snapshot_artifacts, list_snapshots
 
 router = APIRouter(tags=["projects"])
 
@@ -57,8 +57,8 @@ def list_projects():
             SELECT p.*,
                 (SELECT COUNT(*) FROM facts WHERE project_id = p.id) AS fact_count,
                 (SELECT COUNT(*) FROM intents WHERE project_id = p.id) AS intent_count,
-                (SELECT COUNT(*) FROM intents WHERE project_id = p.id AND concluded_at IS NULL AND worker IS NOT NULL) AS working_intent_count,
-                (SELECT COUNT(*) FROM intents WHERE project_id = p.id AND concluded_at IS NULL AND worker IS NULL) AS unclaimed_intent_count,
+                (SELECT COUNT(*) FROM intents WHERE project_id = p.id AND concluded_at IS NULL AND worker IS NOT NULL AND status = 'claimed') AS working_intent_count,
+                (SELECT COUNT(*) FROM intents WHERE project_id = p.id AND concluded_at IS NULL AND worker IS NULL AND status IN ('open', 'cooldown')) AS unclaimed_intent_count,
                 (SELECT COUNT(*) FROM hints WHERE project_id = p.id) AS hint_count
             FROM projects p
             ORDER BY p.created_at
@@ -148,8 +148,21 @@ def create_project(body: CreateProjectRequest):
                     )
                 )
 
-        record_audit("project.create", f"创建项目 {body.title}", target_type="project", target_id=pid, conn=conn)
-        record_notification(f"新建项目：{body.title}", level="info", link="#/projects", conn=conn)
+        record_audit(
+            "project.create",
+            f"创建项目 {body.title}",
+            target_type="project",
+            target_id=pid,
+            project_id=pid,
+            conn=conn,
+        )
+        record_notification(
+            f"新建项目：{body.title}",
+            level="info",
+            link="#/projects",
+            project_id=pid,
+            conn=conn,
+        )
         return ProjectDetail(
             project=ProjectMeta(id=pid, title=body.title, status="active", created_at=now, reason=None),
             facts=[
@@ -189,11 +202,23 @@ def get_project(project_id: str):
 @router.delete("/projects/{project_id}", status_code=204)
 def delete_project(project_id: str):
     with get_conn() as conn:
-        row = get_project_or_404(conn, project_id)
-        title = row["title"]
+        get_project_or_404(conn, project_id)
+        snapshot_ids = [
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM source_snapshots WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        ]
+        conn.execute("DELETE FROM worker_task_history WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM model_usage_records WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM export_records WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM audit_log WHERE project_id = ? OR (target_type = 'project' AND target_id = ?)", (project_id, project_id))
+        conn.execute("DELETE FROM notifications WHERE project_id = ?", (project_id,))
         conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-    record_audit("project.delete", f"删除项目 {title}", target_type="project", target_id=project_id)
-    record_notification(f"项目已删除：{title}", level="warning")
+    delete_snapshot_artifacts(snapshot_ids)
+    record_audit("project.delete", "删除项目及其关联数据")
+    record_notification("项目及其关联数据已删除", level="warning")
 
 
 @router.put("/projects/{project_id}/title", response_model=ProjectMeta)
@@ -221,13 +246,19 @@ def update_project_status(project_id: str, body: UpdateProjectStatusRequest):
         if current_status == body.status:
             return project_meta_from_row(row)
 
+        pause_reason = body.pause_reason if body.status == "stopped" else None
         conn.execute(
-            "UPDATE projects SET status = ? WHERE id = ?",
-            (body.status, project_id),
+            "UPDATE projects SET status = ?, pause_reason = ? WHERE id = ?",
+            (body.status, pause_reason, project_id),
         )
         if body.status == "stopped":
             conn.execute(
-                "UPDATE intents SET worker = NULL, status = 'open' WHERE project_id = ? AND concluded_at IS NULL",
+                """
+                UPDATE intents
+                SET worker = NULL,
+                    status = CASE WHEN status = 'claimed' THEN 'open' ELSE status END
+                WHERE project_id = ? AND concluded_at IS NULL
+                """,
                 (project_id,),
             )
             clear_project_reason(conn, project_id)

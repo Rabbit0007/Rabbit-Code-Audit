@@ -53,7 +53,10 @@ def run_review_task(
     )
     lease.start()
     try:
-        container_name = container_manager.ensure_running(project.project.id)
+        container_name = container_manager.ensure_running(
+            project.project.id,
+            [source.id for source in getattr(project, "sources", []) if source.status == "ready"],
+        )
         source_check = verify_latest_source_available(
             container_manager,
             container_name,

@@ -309,6 +309,18 @@ const BUSINESS_REVIEW_STATUS_META = {
   blocked: { label: "已阻塞", tone: "muted" },
 };
 
+const BUSINESS_GRAPH_LAYER_META = {
+  evidence: { label: "代码证据", tone: "muted" },
+  semantic: { label: "业务语义", tone: "info" },
+  audit: { label: "审计风险", tone: "danger" },
+};
+
+const BUSINESS_EVIDENCE_STATUS_META = {
+  source_backed: { label: "源码支撑", tone: "success" },
+  inferred: { label: "索引推导", tone: "medium" },
+  unverified: { label: "待补证", tone: "warning" },
+};
+
 const BUSINESS_CONCLUSION_META = {
   confirmed_finding: { label: "确认漏洞", tone: "danger" },
   rejected: { label: "未发现漏洞", tone: "success" },
@@ -487,6 +499,7 @@ export default function App() {
         onPassword={() => setPasswordOpen(true)}
         onSettings={() => setSettingsOpen(true)}
         setToast={setToast}
+        confirmAction={confirmAction}
       />
       <main className="app-main">
         {route.page === "project" ? (
@@ -524,7 +537,7 @@ export default function App() {
   );
 }
 
-function TopNav({ route, user, theme, onToggleTheme, onLogout, onPassword, onSettings, setToast }) {
+function TopNav({ route, user, theme, onToggleTheme, onLogout, onPassword, onSettings, setToast, confirmAction }) {
   const mainNav = [
     ["projects", "项目", Folder],
     ["vulnerabilities", "审计报告", AlertTriangle],
@@ -594,7 +607,7 @@ function TopNav({ route, user, theme, onToggleTheme, onLogout, onPassword, onSet
         <div className="top-section-label">{sectionLabel}</div>
         <GlobalSearch setToast={setToast} />
         <div className="nav-actions">
-          <NotificationBell setToast={setToast} />
+          <NotificationBell setToast={setToast} confirmAction={confirmAction} />
           <button
             className="icon-button"
             type="button"
@@ -851,7 +864,7 @@ function GlobalSearch({ setToast }) {
   );
 }
 
-function NotificationBell({ setToast }) {
+function NotificationBell({ setToast, confirmAction }) {
   const [count, setCount] = useState(0);
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState([]);
@@ -918,6 +931,13 @@ function NotificationBell({ setToast }) {
   };
 
   const clearAll = async () => {
+    const confirmed = await confirmAction({
+      title: "清空全部通知？",
+      message: "该操作会删除当前账号的全部通知记录，删除后无法恢复。",
+      tone: "danger",
+      confirmLabel: "清空通知",
+    });
+    if (!confirmed) return;
     try {
       await apiRequest("/api/notifications", { method: "DELETE" });
       setItems([]);
@@ -997,9 +1017,11 @@ function NotificationBell({ setToast }) {
 }
 
 function ConfirmModal({ title = "确认操作", message, tone = "default", confirmLabel = "确认", cancelLabel = "取消", onConfirm, onCancel }) {
+  useModalLifecycle(onCancel);
+
   return (
-    <div className="modal-backdrop" role="presentation">
-      <section className="modal-card confirm-card" role="dialog" aria-modal="true">
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onCancel()}>
+      <section className="modal-card confirm-card" role="dialog" aria-modal="true" aria-label={title}>
         <div className="confirm-body">
           <span className={cn("confirm-icon", tone)}>
             {tone === "danger" ? <AlertTriangle size={22} /> : <AlertCircle size={22} />}
@@ -1010,14 +1032,14 @@ function ConfirmModal({ title = "确认操作", message, tone = "default", confi
           </div>
         </div>
         <div className="modal-footer">
-          <button className="ghost-button" type="button" onClick={onCancel}>
+          <button className="ghost-button" type="button" onClick={onCancel} autoFocus={tone === "danger"}>
             {cancelLabel}
           </button>
           <button
             className={cn("primary-button compact", tone === "danger" && "danger")}
             type="button"
             onClick={onConfirm}
-            autoFocus
+            autoFocus={tone !== "danger"}
           >
             {confirmLabel}
           </button>
@@ -1404,7 +1426,7 @@ function AuthPage({ onAuthed, setToast }) {
             </span>
             <span>
               <Network size={16} />
-              事实图协作
+              业务图协作
             </span>
           </div>
         </aside>
@@ -1574,26 +1596,61 @@ function PageHeader({ icon: Icon, title, subtitle, actions, compact = false }) {
 }
 
 function Toast({ toast, onClose }) {
+  const type = toast.type || "info";
+  const meta = {
+    success: { title: "操作成功", icon: CheckCircle2 },
+    warning: { title: "请注意", icon: AlertTriangle },
+    danger: { title: "操作失败", icon: AlertCircle },
+    info: { title: "系统提示", icon: Bell },
+  }[type];
+  const ToastIcon = meta.icon;
+
   return (
-    <div className={cn("toast", toast.type || "info")}>
-      <span>{toast.message}</span>
-      <button type="button" onClick={onClose}>
+    <div
+      className={cn("toast", type)}
+      role={type === "danger" ? "alert" : "status"}
+      aria-live={type === "danger" ? "assertive" : "polite"}
+    >
+      <span className="toast-icon"><ToastIcon size={18} /></span>
+      <span className="toast-copy">
+        <strong>{toast.title || meta.title}</strong>
+        <span>{toast.message}</span>
+      </span>
+      <button type="button" onClick={onClose} aria-label="关闭提示" title="关闭提示">
         <X size={16} />
       </button>
+      <span className="toast-timer" aria-hidden="true" />
     </div>
   );
 }
 
+function useModalLifecycle(onClose) {
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.body.style.overflow = "hidden";
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [onClose]);
+}
+
 function Modal({ title, subtitle, children, onClose, wide = false }) {
+  useModalLifecycle(onClose);
+
   return (
-    <div className="modal-backdrop" role="presentation">
-      <section className={cn("modal-card", wide && "wide")} role="dialog" aria-modal="true">
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section className={cn("modal-card", wide && "wide")} role="dialog" aria-modal="true" aria-label={title}>
         <header className="modal-header">
           <div>
             <h2>{title}</h2>
             {subtitle && <p>{subtitle}</p>}
           </div>
-          <button className="icon-button" type="button" onClick={onClose}>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="关闭弹窗" title="关闭">
             <X size={18} />
           </button>
         </header>
@@ -2056,6 +2113,7 @@ function NewProjectModal({ onClose, onCreated, runAction, initial = null }) {
   const submit = async (event) => {
     event.preventDefault();
     setSaving(true);
+    let createdProjectId = null;
     try {
       const detail = await runAction("项目已创建", () =>
         apiRequest("/projects", {
@@ -2068,6 +2126,7 @@ function NewProjectModal({ onClose, onCreated, runAction, initial = null }) {
           },
         }),
       );
+      createdProjectId = detail.project.id;
       if (form.sourceType === "git") {
         await runAction("Git 源码已导入", () =>
           apiRequest(`/api/projects/${detail.project.id}/sources/git`, {
@@ -2089,6 +2148,18 @@ function NewProjectModal({ onClose, onCreated, runAction, initial = null }) {
         );
       }
       onCreated(detail.project.id);
+    } catch (error) {
+      if (createdProjectId) {
+        try {
+          await apiRequest(`/projects/${createdProjectId}`, { method: "DELETE" });
+        } catch (cleanupError) {
+          setToast({
+            type: "danger",
+            message: `${error.message || "源码导入失败"}；自动清理失败：${cleanupError.message || "请手动删除项目"}`,
+          });
+        }
+      }
+      throw error;
     } finally {
       setSaving(false);
     }
@@ -2871,7 +2942,7 @@ function GraphCanvas({ detail, selected, onSelect, layout }) {
   const cyRef = useRef(null);
 
   const elements = useMemo(() => {
-    const compactLabel = (value, length = 72) => clampText(String(value || ""), length);
+    const compactLabel = (value, length = 40) => clampText(String(value || ""), length);
     const nodes = detail.facts.map((fact) => ({
       data: {
         id: fact.id,
@@ -4102,6 +4173,24 @@ function BusinessGraphPanel({
   const nodes = graph.nodes || [];
   const edges = graph.edges || [];
   const conclusions = graph.conclusions || [];
+  const [layerFilter, setLayerFilter] = useState("all");
+  const layerCounts = useMemo(
+    () =>
+      nodes.reduce(
+        (counts, node) => ({ ...counts, [node.graph_layer || "semantic"]: (counts[node.graph_layer || "semantic"] || 0) + 1 }),
+        { evidence: 0, semantic: 0, audit: 0 },
+      ),
+    [nodes],
+  );
+  const visibleNodes = useMemo(
+    () => (layerFilter === "all" ? nodes : nodes.filter((node) => (node.graph_layer || "semantic") === layerFilter)),
+    [layerFilter, nodes],
+  );
+  const visibleNodeIds = useMemo(() => new Set(visibleNodes.map((node) => node.id)), [visibleNodes]);
+  const visibleEdges = useMemo(
+    () => edges.filter((edge) => visibleNodeIds.has(edge.from_node_id) && visibleNodeIds.has(edge.to_node_id)),
+    [edges, visibleNodeIds],
+  );
   const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
   const auditFindingById = useMemo(
     () => new Map((auditFindings || []).map((finding) => [finding.id, finding])),
@@ -4134,6 +4223,26 @@ function BusinessGraphPanel({
           <Network size={16} />
           关系
         </button>
+        <div className="business-layer-tabs" role="tablist" aria-label="业务图图层">
+          {[
+            ["all", "全部", nodes.length],
+            ["evidence", "代码证据", layerCounts.evidence],
+            ["semantic", "业务语义", layerCounts.semantic],
+            ["audit", "审计风险", layerCounts.audit],
+          ].map(([key, label, count]) => (
+            <button
+              className={cn(layerFilter === key && "active")}
+              type="button"
+              role="tab"
+              aria-selected={layerFilter === key}
+              key={key}
+              onClick={() => setLayerFilter(key)}
+            >
+              {label}
+              <span>{count}</span>
+            </button>
+          ))}
+        </div>
       </div>
       {highRiskNodes.length > 0 && (
         <div className={cn("business-closure-strip", unresolvedNodes.length ? "warning" : "success")}>
@@ -4161,9 +4270,12 @@ function BusinessGraphPanel({
           <div className="business-section">
             <span>业务节点</span>
             <div className="business-node-list">
-              {nodes.map((node) => {
+              {visibleNodes.map((node) => {
                 const meta = BUSINESS_NODE_META[node.node_type] || { label: node.node_type, tone: "muted" };
                 const risk = BUSINESS_RISK_META[node.risk_level || "unknown"] || BUSINESS_RISK_META.unknown;
+                const layer = BUSINESS_GRAPH_LAYER_META[node.graph_layer || "semantic"] || BUSINESS_GRAPH_LAYER_META.semantic;
+                const evidenceStatus =
+                  BUSINESS_EVIDENCE_STATUS_META[node.evidence_status || "unverified"] || BUSINESS_EVIDENCE_STATUS_META.unverified;
                 const review =
                   BUSINESS_REVIEW_STATUS_META[node.review_status || "unreviewed"] ||
                   BUSINESS_REVIEW_STATUS_META.unreviewed;
@@ -4177,6 +4289,8 @@ function BusinessGraphPanel({
                     <div className="business-node-head">
                       <div className="business-badge-row">
                         <Badge tone={meta.tone}>{meta.label}</Badge>
+                        <Badge tone={layer.tone}>{layer.label}</Badge>
+                        <Badge tone={evidenceStatus.tone}>{evidenceStatus.label}</Badge>
                         <Badge tone={risk.tone}>{risk.label}</Badge>
                         <Badge tone={review.tone}>{review.label}</Badge>
                         {conclusionMeta && <Badge tone={conclusionMeta.tone}>{conclusionMeta.label}</Badge>}
@@ -4195,6 +4309,11 @@ function BusinessGraphPanel({
                       </div>
                     </div>
                     <h3>{node.title}</h3>
+                    <div className="business-node-provenance">
+                      <code>{node.semantic_key || node.id}</code>
+                      <span>修订 {node.revision || 1}</span>
+                      <span>{(node.contributors || [node.created_by]).join("、")}</span>
+                    </div>
                     {node.description && <p>{node.description}</p>}
                     {node.coverage_note && <p className="business-coverage-note">{node.coverage_note}</p>}
                     {conclusion && (
@@ -4227,11 +4346,11 @@ function BusinessGraphPanel({
           </div>
           <div className="business-section">
             <span>业务关系</span>
-            {edges.length === 0 ? (
+            {visibleEdges.length === 0 ? (
               <div className="soft-box compact">暂无关系</div>
             ) : (
               <div className="business-edge-list">
-                {edges.map((edge) => {
+                {visibleEdges.map((edge) => {
                   const from = nodeById.get(edge.from_node_id);
                   const to = nodeById.get(edge.to_node_id);
                   return (
@@ -4241,6 +4360,7 @@ function BusinessGraphPanel({
                         <span>{BUSINESS_EDGE_META[edge.relation] || edge.relation}</span>
                         <strong>{to?.title || edge.to_node_id}</strong>
                       </div>
+                      <small>{BUSINESS_GRAPH_LAYER_META[edge.graph_layer || "semantic"]?.label || "业务语义"} · 修订 {edge.revision || 1}</small>
                       {edge.description && <p>{edge.description}</p>}
                       <button className="icon-button tiny danger" type="button" title="删除关系" onClick={() => onDeleteEdge(edge)}>
                         <Trash2 size={14} />

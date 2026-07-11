@@ -28,16 +28,15 @@ Dual authentication (dispatcher compatibility):
 
 The dispatcher communicates with the API over HTTP using a cookieless
 ``requests.Session`` and hits the same endpoints as the browser UI. To protect
-the UI without breaking the dispatcher — and without modifying the dispatcher
-(an existing core file) — ``require_auth`` accepts EITHER a valid session cookie
-(browser users) OR a valid internal-service token presented via the
-``X-Cairn-Internal-Token`` header matching the ``CAIRN_INTERNAL_TOKEN``
-environment variable (trusted machine clients).
+the UI while still allowing trusted machine clients, ``require_auth`` accepts
+EITHER a valid session cookie (browser users) OR a valid internal-service token
+presented via the ``X-Cairn-Internal-Token`` header matching the
+``CAIRN_INTERNAL_TOKEN`` environment variable.
 
-To keep existing deployments and the current dispatcher working unchanged, the
-internal token is OPT-IN: when ``CAIRN_INTERNAL_TOKEN`` is unset, the protected
-routers preserve their pre-auth (open) behaviour. Once an operator sets the
-variable, requests must present either a valid cookie or the matching header.
+Protected routers are closed by default. Local/test compatibility can be
+explicitly enabled with ``CAIRN_AUTH_OPEN_MODE=1``; production deployments
+should configure ``CAIRN_INTERNAL_TOKEN`` and have the dispatcher send the
+matching header.
 
 The session cookie name and lifetime are reused from
 :mod:`cairn.server.routers.auth` so there is a single source of truth.
@@ -82,15 +81,15 @@ LOGIN_PATH = "/"
 # ``X-Cairn-Internal-Token`` header matching the ``CAIRN_INTERNAL_TOKEN``
 # environment variable.
 #
-# Non-breaking default: when ``CAIRN_INTERNAL_TOKEN`` is *not* set, the
-# dispatcher-facing routers preserve their pre-auth (open) behaviour so existing
-# deployments and the dispatcher keep working exactly as before. Setting the
-# environment variable is an explicit, operator-driven opt-in to enforcement;
-# once set, the dispatcher must be configured to send the matching header.
+# Local/test compatibility: when ``CAIRN_AUTH_OPEN_MODE`` is truthy and no
+# internal token is configured, protected routers preserve their pre-auth open
+# behaviour. Production should leave this unset and configure
+# ``CAIRN_INTERNAL_TOKEN`` instead.
 # ---------------------------------------------------------------------------
 
 # Environment variable holding the shared internal-service token. Optional.
 INTERNAL_TOKEN_ENV = "CAIRN_INTERNAL_TOKEN"
+OPEN_AUTH_ENV = "CAIRN_AUTH_OPEN_MODE"
 
 # Header a trusted machine client (e.g. the dispatcher) uses to present the
 # internal token. Compared case-insensitively by Starlette's header lookup.
@@ -99,6 +98,7 @@ INTERNAL_TOKEN_HEADER = "x-cairn-internal-token"
 # Timestamp format used throughout the codebase (matches ``services.utcnow`` and
 # the format the auth router stores ``sessions.expires_at`` in).
 _TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_TRUTHY = {"1", "true", "yes", "on"}
 
 # Paths exempt from authentication (requirement 5.2).
 EXEMPT_PATHS = frozenset(
@@ -144,14 +144,18 @@ def _configured_internal_token() -> str | None:
     return token or None
 
 
+def _auth_open_mode_enabled() -> bool:
+    value = os.environ.get(OPEN_AUTH_ENV)
+    return value is not None and value.strip().lower() in _TRUTHY
+
+
 def _has_valid_internal_token(request: Request) -> bool:
     """Return ``True`` when the request carries a valid internal-service token.
 
     The dispatcher (and any other trusted machine client) authenticates by
     sending the ``X-Cairn-Internal-Token`` header matching ``CAIRN_INTERNAL_TOKEN``.
     Comparison is constant-time to avoid leaking the secret via timing. Returns
-    ``False`` when no token is configured so the caller can fall back to the
-    dispatcher-safe open behaviour.
+    ``False`` when no token is configured.
     """
     configured = _configured_internal_token()
     if configured is None:
@@ -222,15 +226,11 @@ def require_auth(request: Request, response: Response) -> sqlite3.Row:
     # mechanism that lets us protect the browser UI without breaking the
     # dispatcher's cookieless HTTP calls.
     #
-    # Dispatcher-safe default: if CAIRN_INTERNAL_TOKEN is not configured, the
-    # existing (cookieless) dispatcher and any current deployment must keep
-    # working unchanged. In that case we do not enforce auth on these routers and
-    # allow the request through, preserving pre-auth behaviour. Configuring the
-    # env var is an explicit opt-in to enforcement.
     if _configured_internal_token() is None:
-        # No internal token configured: do not break the dispatcher or existing
-        # deployments. Allow through without injecting a user (no session).
-        return None  # type: ignore[return-value]
+        if _auth_open_mode_enabled():
+            # Explicit local/test compatibility mode. Do not inject a user.
+            return None  # type: ignore[return-value]
+        raise _reject(request)
     if _has_valid_internal_token(request):
         # Trusted machine client (e.g. dispatcher) presenting the shared secret.
         return None  # type: ignore[return-value]

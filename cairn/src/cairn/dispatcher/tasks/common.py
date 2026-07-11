@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 import uuid
@@ -240,7 +241,7 @@ def run_healthcheck(
 ) -> HealthcheckRun:
     process = container_manager.build_exec_process(
         container_name,
-        dict(worker.env),
+        _isolated_worker_env(worker),
         command,
         timeout_seconds=timeout_seconds,
     )
@@ -281,7 +282,7 @@ def run_worker_process(
     )
     process = container_manager.build_exec_process(
         container_name,
-        dict(worker.env),
+        _isolated_worker_env(worker),
         argv,
         timeout_seconds=timeout_seconds,
     )
@@ -297,6 +298,16 @@ def run_worker_process(
             lease.attach_process(None)
         if cancellation is not None:
             cancellation.attach_process(None)
+
+
+def _isolated_worker_env(worker: WorkerConfig) -> dict[str, str]:
+    env = dict(worker.env)
+    proxy_url = os.environ.get("CAIRN_MODEL_PROXY_URL", "").strip()
+    proxy_token = os.environ.get("CAIRN_MODEL_PROXY_TOKEN", "").strip()
+    if worker.type == "pi" and proxy_url and proxy_token:
+        env["PI_BASE_URL"] = proxy_url.rstrip("/")
+        env["PI_API_KEY"] = proxy_token
+    return env
 
 
 def project_allows_conclude_fallback(client: CairnClient, project_id: str, *, worker_name: str, intent_id: str) -> bool:
@@ -343,6 +354,7 @@ def write_conclude_result(
     source: str,
     phase_ms: int,
     total_ms: int | None = None,
+    evidence_refs: list[str] | None = None,
 ) -> str:
     return write_conclude_result_with_fact_id(
         client,
@@ -353,6 +365,7 @@ def write_conclude_result(
         source=source,
         phase_ms=phase_ms,
         total_ms=total_ms,
+        evidence_refs=evidence_refs,
     ).status
 
 
@@ -366,8 +379,18 @@ def write_conclude_result_with_fact_id(
     source: str,
     phase_ms: int,
     total_ms: int | None = None,
+    evidence_refs: list[str] | None = None,
 ) -> ConcludeWriteResult:
-    response = client.conclude(project_id, intent_id, worker_name, description)
+    if evidence_refs:
+        response = client.conclude(
+            project_id,
+            intent_id,
+            worker_name,
+            description,
+            evidence_refs=evidence_refs,
+        )
+    else:
+        response = client.conclude(project_id, intent_id, worker_name, description)
     if response.ok:
         fact_id: str | None = None
         if isinstance(response.data, dict):
@@ -440,6 +463,9 @@ def write_business_graph(
             "last_intent_id": node.get("last_intent_id") or last_intent_id,
             "risk_tags": node.get("risk_tags") or [],
             "evidence": node.get("evidence") or [],
+            "semantic_key": node.get("semantic_key"),
+            "graph_layer": node.get("graph_layer") or ("audit" if node["node_type"] == "risk" else "semantic"),
+            "confidence": node.get("confidence", 0.7),
             "created_by": worker_name,
         }
         response = client.create_business_node(project_id, payload)
@@ -466,6 +492,8 @@ def write_business_graph(
             "to_node_id": to_node_id,
             "relation": edge["relation"],
             "description": edge.get("description"),
+            "graph_layer": edge.get("graph_layer") or ("audit" if edge["relation"] == "risk_of" else "semantic"),
+            "confidence": edge.get("confidence", 0.7),
             "created_by": worker_name,
         }
         response = client.create_business_edge(project_id, payload)

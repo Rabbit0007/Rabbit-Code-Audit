@@ -869,10 +869,16 @@ def test_export_markdown_content_and_scope(client, populated):
     assert "p1.md" in resp.headers["content-disposition"]
     text = resp.text
     assert text.startswith("# Alpha - 代码审计报告")
+    assert "## 执行摘要" in text
+    assert "## 审计范围与方法" in text
     assert "## 报告概览" in text
     assert "## 漏洞清单" in text
     assert "## 项目：Alpha（`p1`）" in text
     assert "缺少原始证明数据包，不能作为交付证明" in text
+    assert "#### 修复验收标准" in text
+    assert "#### 复测记录模板" in text
+    assert "#### 复测操作手册" in text
+    assert "证据口径" in text
     assert "Beta" not in text
 
 
@@ -985,3 +991,64 @@ def test_refresh_picks_up_new_facts(client, temp_db):
     resp = client.post("/api/vulnerabilities/refresh")
     assert resp.status_code == 200
     assert resp.json() == {"critical": 0, "high": 0, "medium": 0, "low": 0}
+
+
+def test_refresh_removes_legacy_fact_rows_but_keeps_audit_findings(client, temp_db):
+    """Refresh reconciles the report table back to confirmed audit findings."""
+    _insert_project("p1", "Alpha")
+    with db.get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO source_snapshots (
+                id, project_id, source_type, status, file_count, total_bytes,
+                detected_languages_json, created_at
+            )
+            VALUES ('snap_1', 'p1', 'zip', 'ready', 1, 10, '{}', '2026-01-01T00:00:00Z')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_findings (
+                id, project_id, snapshot_id, title, category, severity, status,
+                description, discovered_by, created_at
+            )
+            VALUES (
+                'finding_1', 'p1', 'snap_1', 'Confirmed issue', 'injection',
+                'high', 'confirmed', 'confirmed audit finding', 'worker-a',
+                '2026-01-01T00:00:01Z'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO vulnerabilities (
+                id, project_id, fact_id, title, description, severity, discovered_at
+            )
+            VALUES (
+                'finding_1', 'p1', 'finding_1', 'Confirmed issue',
+                'confirmed audit finding', 'high', '2026-01-01T00:00:01Z'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO vulnerabilities (
+                id, project_id, fact_id, title, description, severity, discovered_at
+            )
+            VALUES (
+                'legacy_fact_vuln', 'p1', 'fact_1', 'Legacy keyword issue',
+                'old fact-derived report row', 'critical', '2026-01-01T00:00:02Z'
+            )
+            """
+        )
+
+    resp = client.post("/api/vulnerabilities/refresh")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"critical": 0, "high": 1, "medium": 0, "low": 0}
+    with db.get_conn() as conn:
+        ids = {
+            row["id"]
+            for row in conn.execute("SELECT id FROM vulnerabilities ORDER BY id").fetchall()
+        }
+    assert ids == {"finding_1"}

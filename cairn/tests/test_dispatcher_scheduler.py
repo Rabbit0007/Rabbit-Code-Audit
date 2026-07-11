@@ -5,6 +5,8 @@ import time
 from concurrent.futures import Future
 from types import SimpleNamespace
 
+import pytest
+
 from cairn.dispatcher.models import ReasonCheckpoint, RunningTask, TaskOutcome
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
 from cairn.dispatcher.config import WorkerConfig
@@ -15,6 +17,7 @@ from cairn.dispatcher.scheduler.loop import (
     DispatcherLoop,
 )
 from cairn.dispatcher.tasks.reason import _fallback_intents_from_graph
+from cairn.dispatcher.contracts import validate_reason_payload
 
 
 def _scheduler_loop() -> DispatcherLoop:
@@ -29,6 +32,7 @@ def _scheduler_loop() -> DispatcherLoop:
     loop.reason_worker_retry_blocked_until = {}
     loop.explore_worker_retry_blocked_until = {}
     loop.explore_worker_parse_blocked_until = loop.explore_worker_retry_blocked_until
+    loop._persisted_explore_failures_loaded = set()
     loop.worker_unhealthy_until = {}
     loop.worker_rejected_until = {}
     loop.worker_rate_limited_until = {}
@@ -57,6 +61,45 @@ def _worker(
     )
 
 
+def test_reason_contract_rejects_intents_covering_too_many_source_files():
+    payload = {
+        "accepted": True,
+        "data": {
+            "intents": [
+                {
+                    "from": ["f001"],
+                    "description": "审计 " + "、".join(f"app/module_{index}.py" for index in range(6)),
+                }
+            ]
+        },
+    }
+
+    with pytest.raises(ValueError, match="maximum is 5"):
+        validate_reason_payload(payload, open_intents_empty=True, max_intents=3)
+
+
+def test_dispatcher_startup_restarts_active_container_with_claimed_work():
+    loop = _scheduler_loop()
+    recovered: list[str] = []
+    loop._startup_runtime_recovered = False
+    loop.container_manager = SimpleNamespace(
+        restart_for_dispatcher_recovery=lambda project_id: recovered.append(project_id) or True
+    )
+    summaries = [
+        SimpleNamespace(
+            id="proj_1",
+            status="active",
+            working_intent_count=2,
+            reason=None,
+        )
+    ]
+
+    loop._recover_active_project_containers(summaries)
+    loop._recover_active_project_containers(summaries)
+
+    assert recovered == ["proj_1"]
+
+
 def test_explore_parse_failure_temporarily_avoids_same_worker():
     loop = _scheduler_loop()
 
@@ -79,6 +122,25 @@ def test_explore_parse_failure_cools_down_repeated_bad_intent():
 
     assert loop._explore_parse_cooldown("proj_1", "i001") is True
     assert loop._explore_parse_cooldown("proj_1", "i002") is False
+
+
+def test_persisted_explore_failures_supersede_intent_before_redispatch():
+    loop = _scheduler_loop()
+    superseded: list[tuple[str, str, str]] = []
+    loop.client = SimpleNamespace(
+        list_explore_retry_failures=lambda project_id: [
+            {"intent_id": "i001", "failures": 7, "last_error": "no JSON object found"}
+        ],
+        supersede_intent=lambda project_id, intent_id, reason: (
+            superseded.append((project_id, intent_id, reason))
+            or SimpleNamespace(ok=True, status_code=200)
+        ),
+    )
+    project = SimpleNamespace(project=SimpleNamespace(id="proj_1"))
+    intent = SimpleNamespace(id="i001", created_at="2026-01-01", description="audit app.py")
+
+    assert loop._dispatch_first_available_explore(project, [intent]) is False
+    assert superseded == [("proj_1", "i001", "dispatcher:retry_limit")]
 
 
 def test_successful_explore_clears_parse_failure_state():

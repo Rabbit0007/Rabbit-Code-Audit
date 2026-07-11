@@ -164,7 +164,7 @@ def _install_latency_aware_fake(monkeypatch, *, simulated_latency: float, captur
     config GET/PUT).
     """
 
-    def fake_request(method, url, json=None, timeout=None):  # noqa: ARG001
+    def fake_request(method, url, json=None, timeout=None, headers=None):  # noqa: ARG001
         captured_timeouts.append(timeout)
         if timeout is None or simulated_latency > timeout:
             raise requests.Timeout(

@@ -178,6 +178,201 @@ def test_business_graph_accepts_index_generated_inheritance_relations(temp_db):
     assert {edge["relation"] for edge in graph.json()["edges"]} == {"extends", "extended_by"}
 
 
+def test_business_graph_merges_nodes_by_semantic_key(temp_db):
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    first = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "feature",
+            "semantic_key": "feature:order_refund",
+            "title": "订单退款",
+            "description": "提交退款申请",
+            "risk_tags": ["越权"],
+            "evidence": ["orders/refund.py:42"],
+            "confidence": 0.78,
+            "created_by": "worker-a",
+        },
+    ).json()
+    second = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "feature",
+            "semantic_key": "feature:order_refund",
+            "title": "退款订单",
+            "description": "用户提交退款申请并进入财务审批流程",
+            "risk_level": "high",
+            "risk_tags": ["重复退款"],
+            "evidence": ["orders/approval.py:18"],
+            "confidence": 0.91,
+            "created_by": "worker-b",
+        },
+    ).json()
+
+    assert second["id"] == first["id"]
+    assert second["revision"] == 2
+    assert second["risk_level"] == "high"
+    assert second["confidence"] == 0.9
+    assert second["risk_tags"] == ["越权", "重复退款"]
+    assert second["evidence"] == ["orders/refund.py:42", "orders/approval.py:18"]
+    assert second["contributors"] == ["worker-a", "worker-b"]
+    assert second["evidence_status"] == "source_backed"
+    assert len(client.get(f"/api/projects/{project_id}/business-graph").json()["nodes"]) == 1
+
+
+def test_business_graph_merges_duplicate_edges(temp_db):
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    source = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={"node_type": "role", "title": "财务审核员", "created_by": "worker-a"},
+    ).json()
+    target = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={"node_type": "feature", "title": "退款审批", "created_by": "worker-a"},
+    ).json()
+    payload = {
+        "from_node_id": source["id"],
+        "to_node_id": target["id"],
+        "relation": "guards",
+        "description": "财务角色审批退款",
+        "created_by": "worker-a",
+    }
+    first = client.post(f"/api/projects/{project_id}/business-graph/edges", json=payload).json()
+    payload["created_by"] = "worker-b"
+    payload["confidence"] = 0.9
+    second = client.post(f"/api/projects/{project_id}/business-graph/edges", json=payload).json()
+
+    assert second["id"] == first["id"]
+    assert second["revision"] == 2
+    assert second["confidence"] == 0.9
+    assert second["contributors"] == ["worker-a", "worker-b"]
+    assert len(client.get(f"/api/projects/{project_id}/business-graph").json()["edges"]) == 1
+
+
+def test_business_graph_keeps_unverified_evidence_state_separate_from_review_status(temp_db):
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    node = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "role",
+            "title": "管理员",
+            "review_status": "covered",
+            "created_by": "worker-a",
+        },
+    ).json()
+
+    assert node["review_status"] == "covered"
+    assert node["evidence_status"] == "unverified"
+
+
+def test_business_graph_validates_model_evidence_and_calibrates_confidence(
+    temp_db, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    source_root = tmp_path / "artifacts" / "snapshots" / "snap_graph" / "source"
+    (source_root / "orders").mkdir(parents=True)
+    (source_root / "orders" / "refund.py").write_text(
+        "\n".join(["# filler"] * 41 + ["refund_order(order_id)", "# tail"]),
+        encoding="utf-8",
+    )
+    (source_root / "weak.php").write_text(
+        "<!DOCTYPE html>\n<?php\n$ok = true;\n",
+        encoding="utf-8",
+    )
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO source_snapshots (
+                id, project_id, source_type, status, file_count, total_bytes,
+                detected_languages_json, created_at
+            )
+            VALUES ('snap_graph', ?, 'zip', 'ready', 1, 100, '{"Python": 1}', '2026-01-01T00:00:00Z')
+            """,
+            (project_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO code_files (snapshot_id, path, size_bytes, sha256, language, is_binary)
+            VALUES ('snap_graph', 'orders/refund.py', 100, 'abc', 'Python', 0)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO code_files (snapshot_id, path, size_bytes, sha256, language, is_binary)
+            VALUES ('snap_graph', 'weak.php', 30, 'def', 'PHP', 0),
+                   ('snap_graph', 'bundle.zip', 50, 'ghi', NULL, 1)
+            """
+        )
+
+    static_node = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "risk",
+            "semantic_key": "source:refund-risk",
+            "title": "退款入口风险链",
+            "evidence": ["orders/refund.py:42"],
+            "created_by": "source_index",
+        },
+    ).json()
+
+    node = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "feature",
+            "semantic_key": "feature:order_refund",
+            "title": "订单退款",
+            "evidence": [
+                "orders/refund.py:42",
+                "weak.php:1",
+                "bundle.zip:1",
+                "missing/file.py:9",
+                "not-a-location",
+            ],
+            "confidence": 1,
+            "created_by": "worker-a",
+        },
+    ).json()
+
+    assert node["evidence"] == ["orders/refund.py:42"]
+    assert node["evidence_status"] == "source_backed"
+    assert node["confidence"] == 0.82
+    graph = client.get(f"/api/projects/{project_id}/business-graph").json()
+    evidence_edges = [edge for edge in graph["edges"] if edge["relation"] == "evidenced_by"]
+    assert len(evidence_edges) == 1
+    assert evidence_edges[0]["from_node_id"] == node["id"]
+    assert evidence_edges[0]["to_node_id"] == static_node["id"]
+
+
+def test_business_graph_caps_model_edge_confidence(temp_db):
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    source = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={"node_type": "feature", "title": "Source", "created_by": "worker-a"},
+    ).json()
+    target = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={"node_type": "asset", "title": "Target", "created_by": "worker-a"},
+    ).json()
+
+    edge = client.post(
+        f"/api/projects/{project_id}/business-graph/edges",
+        json={
+            "from_node_id": source["id"],
+            "to_node_id": target["id"],
+            "relation": "uses",
+            "confidence": 1,
+            "created_by": "worker-a",
+        },
+    ).json()
+
+    assert edge["confidence"] == 0.94
+
+
 def test_business_edge_requires_nodes_from_same_project(temp_db):
     client = _client(temp_db)
     project_a = _create_project(client)
@@ -331,6 +526,64 @@ def test_business_node_conclusions_sync_node_coverage(temp_db):
     assert nodes[confirmed_node["id"]]["coverage_note"] == "退款接口存在已确认越权漏洞"
 
 
+def test_weaker_business_conclusion_cannot_replace_decisive_current_result(temp_db):
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    node = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "feature",
+            "title": "订单读取",
+            "risk_level": "high",
+            "review_status": "unreviewed",
+            "created_by": "worker",
+        },
+    ).json()
+
+    decisive = client.post(
+        f"/api/projects/{project_id}/business-graph/conclusions",
+        json={
+            "business_node_id": node["id"],
+            "conclusion": "rejected",
+            "summary": "已验证对象归属检查完整",
+            "evidence": "orders.py:44 compares order.user_id with session.user_id",
+            "created_by": "reviewer",
+        },
+    )
+    assert decisive.status_code == 201
+    weaker = client.post(
+        f"/api/projects/{project_id}/business-graph/conclusions",
+        json={
+            "business_node_id": node["id"],
+            "conclusion": "needs_more_evidence",
+            "summary": "后续 worker 未读取完整文件",
+            "evidence": "context was incomplete",
+            "created_by": "worker-2",
+        },
+    )
+    assert weaker.status_code == 201
+    assert weaker.json()["is_current"] is False
+
+    current = client.get(
+        f"/api/projects/{project_id}/business-graph/nodes/{node['id']}/conclusions"
+    ).json()
+    assert len(current) == 1
+    assert current[0]["id"] == decisive.json()["id"]
+    assert current[0]["is_current"] is True
+
+    history = client.get(
+        f"/api/projects/{project_id}/business-graph/conclusions",
+        params={"business_node_id": node["id"], "include_history": True},
+    ).json()
+    assert len(history) == 2
+    assert sum(item["is_current"] for item in history) == 1
+
+    graph = client.get(f"/api/projects/{project_id}/business-graph").json()
+    graph_node = next(item for item in graph["nodes"] if item["id"] == node["id"])
+    assert graph_node["review_status"] == "covered"
+    assert graph_node["coverage_note"] == "已验证对象归属检查完整"
+
+
 def test_export_treats_valid_historical_business_conclusion_as_covered(temp_db):
     client = _client(temp_db)
     project_id = _create_project(client)
@@ -478,6 +731,8 @@ def test_worker_contract_accepts_business_graph_objects():
         }
     )
     assert result["business_nodes"][0]["ref"] == "refund"
+    assert result["business_nodes"][0]["semantic_key"] == "feature:refund"
+    assert result["business_nodes"][0]["graph_layer"] == "semantic"
     assert result["business_nodes"][0]["risk_level"] == "high"
     assert result["business_edges"][0]["relation"] == "exposes"
     assert result["business_node_conclusions"][0]["conclusion"] == "rejected"

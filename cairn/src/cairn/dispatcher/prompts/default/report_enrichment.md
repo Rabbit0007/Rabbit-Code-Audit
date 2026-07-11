@@ -28,11 +28,14 @@ Produce exactly one JSON object. Use this shape:
     "reproduction_poc": {
       "payload": "concrete payload or direct access trigger",
       "request_template": "curl -i 'http://target/path'",
-      "steps": ["replace target with the test environment", "send the request", "check the expected indicator"],
-      "expected_result": "source-backed expected result",
-      "verification": "files/lines/functions proving the path",
-      "prerequisites": ["environment or configuration needed"],
-      "limitations": ["static PoC, not a captured packet"]
+      "environment_setup": ["start only the required service in an isolated test environment", "create the least-privileged test account and reversible test data"],
+      "steps": ["replace target and placeholders with test-environment values", "send the exact request or command", "record the response and side effects", "repeat with a normal control request"],
+      "expected_result": "specific indicator that means the vulnerable behavior is present",
+      "fixed_result": "specific response and side-effect criteria that mean the remediation passes",
+      "verification": "files/lines/functions proving the entry-to-sink path and how to distinguish vulnerable from fixed behavior",
+      "prerequisites": ["required role, configuration, test data, headers, cookies, or service state"],
+      "cleanup_steps": ["remove created test data", "restore changed state and revoke temporary credentials"],
+      "limitations": ["static PoC, not a captured packet", "unknown runtime conditions that can affect reproduction"]
     },
     "evidence_chain": [
       "file:line evidence for entry point",
@@ -61,4 +64,9 @@ Rules:
 - Do not invent status codes, response bodies, cookies, tokens, secrets, or dynamic values.
 - If the trigger is direct access, the payload can be the route or command that triggers the vulnerable path.
 - Every PoC or packet template must be tied to the supplied source evidence.
+- The exported report must be executable by an authorized retester without guessing the order of operations. Use concrete placeholders such as `${BASE_URL}`, `${TOKEN}`, and `${OBJECT_ID}` and define each placeholder in `prerequisites`.
+- `steps` must include a control request or baseline comparison when response differences are the indicator.
+- `expected_result` must describe the vulnerable observation; `fixed_result` must describe the remediated acceptance result. Do not use vague text such as "verify the issue".
+- Include rollback-safe `cleanup_steps` for state-changing requests. If the request is read-only, state that no cleanup is required.
+- `report_sections` should include concise `root_cause`, `affected_flow`, and `remediation_validation` sections grounded in the supplied evidence.
 - If the evidence packet is insufficient to form any static packet or PoC, return `{"accepted": false, "reason": "insufficient_source_evidence"}`.

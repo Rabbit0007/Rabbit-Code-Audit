@@ -38,6 +38,17 @@ def format_timestamp(value: datetime) -> str:
     return value.strftime(TIMESTAMP_FORMAT)
 
 
+@pytest.fixture(autouse=True)
+def legacy_open_auth_mode(monkeypatch):
+    """Keep legacy router tests focused on their own behavior.
+
+    Product routes now require auth by default when mounted through the real app.
+    Most historical router tests are not auth tests, so they run with the
+    explicit local/test compatibility switch enabled.
+    """
+    monkeypatch.setenv("CAIRN_AUTH_OPEN_MODE", "1")
+
+
 @pytest.fixture
 def temp_db(tmp_path, monkeypatch):
     """Provide a fresh, isolated SQLite database for a single test.

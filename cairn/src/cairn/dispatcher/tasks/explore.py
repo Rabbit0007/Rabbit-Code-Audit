@@ -5,7 +5,11 @@ import re
 import time
 
 from cairn.dispatcher.config import DispatchConfig, WorkerConfig
-from cairn.dispatcher.contracts import parse_json_output, validate_explore_payload
+from cairn.dispatcher.contracts import (
+    parse_json_output,
+    salvage_unproven_explore_findings,
+    validate_explore_payload,
+)
 from cairn.dispatcher.prompting import load_prompt, render_prompt
 from cairn.dispatcher.protocol.client import CairnClient
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
@@ -62,7 +66,10 @@ def run_explore_task(
     lease = HeartbeatLease.for_intent(client, project.project.id, intent.id, worker.name, config.runtime.interval)
     lease.start()
     try:
-        container_name = container_manager.ensure_running(project.project.id)
+        container_name = container_manager.ensure_running(
+            project.project.id,
+            [source.id for source in getattr(project, "sources", []) if source.status == "ready"],
+        )
         source_check = verify_latest_source_available(
             container_manager,
             container_name,
@@ -184,6 +191,7 @@ def run_explore_task(
             best_effort_release(client, project.project.id, intent.id, worker.name)
             return task_outcome("failed", error_type="heartbeat_lost", error_detail=f"status={lease.failure.status_code}", result=first)
         if not did_timeout(first) and first.returncode == 0:
+            payload = None
             try:
                 model_output = driver.extract_response_text(first.stdout, first.stderr)
                 payload = parse_json_output(model_output)
@@ -211,6 +219,29 @@ def run_explore_task(
                     rate_limited=cooldown,
                 )
             except Exception as exc:
+                salvaged = salvage_unproven_explore_findings(payload) if isinstance(payload, dict) else None
+                if salvaged is not None:
+                    try:
+                        kind, result_data = validate_explore_payload(salvaged)
+                    except Exception:
+                        LOG.warning("failed to validate salvaged explore output", exc_info=True)
+                    else:
+                        LOG.warning(
+                            "salvaged unproven explore findings project=%s intent=%s worker=%s",
+                            project.project.id,
+                            intent.id,
+                            worker.name,
+                        )
+                        return _write_explore_result(
+                            client,
+                            project.project.id,
+                            intent.id,
+                            worker.name,
+                            result_data,
+                            source="explore_execute_salvaged",
+                            phase_ms=execute_ms,
+                            total_ms=int((time.perf_counter() - task_started) * 1000),
+                        )
                 LOG.warning(
                     "explore parse failed project=%s intent=%s worker=%s error=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
                     project.project.id,

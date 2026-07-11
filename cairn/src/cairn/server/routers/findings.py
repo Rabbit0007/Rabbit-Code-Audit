@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import uuid
@@ -8,7 +7,13 @@ import uuid
 from fastapi import APIRouter, HTTPException
 
 from cairn.server.db import get_conn
+from cairn.server.finding_taxonomy import (
+    canonical_cwe,
+    canonical_finding_category,
+    finding_cluster_key,
+)
 from cairn.server.services import (
+    activate_business_node_conclusion,
     get_project_or_404,
     next_fact_id,
     sync_business_node_coverage_from_conclusion,
@@ -112,6 +117,12 @@ def create_audit_finding(project_id: str, body: CreateAuditFindingRequest):
     with get_conn() as conn:
         get_project_or_404(conn, project_id)
         _validate_snapshot(conn, project_id, body.snapshot_id)
+        body = body.model_copy(
+            update={
+                "category": canonical_finding_category(body.category, body.cwe),
+                "cwe": canonical_cwe(body.cwe),
+            }
+        )
         inferred_business_node_id = _infer_business_node_for_finding(conn, project_id, body)
         if inferred_business_node_id and not body.business_node_id:
             body = body.model_copy(update={"business_node_id": inferred_business_node_id})
@@ -342,14 +353,10 @@ def _apply_audit_finding_review(
         UPDATE audit_findings
         SET status = ?,
             reviewed_by = ?,
-            reviewed_at = ?,
-            evidence_level = CASE
-                WHEN ? = 'confirmed' THEN 'L5'
-                ELSE evidence_level
-            END
+            reviewed_at = ?
         WHERE id = ? AND project_id = ?
         """,
-        (decision, reviewer, reviewed_at, decision, finding_id, project_id),
+        (decision, reviewer, reviewed_at, finding_id, project_id),
     )
     _sync_reportable_finding(conn, finding_id)
     if decision == "confirmed":
@@ -438,16 +445,17 @@ def _sync_confirmed_finding_coverage(
         (project_id, finding["business_node_id"], finding_id),
     ).fetchone()
     if existing is None:
+        conclusion_id = f"biz_conclusion_{uuid.uuid4().hex[:16]}"
         conn.execute(
             """
             INSERT INTO business_node_conclusions (
                 id, project_id, business_node_id, conclusion, summary, evidence,
-                audit_finding_id, created_by, created_at
+                audit_finding_id, is_current, created_by, created_at
             )
-            VALUES (?, ?, ?, 'confirmed_finding', ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, 'confirmed_finding', ?, ?, ?, 0, ?, ?)
             """,
             (
-                f"biz_conclusion_{uuid.uuid4().hex[:16]}",
+                conclusion_id,
                 project_id,
                 finding["business_node_id"],
                 summary,
@@ -456,6 +464,14 @@ def _sync_confirmed_finding_coverage(
                 reviewer,
                 now,
             ),
+        )
+        activate_business_node_conclusion(
+            conn,
+            project_id,
+            finding["business_node_id"],
+            conclusion_id,
+            "confirmed_finding",
+            now=now,
         )
     sync_business_node_coverage_from_conclusion(
         conn,
@@ -657,22 +673,14 @@ def _decode_json_dict(raw: str | None) -> dict:
 
 
 def audit_finding_cluster_key(body: CreateAuditFindingRequest) -> str:
-    route = _entry_route_key(body.entry_point or "") or "unknown_entry"
-    cwe = _normalize_cluster_text(body.cwe)
-    category = _normalize_cluster_text(body.category)
-    family = cwe or category or "unknown_category"
-    root_locator = _normalize_cluster_text(body.symbol)
-    if not root_locator and body.line_start:
-        root_locator = f"line_bucket:{body.line_start // 10}"
-    if not root_locator:
-        root_locator = route
-    parts = [
-        family,
-        _normalize_path_for_cluster(body.file_path),
-        root_locator,
-        _normalize_cluster_text(body.business_node_id) or "unknown_business_node",
-    ]
-    return hashlib.sha1("\0".join(parts).encode("utf-8")).hexdigest()[:20]
+    return finding_cluster_key(
+        category=body.category,
+        cwe=body.cwe,
+        file_path=body.file_path,
+        symbol=body.symbol,
+        line_start=body.line_start,
+        entry_point=body.entry_point,
+    )
 
 
 def _find_duplicate_audit_finding(conn, project_id: str, snapshot_id: str, cluster_key: str):
@@ -809,18 +817,6 @@ def _evidence_level_rank(value: str | None) -> int:
         return int(value[1:])
     except ValueError:
         return -1
-
-
-def _normalize_path_for_cluster(value: str | None) -> str:
-    text = (value or "").strip().replace("\\", "/").strip("/")
-    return text.lower() or "unknown_path"
-
-
-def _normalize_cluster_text(value: str | None) -> str | None:
-    if value is None:
-        return None
-    text = " ".join(value.strip().lower().replace("-", "_").split())
-    return text or None
 
 
 _PROOF_PLACEHOLDER_RE = re.compile(

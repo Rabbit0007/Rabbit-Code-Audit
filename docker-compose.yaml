@@ -3,6 +3,13 @@ name: rabbit-audit
 networks:
   default:
     name: rabbit-audit-net
+  worker-internal:
+    name: rabbit-audit-worker-net
+    internal: true
+
+volumes:
+  audit-artifacts:
+    name: rabbit-audit-artifacts
 
 services:
   audit-worker-image:
@@ -21,22 +28,25 @@ services:
     ports:
       - "8765:8000"
     volumes:
-      - /Users/rabbit/.local/share/cairn:/root/.local/share/cairn/
-      - /Users/rabbit/.rabbit-code-audit-preview:/Users/rabbit/.rabbit-code-audit-preview
+      - ${CAIRN_DATA_DIR:-${HOME}/.local/share/cairn}:/root/.local/share/cairn/
+      - audit-artifacts:/Users/rabbit/.rabbit-code-audit-preview
     environment:
+      CAIRN_INTERNAL_TOKEN: "${CAIRN_INTERNAL_TOKEN:?Set CAIRN_INTERNAL_TOKEN for server/dispatcher API auth}"
       CAIRN_DISPATCHER_INTERNAL_URL: "http://rabbit-audit-dispatcher:8989"
+      CAIRN_DISPATCHER_INTERNAL_TOKEN: "${CAIRN_DISPATCHER_INTERNAL_TOKEN:?Set CAIRN_DISPATCHER_INTERNAL_TOKEN for dispatcher internal API auth}"
       CAIRN_ARTIFACT_ROOT: "/Users/rabbit/.rabbit-code-audit-preview/artifacts"
       # Timeout (seconds) for the longer-running worker connectivity test and
       # config read/write proxy calls to the dispatcher internal API. Independent
       # of CAIRN_DISPATCHER_INTERNAL_TIMEOUT (status polling, default 2.0s).
       # Defaults to 30s in code; set here only to override.
       CAIRN_DISPATCHER_INTERNAL_TEST_TIMEOUT: "30"
+      CAIRN_DISPATCHER_INTERNAL_TIMEOUT: "5"
     healthcheck:
       test:
         - "CMD"
         - "python"
         - "-c"
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/projects', timeout=5)"
+        - "import os, urllib.request; req=urllib.request.Request('http://127.0.0.1:8000/projects', headers={'X-Cairn-Internal-Token': os.environ['CAIRN_INTERNAL_TOKEN']}); urllib.request.urlopen(req, timeout=5)"
       interval: 10s
       timeout: 5s
       retries: 12
@@ -50,16 +60,24 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./dispatch.yaml:/cairn/dispatch.yaml
-      - /Users/rabbit/.rabbit-code-audit-preview:/Users/rabbit/.rabbit-code-audit-preview
-      - /Users/rabbit/.local/share/cairn:/root/.local/share/cairn/
+      - ${CAIRN_DATA_DIR:-${HOME}/.local/share/cairn}:/root/.local/share/cairn/
     environment:
+      CAIRN_INTERNAL_TOKEN: "${CAIRN_INTERNAL_TOKEN:?Set CAIRN_INTERNAL_TOKEN for server/dispatcher API auth}"
       CAIRN_DISPATCHER_INTERNAL_API: "1"
       CAIRN_DISPATCHER_INTERNAL_HOST: "0.0.0.0"
       CAIRN_DISPATCHER_INTERNAL_PORT: "8989"
+      CAIRN_DISPATCHER_INTERNAL_TOKEN: "${CAIRN_DISPATCHER_INTERNAL_TOKEN:?Set CAIRN_DISPATCHER_INTERNAL_TOKEN for dispatcher internal API auth}"
+      CAIRN_MODEL_PROXY_TOKEN: "${CAIRN_MODEL_PROXY_TOKEN:?Set CAIRN_MODEL_PROXY_TOKEN for isolated model proxy auth}"
+      CAIRN_MODEL_PROXY_URL: "http://rabbit-audit-dispatcher:8989/internal/model-proxy/v1"
+      PI_API_KEY: "${PI_API_KEY:?Set PI_API_KEY for model workers}"
+      GLM_API_KEY: "${GLM_API_KEY:?Set GLM_API_KEY for disabled GLM worker configuration}"
     depends_on:
       audit-worker-image:
         condition: service_completed_successfully
       audit-server:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      - default
+      - worker-internal
     command: ["uv", "run", "cairn", "dispatch", "--config", "dispatch.yaml"]

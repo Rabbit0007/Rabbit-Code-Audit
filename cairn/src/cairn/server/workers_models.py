@@ -92,6 +92,8 @@ class CreateWorkerTaskHistoryRequest(BaseModel):
     used_fallback: bool = False
     stdout_preview: str | None = None
     stderr_preview: str | None = None
+    model_call_count: int = Field(default=1, ge=0)
+    estimated_input_tokens: int = Field(default=0, ge=0)
 
     @field_validator("worker_name", "project_id", "task_type", "started_at")
     @classmethod
@@ -115,6 +117,34 @@ class CreateWorkerTaskHistoryRequest(BaseModel):
             return None
         text = value.strip()
         return text or None
+
+
+class CreateModelUsageRequest(BaseModel):
+    project_id: str
+    model: str
+    request_id: str | None = None
+    prompt_tokens: int = Field(default=0, ge=0)
+    completion_tokens: int = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
+    cached_prompt_tokens: int = Field(default=0, ge=0)
+    estimated: bool = False
+    cost_usd: float = Field(default=0, ge=0)
+    created_at: str
+
+    @field_validator("project_id", "model", "created_at")
+    @classmethod
+    def validate_usage_required_text(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("must not be empty")
+        return text
+
+    @field_validator("request_id")
+    @classmethod
+    def normalize_usage_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
 
 
 TaskType = Literal["reason", "explore", "bootstrap", "report_enrichment", "review"]

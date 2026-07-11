@@ -1,4 +1,4 @@
-from collections import Counter
+from collections import Counter, deque
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from datetime import datetime
@@ -16,17 +16,17 @@ from cairn.server.services import (
     is_high_impact_audit_candidate_row,
     is_high_impact_business_node_row,
 )
-from cairn.server.source_service import list_snapshots, snapshot_container_path
-from cairn.server.source_service import (
-    audit_candidate_priority,
-    get_source_index_summary,
-    list_code_capabilities,
-    list_code_entrypoints,
-    list_code_files,
-    list_code_relationships,
-    list_code_symbols,
-    list_dependency_manifests,
+from cairn.server.source_models import (
+    CodeCapability,
+    CodeEntrypoint,
+    CodeFile,
+    CodeRelationship,
+    CodeSymbol,
+    DependencyManifest,
+    SourceIndexSummary,
+    SourceSnapshot,
 )
+from cairn.server.source_service import audit_candidate_priority, snapshot_container_path
 from cairn.server.audit_tools import build_tool_plan
 
 router = APIRouter(tags=["export"])
@@ -37,6 +37,10 @@ EXPLORE_CANDIDATE_LIMIT = 120
 FULL_CANDIDATE_LIMIT = 1000
 REASON_GRAPH_NODE_LIMIT = 200
 EXPLORE_GRAPH_NODE_LIMIT = 120
+REASON_CONTEXT_MAX_BYTES = 640 * 1024
+EXPLORE_CONTEXT_MAX_BYTES = 480 * 1024
+REASON_CONTEXT_HARD_MAX_BYTES = 1536 * 1024
+EXPLORE_CONTEXT_HARD_MAX_BYTES = 1024 * 1024
 CANDIDATE_ID_RE = re.compile(r"\bcand_[0-9a-fA-F]{16}\b")
 
 
@@ -100,6 +104,197 @@ def _decode_json_dict(raw: str | None) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _load_source_snapshots_from_conn(conn, project_id: str) -> list[SourceSnapshot]:
+    rows = conn.execute(
+        """
+        SELECT id, project_id, source_type, original_name, repository_url,
+               requested_ref, resolved_commit, archive_sha256, snapshot_sha256,
+               status, file_count, total_bytes, detected_languages_json,
+               created_at, error_message
+        FROM source_snapshots
+        WHERE project_id = ?
+        ORDER BY created_at DESC
+        """,
+        (project_id,),
+    ).fetchall()
+    return [
+        SourceSnapshot(
+            id=row["id"],
+            project_id=row["project_id"],
+            source_type=row["source_type"],
+            original_name=row["original_name"],
+            repository_url=row["repository_url"],
+            requested_ref=row["requested_ref"],
+            resolved_commit=row["resolved_commit"],
+            archive_sha256=row["archive_sha256"],
+            snapshot_sha256=row["snapshot_sha256"],
+            status=row["status"],
+            file_count=row["file_count"],
+            total_bytes=row["total_bytes"],
+            detected_languages=_decode_json_dict(row["detected_languages_json"]),
+            created_at=row["created_at"],
+            error_message=row["error_message"],
+        )
+        for row in rows
+    ]
+
+
+def _load_code_files_from_conn(conn, snapshot_id: str, *, limit: int) -> list[CodeFile]:
+    rows = conn.execute(
+        """
+        SELECT snapshot_id, path, size_bytes, sha256, language, is_binary
+        FROM code_files
+        WHERE snapshot_id = ?
+        ORDER BY path
+        LIMIT ?
+        """,
+        (snapshot_id, limit),
+    ).fetchall()
+    return [
+        CodeFile(
+            snapshot_id=row["snapshot_id"],
+            path=row["path"],
+            size_bytes=row["size_bytes"],
+            sha256=row["sha256"],
+            language=row["language"],
+            is_binary=bool(row["is_binary"]),
+        )
+        for row in rows
+    ]
+
+
+def _load_source_index_summary_from_conn(conn, snapshot_id: str) -> SourceIndexSummary:
+    symbols = conn.execute(
+        "SELECT COUNT(*) AS count FROM code_symbols WHERE snapshot_id = ?",
+        (snapshot_id,),
+    ).fetchone()["count"]
+    entrypoints = conn.execute(
+        "SELECT COUNT(*) AS count FROM code_entrypoints WHERE snapshot_id = ?",
+        (snapshot_id,),
+    ).fetchone()["count"]
+    relationships = conn.execute(
+        "SELECT COUNT(*) AS count FROM code_relationships WHERE snapshot_id = ?",
+        (snapshot_id,),
+    ).fetchone()["count"]
+    manifests = conn.execute(
+        "SELECT COUNT(*) AS count FROM dependency_manifests WHERE snapshot_id = ?",
+        (snapshot_id,),
+    ).fetchone()["count"]
+    return SourceIndexSummary(
+        symbol_count=symbols,
+        entrypoint_count=entrypoints,
+        relationship_count=relationships,
+        manifest_count=manifests,
+    )
+
+
+def _load_code_entrypoints_from_conn(conn, snapshot_id: str, *, limit: int) -> list[CodeEntrypoint]:
+    rows = conn.execute(
+        """
+        SELECT id, snapshot_id, path, language, kind, framework, method, route,
+               handler, line_start, evidence, confidence, source
+        FROM code_entrypoints
+        WHERE snapshot_id = ?
+        ORDER BY path, COALESCE(line_start, 0), route, COALESCE(method, '')
+        LIMIT ?
+        """,
+        (snapshot_id, limit),
+    ).fetchall()
+    return [CodeEntrypoint(**dict(row)) for row in rows]
+
+
+def _load_code_relationships_from_conn(conn, snapshot_id: str, *, limit: int) -> list[CodeRelationship]:
+    rows = conn.execute(
+        """
+        SELECT id, snapshot_id, from_path, from_symbol, to_path, to_symbol,
+               relation, evidence, confidence, source, line_start
+        FROM code_relationships
+        WHERE snapshot_id = ?
+        ORDER BY from_path, relation, to_path, COALESCE(line_start, 0)
+        LIMIT ?
+        """,
+        (snapshot_id, limit),
+    ).fetchall()
+    return [CodeRelationship(**dict(row)) for row in rows]
+
+
+def _load_code_capabilities_from_conn(conn, snapshot_id: str, *, limit: int) -> list[CodeCapability]:
+    rows = conn.execute(
+        """
+        SELECT id, snapshot_id, path, symbol, category, title, line_start,
+               line_end, evidence, risk_level, risk_tags_json, confidence, source
+        FROM code_capabilities
+        WHERE snapshot_id = ?
+        ORDER BY
+            CASE risk_level
+                WHEN 'critical' THEN 0
+                WHEN 'high' THEN 1
+                WHEN 'medium' THEN 2
+                WHEN 'unknown' THEN 3
+                WHEN 'low' THEN 4
+                ELSE 5
+            END,
+            path,
+            COALESCE(line_start, 0),
+            category
+        LIMIT ?
+        """,
+        (snapshot_id, limit),
+    ).fetchall()
+    return [
+        CodeCapability(
+            **{
+                key: value
+                for key, value in dict(row).items()
+                if key != "risk_tags_json"
+            },
+            risk_tags=_decode_json_list(row["risk_tags_json"]),
+        )
+        for row in rows
+    ]
+
+
+def _load_dependency_manifests_from_conn(conn, snapshot_id: str, *, limit: int) -> list[DependencyManifest]:
+    rows = conn.execute(
+        """
+        SELECT id, snapshot_id, path, manifest_type, package_name,
+               dependencies_json, dev_dependencies_json
+        FROM dependency_manifests
+        WHERE snapshot_id = ?
+        ORDER BY path
+        LIMIT ?
+        """,
+        (snapshot_id, limit),
+    ).fetchall()
+    return [
+        DependencyManifest(
+            id=row["id"],
+            snapshot_id=row["snapshot_id"],
+            path=row["path"],
+            manifest_type=row["manifest_type"],
+            package_name=row["package_name"],
+            dependencies=_decode_json_list(row["dependencies_json"]),
+            dev_dependencies=_decode_json_list(row["dev_dependencies_json"]),
+        )
+        for row in rows
+    ]
+
+
+def _load_code_symbols_from_conn(conn, snapshot_id: str, *, limit: int) -> list[CodeSymbol]:
+    rows = conn.execute(
+        """
+        SELECT id, snapshot_id, path, language, kind, name, container, signature,
+               line_start, line_end, confidence, source
+        FROM code_symbols
+        WHERE snapshot_id = ?
+        ORDER BY path, COALESCE(line_start, 0), kind, name
+        LIMIT ?
+        """,
+        (snapshot_id, limit),
+    ).fetchall()
+    return [CodeSymbol(**dict(row)) for row in rows]
+
+
 def _load_business_graph(
     conn,
     project_id: str,
@@ -111,7 +306,9 @@ def _load_business_graph(
         """
         SELECT id, node_type, title, description, risk_level, review_status,
                coverage_note, last_intent_id, risk_tags_json, evidence_json,
-               source_snapshot_id, confidence, created_by, created_at, updated_at
+               source_snapshot_id, confidence, semantic_key, graph_layer,
+               source_kind, evidence_status, contributors_json, revision,
+               created_by, created_at, updated_at
         FROM business_nodes
         WHERE project_id = ?
         ORDER BY created_at, id
@@ -120,7 +317,9 @@ def _load_business_graph(
     ).fetchall()
     edges = conn.execute(
         """
-        SELECT id, from_node_id, to_node_id, relation, description, confidence, created_by, created_at
+        SELECT id, from_node_id, to_node_id, relation, description, confidence,
+               graph_layer, source_kind, contributors_json, revision,
+               created_by, created_at
         FROM business_edges
         WHERE project_id = ?
         ORDER BY created_at, id
@@ -137,7 +336,7 @@ def _load_business_graph(
         LEFT JOIN audit_findings af
           ON af.id = c.audit_finding_id
          AND af.project_id = c.project_id
-        WHERE c.project_id = ?
+        WHERE c.project_id = ? AND c.is_current = 1
         ORDER BY c.created_at, c.rowid
         """,
         (project_id,),
@@ -216,11 +415,36 @@ def _load_business_graph(
             profile=profile,
             focus_candidate_ids=focus_candidate_ids or set(),
         )
+        relation_rank = {
+            "guards": 0,
+            "exposes": 1,
+            "calls": 2,
+            "uses": 3,
+            "risk_of": 4,
+            "depends_on": 5,
+        }
+        visible_edges = sorted(
+            visible_edges,
+            key=lambda row: (
+                relation_rank.get(row["relation"], 10),
+                -float(row["confidence"] or 0),
+                row["id"],
+            ),
+        )[: 80 if profile == "explore" else 120]
 
     omitted_nodes = max(0, len(nodes) - len(visible_nodes))
     omitted_edges = max(0, len(edges) - len(visible_edges))
+    visible_node_ids = {row["id"] for row in visible_nodes}
+    if profile != "full":
+        conclusions = [
+            row for row in conclusions if row["business_node_id"] in visible_node_ids
+        ]
     return {
         "coverage": coverage,
+        "layers": {
+            layer: sum(1 for row in nodes if row["graph_layer"] == layer)
+            for layer in ("evidence", "semantic", "audit")
+        },
         "view": {
             "profile": profile,
             "nodes_included": len(visible_nodes),
@@ -233,18 +457,38 @@ def _load_business_graph(
                 "id": row["id"],
                 "type": row["node_type"],
                 "title": row["title"],
-                "description": row["description"],
+                "description": (
+                    row["description"] if profile == "full" or row["graph_layer"] != "evidence" else None
+                ),
                 "risk_level": row["risk_level"],
                 "review_status": row["review_status"],
-                "coverage_note": row["coverage_note"],
+                "coverage_note": (
+                    row["coverage_note"]
+                    if profile == "full" or row["review_status"] == "blocked"
+                    else None
+                ),
                 "last_intent_id": row["last_intent_id"],
                 "risk_tags": _decode_json_list(row["risk_tags_json"]),
-                "evidence": _decode_json_list(row["evidence_json"]),
+                "evidence": _decode_json_list(row["evidence_json"])[
+                    : None if profile == "full" else 6
+                ],
                 "source_snapshot_id": row["source_snapshot_id"],
                 "confidence": row["confidence"],
-                "created_by": row["created_by"],
-                "created_at": format_export_timestamp(row["created_at"]),
-                "updated_at": format_export_timestamp(row["updated_at"]),
+                "semantic_key": row["semantic_key"],
+                "graph_layer": row["graph_layer"],
+                "source_kind": row["source_kind"],
+                "evidence_status": row["evidence_status"],
+                **(
+                    {
+                        "contributors": _decode_json_list(row["contributors_json"]),
+                        "revision": row["revision"],
+                        "created_by": row["created_by"],
+                        "created_at": format_export_timestamp(row["created_at"]),
+                        "updated_at": format_export_timestamp(row["updated_at"]),
+                    }
+                    if profile == "full"
+                    else {}
+                ),
             }
             for row in visible_nodes
         ],
@@ -256,8 +500,18 @@ def _load_business_graph(
                 "relation": row["relation"],
                 "description": row["description"],
                 "confidence": row["confidence"],
-                "created_by": row["created_by"],
-                "created_at": format_export_timestamp(row["created_at"]),
+                "graph_layer": row["graph_layer"],
+                "source_kind": row["source_kind"],
+                **(
+                    {
+                        "contributors": _decode_json_list(row["contributors_json"]),
+                        "revision": row["revision"],
+                        "created_by": row["created_by"],
+                        "created_at": format_export_timestamp(row["created_at"]),
+                    }
+                    if profile == "full"
+                    else {}
+                ),
             }
             for row in visible_edges
         ],
@@ -270,8 +524,14 @@ def _load_business_graph(
                 "evidence": row["evidence"],
                 "audit_finding_id": row["audit_finding_id"],
                 "audit_finding_status": row["audit_finding_status"],
-                "created_by": row["created_by"],
-                "created_at": format_export_timestamp(row["created_at"]),
+                **(
+                    {
+                        "created_by": row["created_by"],
+                        "created_at": format_export_timestamp(row["created_at"]),
+                    }
+                    if profile == "full"
+                    else {}
+                ),
             }
             for row in conclusions
         ],
@@ -326,21 +586,39 @@ def _select_business_graph_rows(
         ).fetchall()
         include_ids.update(row["business_node_id"] for row in rows)
     for row in nodes:
-        if row["risk_level"] in ("critical", "high", "unknown") and row["review_status"] in (
+        if (
+            row["graph_layer"] != "evidence"
+            and row["risk_level"] in ("critical", "high", "unknown")
+            and row["review_status"] in (
             "unreviewed",
             "investigating",
             "blocked",
+            )
         ):
             include_ids.add(row["id"])
     for row in nodes:
         if row["last_intent_id"] and profile == "explore":
             include_ids.add(row["id"])
     adjacent_ids = set(include_ids)
+    evidence_neighbor_limit = 40 if profile == "explore" else 30
+    evidence_neighbors: set[str] = set()
     for edge in edges:
         if edge["from_node_id"] in include_ids:
-            adjacent_ids.add(edge["to_node_id"])
+            neighbor_id = edge["to_node_id"]
+            neighbor = node_by_id.get(neighbor_id)
+            if neighbor is None or neighbor["graph_layer"] != "evidence":
+                adjacent_ids.add(neighbor_id)
+            elif len(evidence_neighbors) < evidence_neighbor_limit:
+                adjacent_ids.add(neighbor_id)
+                evidence_neighbors.add(neighbor_id)
         if edge["to_node_id"] in include_ids:
-            adjacent_ids.add(edge["from_node_id"])
+            neighbor_id = edge["from_node_id"]
+            neighbor = node_by_id.get(neighbor_id)
+            if neighbor is None or neighbor["graph_layer"] != "evidence":
+                adjacent_ids.add(neighbor_id)
+            elif len(evidence_neighbors) < evidence_neighbor_limit:
+                adjacent_ids.add(neighbor_id)
+                evidence_neighbors.add(neighbor_id)
     limit = EXPLORE_GRAPH_NODE_LIMIT if profile == "explore" else REASON_GRAPH_NODE_LIMIT
     ordered_ids = [row["id"] for row in nodes if row["id"] in adjacent_ids][:limit]
     selected_ids = set(ordered_ids)
@@ -489,6 +767,7 @@ def _select_audit_candidate_rows(rows, *, profile: str, focus_candidate_ids: set
             for row in rows
             if row["severity"] in ("critical", "high", "unknown")
             and row["status"] in ("candidate", "investigating")
+            and not _is_navigation_only_candidate(row)
         ]
         return _sort_candidate_rows(required)[:EXPLORE_CANDIDATE_LIMIT]
     required = [
@@ -496,6 +775,7 @@ def _select_audit_candidate_rows(rows, *, profile: str, focus_candidate_ids: set
         for row in rows
         if row["severity"] in ("critical", "high", "unknown")
         and row["status"] in ("candidate", "investigating")
+        and not _is_navigation_only_candidate(row)
     ]
     invalid = [
         row
@@ -514,6 +794,13 @@ def _select_audit_candidate_rows(rows, *, profile: str, focus_candidate_ids: set
         if len(selected) >= REASON_CANDIDATE_LIMIT:
             break
     return selected
+
+
+def _is_navigation_only_candidate(row) -> bool:
+    return row["source"] == "index" and row["candidate_type"] in (
+        "entrypoint",
+        "web_entrypoint",
+    )
 
 
 def _sort_candidate_rows(rows) -> list:
@@ -707,13 +994,13 @@ def _load_code_index_audit_context(
         limit=120,
     )
     relationships = _relationship_rows_for_paths(conn, snapshot_id, paths, limit=relationship_limit)
-    module_limit = 8 if profile == "explore" else 12 if profile == "reason" else 30
+    module_limit = 3 if profile == "explore" else 4 if profile == "reason" else 30
     if profile == "explore":
         flow_limit = 16 if focused else 10
-        entrypoint_summary_limit = 12 if focused else 8
+        entrypoint_summary_limit = 4 if focused else 3
     elif profile == "reason":
         flow_limit = 18
-        entrypoint_summary_limit = 14
+        entrypoint_summary_limit = 4
     else:
         flow_limit = 40
         entrypoint_summary_limit = 40
@@ -747,7 +1034,7 @@ def _load_code_index_audit_context(
         snapshot_id,
         priority_candidates,
         entrypoint_traces,
-        limit=8 if profile == "explore" else 12 if profile == "reason" else 20,
+        limit=4 if profile == "explore" else 5 if profile == "reason" else 20,
     )
 
     return {
@@ -957,8 +1244,8 @@ def _business_module_summaries(conn, project_id: str, snapshot_id: str, *, limit
                 "risk_level": module["risk_level"],
                 "review_status": module["review_status"],
                 "confidence": module["confidence"],
-                "risk_tags": _decode_json_list(module["risk_tags_json"]),
-                "evidence": _decode_json_list(module["evidence_json"]),
+                "risk_tags": _decode_json_list(module["risk_tags_json"])[:8],
+                "evidence": _decode_json_list(module["evidence_json"])[:5],
                 "child_counts": dict(sorted(counts.items())),
                 "entrypoints": [
                     _business_node_brief(row)
@@ -1389,6 +1676,9 @@ def _business_node_brief(row) -> dict:
         "risk_tags": _decode_json_list(row["risk_tags_json"]),
         "evidence": _decode_json_list(row["evidence_json"])[:3],
         "confidence": row["confidence"],
+        "semantic_key": _row_value(row, "semantic_key"),
+        "graph_layer": _row_value(row, "graph_layer", "semantic"),
+        "evidence_status": _row_value(row, "evidence_status", "unverified"),
     }
 
 
@@ -1400,7 +1690,12 @@ def _business_edge_brief(row) -> dict:
         "relation": row["relation"],
         "description": row["description"],
         "confidence": row["confidence"],
+        "graph_layer": _row_value(row, "graph_layer", "semantic"),
     }
+
+
+def _row_value(row, key: str, default=None):
+    return row[key] if key in row.keys() else default
 
 
 def _business_flow_traces(conn, snapshot_id: str, *, limit: int, max_depth: int = 4, max_per_entrypoint: int = 2) -> list[dict]:
@@ -1441,12 +1736,17 @@ def _business_flow_traces(conn, snapshot_id: str, *, limit: int, max_depth: int 
 
     traces: list[dict] = []
     seen_trace_keys: set[tuple[str, tuple[str, ...]]] = set()
+    max_candidates_per_entrypoint = max(24, max_per_entrypoint * 12)
+    max_expansions_per_entrypoint = 240
+    max_queue_size = 240
     for entrypoint in entrypoint_rows:
         entrypoint_traces: list[dict] = []
         entrypoint_seen: set[tuple[str, tuple[str, ...]]] = set()
-        queue: list[tuple[str, list, set[str]]] = [(entrypoint["path"], [], {entrypoint["path"]})]
-        while queue:
-            current_path, edges, visited = queue.pop(0)
+        queue = deque([(entrypoint["path"], [], {entrypoint["path"]})])
+        expansions = 0
+        while queue and expansions < max_expansions_per_entrypoint:
+            current_path, edges, visited = queue.popleft()
+            expansions += 1
             if len(edges) >= max_depth:
                 continue
             for rel in adjacency.get(current_path, [])[:24]:
@@ -1459,7 +1759,12 @@ def _business_flow_traces(conn, snapshot_id: str, *, limit: int, max_depth: int 
                 if key not in entrypoint_seen:
                     entrypoint_traces.append(item)
                     entrypoint_seen.add(key)
-                queue.append((next_path, next_edges, visited | {next_path}))
+                    if len(entrypoint_traces) >= max_candidates_per_entrypoint:
+                        break
+                if len(next_edges) < max_depth and len(queue) < max_queue_size:
+                    queue.append((next_path, next_edges, visited | {next_path}))
+            if len(entrypoint_traces) >= max_candidates_per_entrypoint:
+                break
         for item in sorted(entrypoint_traces, key=_business_flow_trace_rank)[:max_per_entrypoint]:
             key = (item["entry_point"], tuple(item["path_chain"]))
             if key in seen_trace_keys:
@@ -1932,7 +2237,7 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
             "Use database-backed coverage sections as the source of truth; omitted graph items remain stored server-side."
         ),
     }
-    sources = list_snapshots(project_id)
+    sources = _load_source_snapshots_from_conn(conn, project_id)
     if sources:
         data["sources"] = [
             {
@@ -1954,19 +2259,19 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
         ready_source = next((source for source in sources if source.status == "ready"), None)
         if ready_source is not None:
             source_path = snapshot_container_path(ready_source.id)
-            files = list_code_files(project_id, ready_source.id, limit=20_000)
-            index_summary = get_source_index_summary(project_id, ready_source.id)
+            files = _load_code_files_from_conn(conn, ready_source.id, limit=20_000)
+            index_summary = _load_source_index_summary_from_conn(conn, ready_source.id)
             data["validation_strategy"] = _validation_strategy(ready_source, files)
             data["audit_tool_plan"] = [
                 item.as_dict()
                 for item in build_tool_plan(ready_source, files, source_path)
             ]
             index_limit = _code_index_limit(profile)
-            entrypoints = list_code_entrypoints(project_id, ready_source.id, limit=index_limit)
-            relationships = list_code_relationships(project_id, ready_source.id, limit=index_limit)
-            capabilities = list_code_capabilities(project_id, ready_source.id, limit=index_limit)
-            manifests = list_dependency_manifests(project_id, ready_source.id, limit=index_limit)
-            symbols = list_code_symbols(project_id, ready_source.id, limit=index_limit)
+            entrypoints = _load_code_entrypoints_from_conn(conn, ready_source.id, limit=index_limit)
+            relationships = _load_code_relationships_from_conn(conn, ready_source.id, limit=index_limit)
+            capabilities = _load_code_capabilities_from_conn(conn, ready_source.id, limit=index_limit)
+            manifests = _load_dependency_manifests_from_conn(conn, ready_source.id, limit=index_limit)
+            symbols = _load_code_symbols_from_conn(conn, ready_source.id, limit=index_limit)
             data["code_index"] = {
                 "summary": index_summary.model_dump(),
                 "view": {
@@ -1978,12 +2283,17 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
                     "symbols_included": len(symbols),
                     "manifests_included": len(manifests),
                 },
-                "entrypoints": [item.model_dump() for item in entrypoints],
-                "relationships": [item.model_dump() for item in relationships],
-                "capabilities": [item.model_dump() for item in capabilities],
-                "dependency_manifests": [item.model_dump() for item in manifests],
-                "symbols_sample": [item.model_dump() for item in symbols],
             }
+            if profile == "full":
+                data["code_index"].update(
+                    {
+                        "entrypoints": [item.model_dump() for item in entrypoints],
+                        "relationships": [item.model_dump() for item in relationships],
+                        "capabilities": [item.model_dump() for item in capabilities],
+                        "dependency_manifests": [item.model_dump() for item in manifests],
+                        "symbols_sample": [item.model_dump() for item in symbols],
+                    }
+                )
             data["code_index"]["audit_context"] = _load_code_index_audit_context(
                 conn,
                 project_id,
@@ -1991,6 +2301,11 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
                 profile=profile,
                 focus_candidate_ids=focus_candidate_ids,
             )
+            if profile != "full":
+                data["code_index"]["audit_context"].pop("audit_packs", None)
+                data["code_index"]["audit_context"].pop(
+                    "candidate_entrypoint_traces", None
+                )
 
     tool_findings = conn.execute(
         """
@@ -2002,6 +2317,12 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
         """,
         (project_id,),
     ).fetchall()
+    if profile != "full":
+        tool_findings = [
+            row
+            for row in tool_findings
+            if row["status"] == "candidate" or row["severity"] in ("critical", "high")
+        ][:80 if profile == "reason" else 30]
     if tool_findings:
         data["tool_findings"] = [dict(row) for row in tool_findings]
 
@@ -2018,6 +2339,14 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
         """,
         (project_id,),
     ).fetchall()
+    if profile != "full":
+        audit_findings = _select_context_audit_findings(
+            conn,
+            project_id,
+            audit_findings,
+            profile=profile,
+            focus_candidate_ids=focus_candidate_ids,
+        )
     if audit_findings:
         data["audit_findings"] = [
             {
@@ -2026,8 +2355,14 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
                     for key, value in dict(row).items()
                     if key not in ("proof_packets_json", "reproduction_poc_json")
                 },
-                "proof_packets": _decode_json_list(row["proof_packets_json"]),
-                "reproduction_poc": _decode_json_dict(row["reproduction_poc_json"]),
+                **(
+                    {
+                        "proof_packets": _decode_json_list(row["proof_packets_json"]),
+                        "reproduction_poc": _decode_json_dict(row["reproduction_poc_json"]),
+                    }
+                    if profile == "full"
+                    else {}
+                ),
             }
             for row in audit_findings
         ]
@@ -2067,6 +2402,13 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
             for h in hints
         ]
 
+    scoped_facts, scoped_intents = _scope_blackboard_history(
+        facts,
+        intents,
+        sources_by_intent,
+        profile=profile,
+        intent_id=intent_id,
+    )
     data["facts"] = [
         {
             "id": f["id"],
@@ -2078,11 +2420,11 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
             "parent_fact_ids": _decode_json_list(f["parent_fact_ids_json"]),
             "fingerprint": f["fingerprint"],
         }
-        for f in facts
+        for f in scoped_facts
     ]
 
     intent_list = []
-    for i in intents:
+    for i in scoped_intents:
         entry: dict = {
             "id": i["id"],
             "from": sources_by_intent.get(i["id"], []),
@@ -2104,8 +2446,32 @@ def _export_yaml(conn, project_id: str, *, profile: str = "full", intent_id: str
 
     if intent_list:
         data["intents"] = intent_list
+    data["context_profile"]["required_fact_ids"] = sorted(
+        {
+            "origin",
+            "goal",
+            *(
+                fact_id
+                for intent in intent_list
+                if intent["status"] in ("open", "claimed", "cooldown")
+                or intent["id"] == intent_id
+                for fact_id in intent["from"]
+            ),
+        }
+    )
+    if profile != "full":
+        _compact_coverage_details(data)
 
-    return yaml.dump(data, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    text = yaml.dump(data, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    max_bytes = _context_max_bytes(profile)
+    if max_bytes is not None and len(text.encode("utf-8")) > max_bytes:
+        text = _fit_context_to_budget(
+            data,
+            profile,
+            max_bytes,
+            hard_max_bytes=_context_hard_max_bytes(profile),
+        )
+    return text
 
 
 def _code_index_limit(profile: str) -> int:
@@ -2122,18 +2488,256 @@ def _profile_budgets(profile: str) -> dict[str, int | None]:
             "audit_candidate_limit": EXPLORE_CANDIDATE_LIMIT,
             "business_graph_node_limit": EXPLORE_GRAPH_NODE_LIMIT,
             "code_index_limit": _code_index_limit(profile),
+            "max_context_bytes": EXPLORE_CONTEXT_MAX_BYTES,
+            "hard_max_context_bytes": EXPLORE_CONTEXT_HARD_MAX_BYTES,
         }
     if profile == "reason":
         return {
             "audit_candidate_limit": REASON_CANDIDATE_LIMIT,
             "business_graph_node_limit": REASON_GRAPH_NODE_LIMIT,
             "code_index_limit": _code_index_limit(profile),
+            "max_context_bytes": REASON_CONTEXT_MAX_BYTES,
+            "hard_max_context_bytes": REASON_CONTEXT_HARD_MAX_BYTES,
         }
     return {
         "audit_candidate_limit": FULL_CANDIDATE_LIMIT,
         "business_graph_node_limit": None,
         "code_index_limit": _code_index_limit(profile),
+        "max_context_bytes": None,
+        "hard_max_context_bytes": None,
     }
+
+
+def _context_max_bytes(profile: str) -> int | None:
+    if profile == "explore":
+        return EXPLORE_CONTEXT_MAX_BYTES
+    if profile == "reason":
+        return REASON_CONTEXT_MAX_BYTES
+    return None
+
+
+def _context_hard_max_bytes(profile: str) -> int | None:
+    if profile == "explore":
+        return EXPLORE_CONTEXT_HARD_MAX_BYTES
+    if profile == "reason":
+        return REASON_CONTEXT_HARD_MAX_BYTES
+    return None
+
+
+def _scope_blackboard_history(
+    facts,
+    intents,
+    sources_by_intent: dict[str, list[str]],
+    *,
+    profile: str,
+    intent_id: str | None,
+):
+    if profile == "full":
+        return list(facts), list(intents)
+    active_statuses = {"open", "claimed", "cooldown"}
+    selected_intents = [
+        row
+        for row in intents
+        if row["id"] == intent_id or row["status"] in active_statuses
+    ]
+    history_limit = 30 if profile == "reason" else 8
+    for row in reversed(intents):
+        if row not in selected_intents:
+            selected_intents.append(row)
+        if len(selected_intents) >= history_limit:
+            break
+    selected_intent_ids = {row["id"] for row in selected_intents}
+    required_fact_ids = {"origin", "goal"}
+    for selected_id in selected_intent_ids:
+        required_fact_ids.update(sources_by_intent.get(selected_id, []))
+    fact_by_id = {row["id"]: row for row in facts}
+    pending = list(required_fact_ids)
+    while pending:
+        fact_id = pending.pop()
+        row = fact_by_id.get(fact_id)
+        if row is None:
+            continue
+        for parent_id in _decode_json_list(row["parent_fact_ids_json"]):
+            if parent_id not in required_fact_ids:
+                required_fact_ids.add(parent_id)
+                pending.append(parent_id)
+    fact_limit = 100 if profile == "reason" else 40
+    selected_facts = [row for row in facts if row["id"] in required_fact_ids]
+    for row in reversed(facts):
+        if row not in selected_facts:
+            selected_facts.append(row)
+        if len(selected_facts) >= fact_limit:
+            break
+    return selected_facts, selected_intents
+
+
+def _select_context_audit_findings(
+    conn,
+    project_id: str,
+    rows,
+    *,
+    profile: str,
+    focus_candidate_ids: set[str],
+):
+    if profile == "reason" or not focus_candidate_ids:
+        limit = 200 if profile == "reason" else 40
+        return list(rows[-limit:])
+    placeholders = ",".join("?" for _ in focus_candidate_ids)
+    focus_rows = conn.execute(
+        f"""
+        SELECT file_path, business_node_id
+        FROM audit_candidates
+        WHERE project_id = ? AND id IN ({placeholders})
+        """,
+        (project_id, *sorted(focus_candidate_ids)),
+    ).fetchall()
+    paths = {row["file_path"] for row in focus_rows if row["file_path"]}
+    node_ids = {row["business_node_id"] for row in focus_rows if row["business_node_id"]}
+    selected = [
+        row
+        for row in rows
+        if row["file_path"] in paths
+        or (row["business_node_id"] and row["business_node_id"] in node_ids)
+        or row["status"] == "pending_review"
+    ]
+    return selected[-40:]
+
+
+def _fit_context_to_budget(
+    data: dict,
+    profile: str,
+    max_bytes: int,
+    *,
+    hard_max_bytes: int | None = None,
+) -> str:
+    """Drop only low-priority history; focused candidates and open coverage stay intact."""
+    context_profile = data.get("context_profile") or {}
+    focused = set(context_profile.get("focused_candidate_ids") or [])
+    required_fact_ids = set(context_profile.get("required_fact_ids") or [])
+    candidate_items = (data.get("audit_candidates") or {}).get("items") or []
+    business_nodes = (data.get("business_graph") or {}).get("nodes") or []
+    audit_findings = data.get("audit_findings") or []
+    intents = data.get("intents") or []
+    facts = data.get("facts") or []
+    def serialize_if_fit() -> str | None:
+        text = yaml.dump(data, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        if len(text.encode("utf-8")) <= max_bytes:
+            return text
+        return None
+
+    active_intents = [
+        row for row in intents if row["status"] in ("open", "claimed", "cooldown")
+    ]
+    completed_intents = [row for row in intents if row not in active_intents]
+    intents[:] = [*active_intents, *completed_intents[-5:]]
+    if text := serialize_if_fit():
+        return text
+
+    fixed_facts = [row for row in facts if row["id"] in required_fact_ids]
+    other_facts = [row for row in facts if row not in fixed_facts]
+    facts[:] = [*fixed_facts, *other_facts[-20:]]
+    if text := serialize_if_fit():
+        return text
+
+    unresolved_findings = [row for row in audit_findings if row["status"] != "confirmed"]
+    confirmed_findings = [row for row in audit_findings if row["status"] == "confirmed"]
+    audit_findings[:] = [*unresolved_findings, *confirmed_findings[-20:]]
+    if text := serialize_if_fit():
+        return text
+
+    unresolved_nodes = [
+        row for row in business_nodes if row.get("review_status") != "covered"
+    ]
+    covered_nodes = [row for row in business_nodes if row.get("review_status") == "covered"]
+    business_nodes[:] = [*unresolved_nodes, *covered_nodes[-20:]]
+    if text := serialize_if_fit():
+        return text
+
+    required_candidates = [
+        row
+        for row in candidate_items
+        if row.get("id") in focused
+        or row.get("status") in ("candidate", "investigating")
+    ]
+    historical_candidates = [row for row in candidate_items if row not in required_candidates]
+    candidate_items[:] = [*required_candidates, *historical_candidates[:10]]
+    if text := serialize_if_fit():
+        return text
+
+    required_bytes = len(
+        yaml.dump(data, allow_unicode=True, default_flow_style=False, sort_keys=False).encode(
+            "utf-8"
+        )
+    )
+    hard_max_bytes = hard_max_bytes or max_bytes
+    if required_bytes <= hard_max_bytes:
+        context_profile["expanded_context"] = {
+            "target_bytes": max_bytes,
+            "required_bytes": required_bytes,
+            "hard_max_bytes": hard_max_bytes,
+            "reason": "required_security_context_preserved",
+        }
+        expanded = yaml.dump(
+            data,
+            allow_unicode=True,
+            default_flow_style=False,
+            sort_keys=False,
+        )
+        if len(expanded.encode("utf-8")) <= hard_max_bytes:
+            return expanded
+    raise HTTPException(
+        507,
+        (
+            f"{profile} context requires {required_bytes} bytes and exceeds {max_bytes} bytes "
+            "after relevance compaction; "
+            "the task was not dispatched because required security coverage would be lost"
+        ),
+    )
+
+
+def _compact_coverage_details(data: dict) -> None:
+    candidate_coverage = (data.get("audit_candidates") or {}).get("coverage") or {}
+    candidate_keys = (
+        "id",
+        "severity",
+        "status",
+        "candidate_type",
+        "title",
+        "file_path",
+        "line_start",
+        "entry_point",
+        "reason",
+    )
+    for name in (
+        "open_required",
+        "high_risk_unresolved",
+        "invalid_conclusions",
+        "pending_high_findings",
+    ):
+        rows = candidate_coverage.get(name)
+        if isinstance(rows, list):
+            candidate_coverage[name] = [
+                {key: row.get(key) for key in candidate_keys if row.get(key) is not None}
+                for row in rows
+                if isinstance(row, dict)
+            ]
+
+    graph_coverage = (data.get("business_graph") or {}).get("coverage") or {}
+    graph_keys = (
+        "id",
+        "node_type",
+        "title",
+        "risk_level",
+        "review_status",
+        "reason",
+    )
+    for name, rows in list(graph_coverage.items()):
+        if isinstance(rows, list):
+            graph_coverage[name] = [
+                {key: row.get(key) for key in graph_keys if row.get(key) is not None}
+                for row in rows
+                if isinstance(row, dict)
+            ]
 
 
 def _validation_strategy(source, files) -> dict:

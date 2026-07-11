@@ -3,9 +3,10 @@
 Target: ``cairn.server.middleware.auth.require_auth`` as wired into the real
 application (:mod:`cairn.server.app`).
 
-Covers requirements 5.1-5.4 plus the dual-auth / dispatcher-safe behaviour:
+Covers requirements 5.1-5.4 plus the dual-auth / dispatcher compatibility path:
 
-- ``CAIRN_INTERNAL_TOKEN`` unset  -> protected routers stay open (non-401).
+- ``CAIRN_INTERNAL_TOKEN`` unset  -> protected routers require a browser session.
+- ``CAIRN_AUTH_OPEN_MODE`` set    -> local/test compatibility mode stays open.
 - ``CAIRN_INTERNAL_TOKEN`` set     -> 401 without auth; 200 with a valid session
   cookie or the matching ``X-Cairn-Internal-Token`` header; 401 with a wrong
   token.
@@ -33,6 +34,7 @@ from cairn.server import db
 from cairn.server.middleware.auth import (
     INTERNAL_TOKEN_ENV,
     INTERNAL_TOKEN_HEADER,
+    OPEN_AUTH_ENV,
     SESSION_COOKIE_NAME,
 )
 
@@ -52,8 +54,9 @@ def app_client(temp_db, monkeypatch):
     app's lifespan ``db.configure(DEFAULT_DB)`` is a no-op and the temp DB is
     used throughout. https origin keeps the Secure cookie working.
     """
-    # Default: ensure the internal token is unset unless a test sets it.
+    # Default: ensure auth is closed unless a test explicitly opens it.
     monkeypatch.delenv(INTERNAL_TOKEN_ENV, raising=False)
+    monkeypatch.delenv(OPEN_AUTH_ENV, raising=False)
 
     from cairn.server.app import app
 
@@ -85,15 +88,21 @@ def _captcha_payload(client):
 
 
 # ---------------------------------------------------------------------------
-# Dispatcher-safe default: CAIRN_INTERNAL_TOKEN unset -> routers stay open
+# Default: protected routes are closed unless explicitly opened
 # ---------------------------------------------------------------------------
 
 
-def test_internal_token_unset_protected_route_is_open(app_client, monkeypatch):
+def test_internal_token_unset_protected_route_requires_auth(app_client, monkeypatch):
     monkeypatch.delenv(INTERNAL_TOKEN_ENV, raising=False)
-    # No auth at all, yet the protected route must not 401 (open default).
+    monkeypatch.delenv(OPEN_AUTH_ENV, raising=False)
     response = app_client.get(PROTECTED_PATH)
-    assert response.status_code != 401
+    assert response.status_code == 401
+
+
+def test_explicit_open_auth_mode_keeps_legacy_route_open(app_client, monkeypatch):
+    monkeypatch.delenv(INTERNAL_TOKEN_ENV, raising=False)
+    monkeypatch.setenv(OPEN_AUTH_ENV, "1")
+    response = app_client.get(PROTECTED_PATH)
     assert response.status_code == 200
 
 

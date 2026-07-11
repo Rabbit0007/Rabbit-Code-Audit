@@ -327,18 +327,82 @@ def _regex_symbols(snapshot_id: str, file: CodeFile, text: str) -> list[CodeSymb
     return symbols
 
 
+_SQL_IDENTIFIER_PART = r'(?:`[A-Za-z_][\w$-]*`|"[A-Za-z_][\w$-]*"|\[[A-Za-z_][\w$-]*\]|[A-Za-z_][\w$-]*)'
+_SQL_QUALIFIED_IDENTIFIER = rf"({_SQL_IDENTIFIER_PART}(?:\s*\.\s*{_SQL_IDENTIFIER_PART}){{0,2}})"
 DATA_OBJECT_SQL_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`\"'\[]?([A-Za-z_][\w.$-]*)", re.IGNORECASE),
-    re.compile(r"\b(?:FROM|JOIN|UPDATE|INTO)\s+[`\"'\[]?([A-Za-z_][\w.$-]*)", re.IGNORECASE),
+    re.compile(
+        rf"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?{_SQL_QUALIFIED_IDENTIFIER}",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:INSERT|REPLACE|MERGE)\s+INTO\s+{_SQL_QUALIFIED_IDENTIFIER}",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\bUPDATE\s+{_SQL_QUALIFIED_IDENTIFIER}"
+        r"(?=\s+(?:SET\b|(?:AS\s+)?[A-Za-z_][\w$-]*\s+SET\b))",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:SELECT|DELETE)\b[^\r\n;]{{0,1600}}?\bFROM\s+{_SQL_QUALIFIED_IDENTIFIER}",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\bSELECT\b[^\r\n;]{{0,1600}}?\bJOIN\s+{_SQL_QUALIFIED_IDENTIFIER}",
+        re.IGNORECASE,
+    ),
 )
+SQL_DATA_OBJECT_LANGUAGES = {
+    "C",
+    "C++",
+    "C#",
+    "Go",
+    "Java",
+    "JavaScript",
+    "Kotlin",
+    "Objective-C",
+    "PHP",
+    "Perl",
+    "Python",
+    "Ruby",
+    "Rust",
+    "SQL",
+    "Scala",
+    "Shell",
+    "TypeScript",
+    "Vue",
+}
 DATA_OBJECT_RESERVED_NAMES = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "database",
+    "from",
+    "http",
+    "if",
+    "in",
+    "into",
+    "it",
+    "of",
+    "on",
+    "only",
+    "or",
     "select",
-    "where",
-    "values",
-    "set",
-    "returning",
     "dual",
     "public",
+    "query",
+    "returning",
+    "set",
+    "table",
+    "that",
+    "the",
+    "this",
+    "to",
+    "values",
+    "where",
+    "within",
+    "your",
 }
 
 
@@ -370,13 +434,14 @@ def _data_object_symbols(snapshot_id: str, file: CodeFile, text: str) -> list[Co
             )
         )
 
-    for pattern in DATA_OBJECT_SQL_PATTERNS:
-        for match in pattern.finditer(text):
-            line_start = _line_no(text, match.start())
-            line = _line_at(text, line_start)
-            if _looks_like_language_import_line(line):
-                continue
-            add(match.group(1), match.start(), line, 0.82, "heuristic:sql")
+    if file.language in SQL_DATA_OBJECT_LANGUAGES:
+        for pattern in DATA_OBJECT_SQL_PATTERNS:
+            for match in pattern.finditer(text):
+                line_start = _line_no(text, match.start())
+                line = _line_at(text, line_start)
+                if _looks_like_language_import_line(line) or _looks_like_sql_prose(line):
+                    continue
+                add(match.group(1), match.start(), line, 0.82, "heuristic:sql")
 
     for match in re.finditer(r"__tablename__\s*=\s*['\"]([^'\"]+)['\"]", text):
         add(match.group(1), match.start(), _line_at(text, _line_no(text, match.start())), 0.88, "heuristic:orm")
@@ -408,13 +473,27 @@ def _data_object_symbols(snapshot_id: str, file: CodeFile, text: str) -> list[Co
 
 
 def _clean_data_object_name(value: str) -> str | None:
-    text = value.strip().strip("`\"'[]")
-    text = text.split()[0].strip("`\"'[]")
-    if not text or text.lower() in DATA_OBJECT_RESERVED_NAMES:
+    raw_parts = re.split(r"\s*\.\s*", value.strip())
+    parts = [part.strip().strip("`\"'[]") for part in raw_parts]
+    if not parts or any(not part for part in parts):
         return None
+    if any(part.lower() in DATA_OBJECT_RESERVED_NAMES for part in parts):
+        return None
+    text = ".".join(parts)
     if text.startswith("$") or text.startswith(":"):
         return None
     return text[:120]
+
+
+def _looks_like_sql_prose(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if stripped.startswith(("//", "#", "--", "/*", "*", "<!--")):
+        return True
+    if re.match(r"^(?:echo|print|printf)\b", stripped, re.IGNORECASE) and "<" in stripped:
+        return True
+    return False
 
 
 def _looks_like_language_import_line(line: str) -> bool:

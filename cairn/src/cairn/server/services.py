@@ -165,6 +165,59 @@ def sync_business_node_coverage_from_conclusion(
     )
 
 
+def activate_business_node_conclusion(
+    conn: sqlite3.Connection,
+    project_id: str,
+    business_node_id: str,
+    conclusion_id: str,
+    conclusion: str,
+    *,
+    now: str,
+) -> bool:
+    """Make a conclusion current unless it would weaken decisive evidence."""
+    priority = {
+        "needs_more_evidence": 1,
+        "rejected": 2,
+        "confirmed_finding": 3,
+    }
+    current = conn.execute(
+        """
+        SELECT id, conclusion
+        FROM business_node_conclusions
+        WHERE project_id = ? AND business_node_id = ? AND is_current = 1
+        """,
+        (project_id, business_node_id),
+    ).fetchone()
+    if current is not None and priority[current["conclusion"]] > priority[conclusion]:
+        conn.execute(
+            """
+            UPDATE business_node_conclusions
+            SET is_current = 0, superseded_at = ?
+            WHERE id = ?
+            """,
+            (now, conclusion_id),
+        )
+        return False
+    conn.execute(
+        """
+        UPDATE business_node_conclusions
+        SET is_current = 0, superseded_at = ?
+        WHERE project_id = ? AND business_node_id = ?
+          AND is_current = 1 AND id != ?
+        """,
+        (now, project_id, business_node_id, conclusion_id),
+    )
+    conn.execute(
+        """
+        UPDATE business_node_conclusions
+        SET is_current = 1, superseded_at = NULL
+        WHERE id = ?
+        """,
+        (conclusion_id,),
+    )
+    return True
+
+
 def sync_business_node_coverage_from_latest_conclusions(
     conn: sqlite3.Connection,
     project_id: str | None = None,
@@ -191,7 +244,7 @@ def sync_business_node_coverage_from_latest_conclusions(
         LEFT JOIN business_nodes bn
           ON bn.id = c.business_node_id
          AND bn.project_id = c.project_id
-        {where_sql}
+        {where_sql + (' AND ' if where_sql else 'WHERE ') + 'c.is_current = 1'}
         ORDER BY c.project_id, c.business_node_id, c.created_at DESC, c.rowid DESC
         """,
         params,
@@ -323,12 +376,29 @@ def validate_goal_not_in_sources(fact_ids: list[str]) -> None:
         raise HTTPException(400, "goal cannot be used in from")
 
 
+def _latest_ready_snapshot_id(conn: sqlite3.Connection, project_id: str) -> str | None:
+    row = conn.execute(
+        """
+        SELECT id
+        FROM source_snapshots
+        WHERE project_id = ?
+          AND status = 'ready'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (project_id,),
+    ).fetchone()
+    return None if row is None else str(row["id"])
+
+
 def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str) -> None:
     open_intents = conn.execute(
         """
         SELECT id, worker, description
         FROM intents
-        WHERE project_id = ? AND to_fact_id IS NULL
+        WHERE project_id = ?
+          AND to_fact_id IS NULL
+          AND status IN ('open', 'claimed', 'cooldown')
         ORDER BY created_at, id
         LIMIT 10
         """,
@@ -350,11 +420,14 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
             },
         )
 
+    latest_snapshot_id = _latest_ready_snapshot_id(conn, project_id)
+
     open_candidates = conn.execute(
         """
         SELECT id, source, title, severity, status, candidate_type, file_path, line_start, entry_point
         FROM audit_candidates
         WHERE project_id = ?
+          AND (? IS NULL OR snapshot_id = ?)
           AND severity IN ('critical', 'high', 'unknown')
           AND status IN ('candidate', 'investigating')
           AND NOT (
@@ -364,7 +437,7 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
         ORDER BY created_at, id
         LIMIT 20
         """,
-        (project_id,),
+        (project_id, latest_snapshot_id, latest_snapshot_id),
     ).fetchall()
     if open_candidates:
         raise HTTPException(
@@ -397,12 +470,13 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
                    file_path, line_start, entry_point
             FROM audit_candidates
             WHERE project_id = ?
+              AND (? IS NULL OR snapshot_id = ?)
               AND status = 'needs_more_evidence'
               AND severity IN ('critical', 'high', 'unknown')
             ORDER BY updated_at, id
             LIMIT 200
             """,
-            (project_id,),
+            (project_id, latest_snapshot_id, latest_snapshot_id),
         ).fetchall()
         if is_high_impact_audit_candidate_row(row)
     ][:20]
@@ -441,6 +515,7 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
           ON af.id = c.audit_finding_id
          AND af.project_id = c.project_id
         WHERE c.project_id = ?
+          AND (? IS NULL OR c.snapshot_id = ?)
           AND c.severity IN ('critical', 'high', 'unknown')
           AND NOT (
               c.source = 'index'
@@ -458,7 +533,7 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
         ORDER BY c.updated_at, c.id
         LIMIT 20
         """,
-        (project_id,),
+        (project_id, latest_snapshot_id, latest_snapshot_id),
     ).fetchall()
     if invalid_candidate_conclusions:
         raise HTTPException(
@@ -493,7 +568,9 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
                       ac.source = 'index'
                       AND ac.candidate_type IN ('entrypoint', 'web_entrypoint')
                   )) AS candidate_count,
-               (SELECT COUNT(*) FROM business_nodes bn WHERE bn.project_id = s.project_id) AS business_node_count
+               (SELECT COUNT(*) FROM business_nodes bn
+                WHERE bn.project_id = s.project_id
+                  AND (bn.source_snapshot_id IS NULL OR bn.source_snapshot_id = s.id)) AS business_node_count
         FROM source_snapshots s
         WHERE s.project_id = ?
           AND s.status = 'ready'
@@ -526,12 +603,13 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
                discovered_by, reviewed_by
         FROM audit_findings
         WHERE project_id = ?
+          AND (? IS NULL OR snapshot_id = ?)
           AND severity IN ('critical', 'high')
           AND status IN ('candidate', 'investigating', 'pending_review')
         ORDER BY created_at, id
         LIMIT 20
         """,
-        (project_id,),
+        (project_id, latest_snapshot_id, latest_snapshot_id),
     ).fetchall()
     if pending_high_findings:
         raise HTTPException(
@@ -561,12 +639,13 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
                proof_packets_json, reproduction_poc_json
         FROM audit_findings
         WHERE project_id = ?
+          AND (? IS NULL OR snapshot_id = ?)
           AND severity IN ('critical', 'high')
           AND status = 'confirmed'
         ORDER BY created_at, id
         LIMIT 200
         """,
-        (project_id,),
+        (project_id, latest_snapshot_id, latest_snapshot_id),
     ).fetchall()
     proof_blockers = [
         row
@@ -601,13 +680,15 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
 
     business_nodes = conn.execute(
         """
-        SELECT id, title, risk_level, review_status, coverage_note, risk_tags_json
+        SELECT id, title, risk_level, review_status, coverage_note, risk_tags_json,
+               graph_layer, evidence_status
         FROM business_nodes
         WHERE project_id = ?
+          AND (? IS NULL OR source_snapshot_id IS NULL OR source_snapshot_id = ?)
           AND risk_level IN ('critical', 'high', 'unknown')
         ORDER BY risk_level, created_at, id
         """,
-        (project_id,),
+        (project_id, latest_snapshot_id, latest_snapshot_id),
     ).fetchall()
     latest_conclusions_by_node = _load_latest_business_node_conclusions(conn, project_id)
     coverage_blockers = [
@@ -674,6 +755,31 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
                     "audit conclusion before completion"
                 ),
                 "business_nodes": conclusion_blockers[:20],
+            },
+        )
+
+    evidence_blockers = [
+        {
+            "id": row["id"],
+            "title": row["title"],
+            "risk_level": row["risk_level"],
+            "evidence_status": row["evidence_status"],
+        }
+        for row in business_nodes
+        if row["graph_layer"] == "semantic"
+        and row["evidence_status"] != "source_backed"
+        and not _business_node_conclusion_provides_coverage(
+            latest_conclusions_by_node.get(row["id"]),
+            row["id"],
+            require_decisive=is_high_impact_business_node_row(row),
+        )
+    ][:20]
+    if evidence_blockers:
+        raise HTTPException(
+            409,
+            {
+                "message": "Semantic business nodes require source-backed evidence before completion",
+                "business_nodes": evidence_blockers,
             },
         )
 
@@ -1035,6 +1141,7 @@ def project_meta_from_row(row: sqlite3.Row) -> ProjectMeta:
         status=row["status"],
         created_at=row["created_at"],
         reason=project_reason_from_row(row),
+        pause_reason=row["pause_reason"],
     )
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ import zipfile
 
 from cairn.server.code_index import extract_code_index, is_likely_generic_web_script
 from cairn.server import db
+from cairn.server.business_graph_service import reconcile_project_business_graph
 from cairn.server.services import get_project_or_404, utcnow
 from cairn.server.source_models import (
     CodeCapability,
@@ -30,8 +32,13 @@ from cairn.server.source_models import (
     SourceIndexQuality,
     SourceIndexQualityIssue,
     SourceIndexSummary,
+    SourceBootstrapBrief,
+    SourceBootstrapCandidate,
     SourceSnapshot,
 )
+
+
+LOG = logging.getLogger(__name__)
 
 
 MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
@@ -105,10 +112,12 @@ CAPABILITY_CHAIN_CATEGORY_QUOTAS = {
     "object_id_lookup": 6,
 }
 HIGH_IMPACT_RISK_SIGNAL_CATEGORIES = {
+    "数据库执行能力",
     "文件读写/加载能力",
     "系统进程能力",
     "对象反序列化能力",
 }
+MEDIUM_IMPACT_RISK_SIGNAL_CATEGORIES = {"响应输出/渲染能力"}
 HIGH_IMPACT_CAPABILITY_CATEGORIES = {
     "archive_extract",
     "file_upload",
@@ -406,9 +415,11 @@ CAPABILITY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "credential_access",
         re.compile(
-            r"\b(?:secret|token|credential|password|passwd|private_key|access_key|api_key|session_key)\b"
-            r"|settings\.[A-Z_]*(?:SECRET|TOKEN|KEY|PASSWORD)[A-Z_]*",
-            re.IGNORECASE,
+            r"(?i:settings\.[A-Z_]*(?:SECRET|TOKEN|KEY|PASSWORD)[A-Z_]*)"
+            r"|(?i:(?:getenv|System\.getenv|os\.environ(?:\.get)?)\s*\([^)]*(?:SECRET|TOKEN|KEY|PASSWORD))"
+            r"|(?i:(?:\$|\.)(?:secret|token|credential|password|passwd|private_key|access_key|api_key|session_key)\b)"
+            r"|(?i:\b(?:secret_key|access_token|refresh_token|api_key|session_key|private_key|password_hash|password_digest|credentials?)\b\s*(?:=|:|\[|\(|,))"
+            r"|\b(?:SECRET|TOKEN|CREDENTIAL|PASSWORD|PASSWD|PRIVATE_KEY|ACCESS_KEY|API_KEY|SESSION_KEY)[A-Z0-9_]*\b",
         ),
     ),
     (
@@ -470,6 +481,25 @@ def snapshot_path(snapshot_id: str) -> Path:
 
 def snapshot_container_path(snapshot_id: str) -> str:
     return f"/audit-data/artifacts/snapshots/{snapshot_id}/source"
+
+
+def delete_snapshot_artifacts(snapshot_ids: list[str]) -> None:
+    """Remove filesystem artifacts owned by source snapshots."""
+    root = artifact_root()
+    for snapshot_id in snapshot_ids:
+        if not snapshot_id or Path(snapshot_id).name != snapshot_id:
+            LOG.warning("refusing to delete artifacts for unsafe snapshot id=%r", snapshot_id)
+            continue
+        for path in (
+            root / "snapshots" / snapshot_id,
+            root / "tool-runs" / snapshot_id,
+        ):
+            try:
+                shutil.rmtree(path)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                LOG.exception("failed to delete snapshot artifact path=%s", path)
 
 
 def import_git_source(project_id: str, repository_url: str, requested_ref: str | None) -> SourceSnapshot:
@@ -1149,6 +1179,98 @@ def get_source_index_quality(project_id: str, snapshot_id: str) -> SourceIndexQu
         audit_readiness=audit_readiness,
         issues=issues,
         recommendations=list(dict.fromkeys(recommendations)),
+    )
+
+
+def get_source_bootstrap_brief(
+    project_id: str,
+    snapshot_id: str,
+    *,
+    entrypoint_limit: int = 30,
+    candidate_limit: int = 30,
+    manifest_limit: int = 20,
+) -> SourceBootstrapBrief:
+    snapshot = get_snapshot(project_id, snapshot_id)
+    if snapshot.status != "ready":
+        raise ValueError("Source snapshot is not ready")
+
+    quality = get_source_index_quality(project_id, snapshot_id)
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT candidate_type, severity, status, title, description,
+                   file_path, line_start, entry_point, symbol
+            FROM audit_candidates
+            WHERE project_id = ?
+              AND snapshot_id = ?
+              AND source = 'index'
+              AND status IN ('candidate', 'investigating', 'needs_more_evidence')
+            """,
+            (project_id, snapshot_id),
+        ).fetchall()
+
+    ranked_candidates: list[tuple[int, str, int, SourceBootstrapCandidate]] = []
+    severity_rank = {"critical": 0, "high": 1, "medium": 2, "unknown": 3, "low": 4, "info": 5}
+    for row in rows:
+        priority = audit_candidate_priority(
+            candidate_type=row["candidate_type"],
+            severity=row["severity"],
+            status=row["status"],
+            title=row["title"],
+            description=row["description"],
+            file_path=row["file_path"],
+            line_start=row["line_start"],
+            entry_point=row["entry_point"],
+            symbol=row["symbol"],
+        )
+        candidate = SourceBootstrapCandidate(
+            candidate_type=row["candidate_type"],
+            severity=row["severity"],
+            priority_score=int(priority["score"]),
+            priority_reasons=[str(item) for item in priority["reasons"]],
+            title=row["title"],
+            file_path=row["file_path"],
+            line_start=row["line_start"],
+            entry_point=row["entry_point"],
+            symbol=row["symbol"],
+        )
+        ranked_candidates.append(
+            (
+                -candidate.priority_score,
+                candidate.file_path or "",
+                candidate.line_start or 0,
+                candidate,
+            )
+        )
+    ranked_candidates.sort(key=lambda item: (item[0], severity_rank.get(item[3].severity, 9), item[1], item[2]))
+    priority_candidates = [item[3] for item in ranked_candidates[: max(1, candidate_limit)]]
+
+    entrypoints = list_code_entrypoints(project_id, snapshot_id, limit=20_000)
+    priority_paths: dict[str, int] = {}
+    for index, candidate in enumerate(priority_candidates):
+        if candidate.file_path:
+            priority_paths.setdefault(candidate.file_path, index)
+    entrypoints.sort(
+        key=lambda item: (
+            priority_paths.get(item.path, len(priority_paths)),
+            -item.confidence,
+            item.path,
+            item.line_start or 0,
+        )
+    )
+    manifests = list_dependency_manifests(project_id, snapshot_id, limit=max(1, manifest_limit))
+    return SourceBootstrapBrief(
+        snapshot_id=snapshot_id,
+        source_path=snapshot_container_path(snapshot_id),
+        file_count=snapshot.file_count,
+        total_bytes=snapshot.total_bytes,
+        detected_languages=snapshot.detected_languages,
+        index_summary=quality.summary,
+        quality_score=quality.score,
+        quality_grade=quality.grade,
+        manifests=manifests[: max(1, manifest_limit)],
+        entrypoints=entrypoints[: max(1, entrypoint_limit)],
+        priority_candidates=priority_candidates,
     )
 
 
@@ -1898,22 +2020,8 @@ def _copy_limited(stream: BinaryIO, destination: Path, limit: int) -> str:
 def _safe_extract_zip(archive_path: Path, destination: Path) -> None:
     total_bytes = 0
     file_count = 0
-    seen_paths: set[str] = set()
     with zipfile.ZipFile(archive_path) as archive:
-        for info in archive.infolist():
-            relative = _safe_zip_path(info.filename)
-            if relative is None:
-                continue
-            normalized = relative.as_posix().casefold()
-            if normalized in seen_paths:
-                raise ValueError(f"ZIP contains a duplicate path: {relative.as_posix()}")
-            seen_paths.add(normalized)
-            mode = info.external_attr >> 16
-            file_type = stat.S_IFMT(mode)
-            if file_type == stat.S_IFLNK:
-                raise ValueError(f"ZIP contains a symbolic link: {relative.as_posix()}")
-            if file_type not in (0, stat.S_IFREG, stat.S_IFDIR):
-                raise ValueError(f"ZIP contains a special file: {relative.as_posix()}")
+        for info, relative in _validated_zip_members(archive):
             if info.is_dir():
                 (destination / relative).mkdir(parents=True, exist_ok=True)
                 continue
@@ -1937,6 +2045,29 @@ def _safe_extract_zip(archive_path: Path, destination: Path) -> None:
                     if written > info.file_size or written > MAX_FILE_BYTES:
                         raise ValueError(f"ZIP file size mismatch: {relative.as_posix()}")
                     output.write(chunk)
+
+
+def _validated_zip_members(
+    archive: zipfile.ZipFile,
+) -> list[tuple[zipfile.ZipInfo, PurePosixPath]]:
+    members: list[tuple[zipfile.ZipInfo, PurePosixPath]] = []
+    seen_paths: set[str] = set()
+    for info in archive.infolist():
+        relative = _safe_zip_path(info.filename)
+        if relative is None:
+            continue
+        normalized = relative.as_posix()
+        if normalized in seen_paths:
+            raise ValueError(f"ZIP contains a duplicate path: {relative.as_posix()}")
+        seen_paths.add(normalized)
+        mode = info.external_attr >> 16
+        file_type = stat.S_IFMT(mode)
+        if file_type == stat.S_IFLNK:
+            raise ValueError(f"ZIP contains a symbolic link: {relative.as_posix()}")
+        if file_type not in (0, stat.S_IFREG, stat.S_IFDIR):
+            raise ValueError(f"ZIP contains a special file: {relative.as_posix()}")
+        members.append((info, relative))
+    return members
 
 
 def _safe_zip_path(name: str) -> PurePosixPath | None:
@@ -2559,11 +2690,26 @@ def _audit_candidate_signal_description(file_path: str, entry_point: str | None,
         parts.append(f"控制/校验：{signal.control_summary}。")
     else:
         parts.append("控制/校验：邻近片段未抽取到明显控制语句，需以 worker 源码阅读为准。")
-    if signal.category in HIGH_IMPACT_RISK_SIGNAL_CATEGORIES:
+    if signal.category == "文件读写/加载能力":
         parts.append(
             "高影响能力提示：请优先确认该输入是否可绕过认证/权限、是否可控路径或目标、"
             "是否存在路径穿越/扩展名或内容边界缺失，以及写入/加载/执行结果是否能被后续入口、"
             "模板、插件、解释器或静态资源服务触发。"
+        )
+    elif signal.category == "数据库执行能力":
+        parts.append(
+            "数据库能力提示：请优先确认输入是否进入 SQL 结构、标识符或未参数化表达式，"
+            "并核对实际执行 API、参数绑定、查询边界和数据库权限。"
+        )
+    elif signal.category == "系统进程能力":
+        parts.append(
+            "执行能力提示：请优先确认输入是否影响命令、参数、解释器、工作目录或环境变量，"
+            "并核对调用方式、白名单和运行权限。"
+        )
+    elif signal.category == "对象反序列化能力":
+        parts.append(
+            "反序列化能力提示：请优先确认输入格式、类型约束、允许类范围、解析器安全模式和"
+            "反序列化后的可触发行为。"
         )
     parts.append(
         "该候选是数据流事实，不是漏洞类型判断；worker 需要重新阅读源码，"
@@ -2637,6 +2783,8 @@ def _priority_summary(priority: dict[str, object]) -> str:
 def _risk_signal_candidate_severity(signal: RiskSignal) -> str:
     if signal.category in HIGH_IMPACT_RISK_SIGNAL_CATEGORIES:
         return "high"
+    if signal.category in MEDIUM_IMPACT_RISK_SIGNAL_CATEGORIES:
+        return "medium"
     return "unknown"
 
 
@@ -2806,7 +2954,7 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
 
     entrypoints = conn.execute(
         """
-        SELECT path, method, route, handler, line_start, evidence, confidence, source
+        SELECT path, framework, method, route, handler, line_start, evidence, confidence, source
         FROM code_entrypoints
         WHERE snapshot_id = ?
         ORDER BY path, COALESCE(line_start, 0), route, COALESCE(method, '')
@@ -2895,6 +3043,11 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
     def ensure_feature(entrypoint) -> str | None:
         feature_key = _route_feature_key(entrypoint["route"])
         if feature_key is None:
+            return None
+        if (
+            entrypoint["framework"] == "web_script"
+            and feature_key == _business_module_key(entrypoint["path"], entrypoint["route"])
+        ):
             return None
         node_id = _stable_business_id("biz", snapshot_id, "feature", feature_key)
         evidence = _business_evidence(entrypoint["path"], entrypoint["line_start"], entrypoint["evidence"])
@@ -3027,7 +3180,7 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
         if not path:
             return None
         symbol = capability["symbol"]
-        node_id = _stable_business_id("biz", snapshot_id, "semantic_capability", path, category, symbol)
+        node_id = _stable_business_id("biz", snapshot_id, "semantic_capability", path, category)
         tags = _decode_json_list(capability["risk_tags_json"])
         for tag in config["risk_tags"]:
             if tag not in tags:
@@ -3368,7 +3521,7 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
                 created_by="source_index",
                 now=now,
             )
-        for control_id in controls_by_path.get(candidate["file_path"] or "", []):
+        for control_id in controls_by_path.get(candidate["file_path"] or "", [])[:1]:
             _insert_business_edge_seed(
                 conn,
                 project_id,
@@ -3380,7 +3533,7 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
                 created_by="source_index",
                 now=now,
             )
-        for semantic_id in semantic_by_path.get(candidate["file_path"] or "", [])[:6]:
+        for semantic_id in semantic_by_path.get(candidate["file_path"] or "", [])[:2]:
             _insert_business_edge_seed(
                 conn,
                 project_id,
@@ -3392,7 +3545,7 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
                 created_by="source_index",
                 now=now,
             )
-        for data_id in data_by_path.get(candidate["file_path"] or "", []):
+        for data_id in data_by_path.get(candidate["file_path"] or "", [])[:2]:
             _insert_business_edge_seed(
                 conn,
                 project_id,
@@ -3404,6 +3557,13 @@ def _ensure_business_graph_seed(conn, snapshot_id: str) -> None:
                 created_by="source_index",
                 now=now,
             )
+
+    reconcile_project_business_graph(
+        conn,
+        project_id,
+        snapshot_id,
+        now=now,
+    )
 
 
 def _candidate_risk_node_id(snapshot_id: str, candidate) -> str:
@@ -3528,9 +3688,11 @@ def _insert_business_node_seed(
         INSERT OR IGNORE INTO business_nodes (
             id, project_id, node_type, title, description, risk_level,
             review_status, coverage_note, last_intent_id, risk_tags_json,
-            evidence_json, source_snapshot_id, confidence, created_by, created_at, updated_at
+            evidence_json, source_snapshot_id, confidence, semantic_key,
+            graph_layer, source_kind, evidence_status, contributors_json,
+            revision, created_by, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'static_index', ?, ?, 1, ?, ?, ?)
         """,
         (
             node_id,
@@ -3545,6 +3707,10 @@ def _insert_business_node_seed(
             json.dumps(evidence[:5], ensure_ascii=False),
             snapshot_id,
             confidence,
+            f"source:{node_id}",
+            "audit" if node_type == "risk" else "evidence",
+            "source_backed" if evidence else "inferred",
+            json.dumps([created_by], ensure_ascii=False),
             created_by,
             now,
             now,
@@ -3569,9 +3735,10 @@ def _insert_business_edge_seed(
         """
         INSERT OR IGNORE INTO business_edges (
             id, project_id, from_node_id, to_node_id, relation,
-            description, confidence, created_by, created_at
+            description, confidence, graph_layer, source_kind,
+            contributors_json, revision, created_by, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'static_index', ?, 1, ?, ?)
         """,
         (
             edge_id,
@@ -3581,6 +3748,8 @@ def _insert_business_edge_seed(
             relation,
             description,
             confidence,
+            "audit" if relation == "risk_of" else "evidence",
+            json.dumps([created_by], ensure_ascii=False),
             created_by,
             now,
         ),

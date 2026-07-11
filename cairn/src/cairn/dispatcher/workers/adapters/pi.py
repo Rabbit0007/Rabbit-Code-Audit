@@ -111,11 +111,25 @@ class PiDriver(WorkerDriver):
     def _wrap_with_models(self, worker: WorkerConfig, pi_argv: list[str], *, enable_tools: bool = True) -> list[str]:
         script = (
             'agent_dir="$1"\n'
-            'models_json="$2"\n'
-            "shift 2\n"
+            "shift 1\n"
             'mkdir -p "$agent_dir"\n'
             'mkdir -p "$agent_dir/sessions"\n'
-            'printf "%s" "$models_json" > "$agent_dir/models.json"\n'
+            'python3 - "$agent_dir/models.json" <<\'PY\'\n'
+            'import json, os, sys\n'
+            'model = {"id": os.environ["PI_MODEL"], "name": os.environ["PI_MODEL"]}\n'
+            'context_window = os.environ.get("PI_MODEL_CONTEXT_WINDOW")\n'
+            'if context_window:\n'
+            '    model["contextWindow"] = int(context_window)\n'
+            'payload = {"providers": {"cairn": {\n'
+            '    "baseUrl": os.environ["PI_BASE_URL"],\n'
+            '    "api": os.environ["PI_PROVIDER_API"],\n'
+            '    "apiKey": os.environ["PI_API_KEY"],\n'
+            '    "models": [model],\n'
+            '}}}\n'
+            'with open(sys.argv[1], "w", encoding="utf-8") as handle:\n'
+            '    json.dump(payload, handle, ensure_ascii=True, separators=(",", ":"))\n'
+            'os.chmod(sys.argv[1], 0o600)\n'
+            'PY\n'
             'exec env PI_CODING_AGENT_DIR="$agent_dir" pi "$@"\n'
         )
         argv = [
@@ -133,7 +147,6 @@ class PiDriver(WorkerDriver):
             script,
             "--",
             self._agent_dir(worker),
-            self._models_json(worker),
             *argv,
             *pi_argv,
         ]
@@ -211,23 +224,3 @@ class PiDriver(WorkerDriver):
             if isinstance(text, str) and text:
                 parts.append(text)
         return "\n".join(parts).strip()
-
-    @staticmethod
-    def _models_json(worker: WorkerConfig) -> str:
-        env = worker.env
-        model: dict[str, Any] = {
-            "id": env["PI_MODEL"],
-            "name": env["PI_MODEL"],
-        }
-        context_window = env.get("PI_MODEL_CONTEXT_WINDOW")
-        if context_window:
-            model["contextWindow"] = int(context_window)
-
-        provider: dict[str, Any] = {
-            "baseUrl": env["PI_BASE_URL"],
-            "api": env["PI_PROVIDER_API"],
-            "apiKey": env["PI_API_KEY"],
-            "models": [model],
-        }
-        payload = {"providers": {"cairn": provider}}
-        return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))

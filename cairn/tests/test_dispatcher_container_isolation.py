@@ -46,3 +46,26 @@ def test_container_manager_uses_configured_prefixes(monkeypatch):
 
     assert manager.container_name("proj/1") == "rabbit-audit-dispatch-proj-1"
     assert manager.managed_container_names() == ["rabbit-audit-dispatch-proj_1"]
+
+
+def test_project_workers_mount_distinct_isolated_artifact_volumes(monkeypatch):
+    monkeypatch.setattr(containers.docker, "from_env", lambda: _FakeDockerClient([]))
+    manager = ContainerManager(
+        ContainerConfig(
+            image="worker:latest",
+            network_mode="rabbit-audit-worker-net",
+            completed_action="stop",
+            artifact_volume="rabbit-audit-artifacts",
+        )
+    )
+
+    first = manager._container_volumes("proj_1")
+    second = manager._container_volumes("proj_2")
+
+    assert set(first) == {"rabbit-audit-artifacts-proj_1"}
+    assert set(second) == {"rabbit-audit-artifacts-proj_2"}
+    assert first["rabbit-audit-artifacts-proj_1"] == {
+        "bind": "/audit-data",
+        "mode": "ro",
+    }
+    assert "rabbit-audit-artifacts" not in first

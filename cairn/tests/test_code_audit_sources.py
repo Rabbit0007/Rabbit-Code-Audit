@@ -12,7 +12,7 @@ import yaml
 
 from cairn.dispatcher.contracts import validate_explore_payload
 from cairn.server.code_index import CodeSymbolRecord, _call_relationships
-from cairn.server import db
+from cairn.server import db, source_service
 from cairn.server.routers import business_graph, export, findings, intents, projects, review_tasks, sources, vulnerabilities
 from cairn.server.services import utcnow
 from cairn.server.source_models import CodeFile
@@ -775,7 +775,6 @@ class User(models.Model):
         for summary in audit_context["entrypoint_summaries"]
     )
     focus_packs = audit_context["planner_focus_packs"]
-    assert audit_context["audit_packs"] == focus_packs
     assert focus_packs
     assert any(
         data_flow["id"] in pack["candidate_ids"]
@@ -786,13 +785,12 @@ class User(models.Model):
         and pack["audit_focus"]
         for pack in focus_packs
     )
-    traces = audit_context["candidate_entrypoint_traces"]
+    traces = audit_context["entrypoint_traces"]
     assert any(
         trace["candidate_id"] == data_flow["id"]
         and trace["path_chain"][:2] == ["app/api.py", "app/services.py"]
         for trace in traces
     )
-    assert audit_context["entrypoint_traces"] == audit_context["candidate_entrypoint_traces"]
 
     reindexed = client.post(f"/api/projects/{project_id}/sources/{snapshot['id']}/reindex")
     assert reindexed.status_code == 200
@@ -802,6 +800,49 @@ class User(models.Model):
     edge_ids = [item["id"] for item in graph_after["edges"]]
     assert len(node_ids) == len(set(node_ids))
     assert len(edge_ids) == len(set(edge_ids))
+
+
+def test_data_object_index_keeps_sql_identifiers_and_rejects_prose(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    payload = _zip_bytes(
+        {
+            "demo/app.php": b"""<?php
+// update the counter in database
+echo "Read records from only random table from Database";
+$query = "SELECT * FROM `security`.`users` WHERE id = 1";
+$update = "UPDATE accounts SET locked = 1 WHERE id = 1";
+$insert = "INSERT INTO `audit`.`events` (`name`) VALUES ('login')";
+""",
+            "demo/readme.md": b"Use git from within your project and update the database.",
+            "demo/index.html": b"<title>Dump into Outfile</title>",
+        }
+    )
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("data-object-quality.zip", payload, "application/zip")},
+    ).json()
+
+    symbols = client.get(
+        f"/api/projects/{project_id}/sources/{snapshot['id']}/symbols"
+    ).json()
+    names = {
+        item["name"]
+        for item in symbols
+        if item["kind"] == "data_object"
+    }
+    assert {"security.users", "accounts", "audit.events"} <= names
+    assert not names & {
+        "Database",
+        "Outfile",
+        "database",
+        "only",
+        "the",
+        "within",
+        "your",
+    }
 
 
 def test_source_index_uses_import_scope_for_object_method_business_flow(temp_db, monkeypatch, tmp_path):
@@ -1481,12 +1522,19 @@ class Job:
         for edge in graph["edges"]
     )
 
+    def fail_on_lazy_index_ensure(snapshot):
+        raise AssertionError("export must not rebuild or mutate source indexes")
+
+    monkeypatch.setattr(source_service, "_ensure_code_index", fail_on_lazy_index_ensure)
     reason_export = client.get(
         f"/projects/{project_id}/export",
         params={"format": "yaml", "profile": "reason"},
     )
     reason_data = yaml.safe_load(reason_export.text)
-    assert reason_data["code_index"]["capabilities"]
+    assert any(
+        item["capabilities"]
+        for item in reason_data["code_index"]["audit_context"]["file_slices"]
+    )
     high_risk_ids = {
         item["id"] for item in reason_data["audit_candidates"]["coverage"]["high_risk_unresolved"]
     }
@@ -2316,6 +2364,7 @@ def test_high_severity_finding_requires_quality_evidence_and_infers_business_nod
     )
     assert inferred_business_node.status_code == 201
     assert inferred_business_node.json()["business_node_id"]
+    inferred_finding = inferred_business_node.json()
 
     valid = client.post(
         f"/api/projects/{project_id}/audit-findings",
@@ -2336,7 +2385,8 @@ def test_high_severity_finding_requires_quality_evidence_and_infers_business_nod
         },
     )
     assert valid.status_code == 201
-    assert valid.json()["business_node_id"] == node["id"]
+    assert valid.json()["id"] == inferred_finding["id"]
+    assert valid.json()["business_node_id"] == inferred_finding["business_node_id"]
 
     static_poc = client.post(
         f"/api/projects/{project_id}/audit-findings",
@@ -2460,7 +2510,7 @@ def test_duplicate_audit_findings_share_cluster_and_reuse_existing_record(temp_d
         json={
             "snapshot_id": snapshot["id"],
             "title": "same reflected xss with static poc",
-            "category": "xss",
+            "category": "Cross-Site Scripting (XSS)",
             "severity": "high",
             "file_path": "app.php",
             "line_start": 1,
@@ -2476,6 +2526,7 @@ def test_duplicate_audit_findings_share_cluster_and_reuse_existing_record(temp_d
     assert first.status_code == 201
     assert second.status_code == 201
     assert second.json()["id"] == first.json()["id"]
+    assert second.json()["category"] == "xss"
     assert second.json()["cluster_key"] == first.json()["cluster_key"]
     assert second.json()["reproduction_poc"]["payload"] == "<script>alert(1)</script>"
     findings = client.get(f"/api/projects/{project_id}/audit-findings").json()
@@ -2709,3 +2760,48 @@ def test_confirmed_finding_backfills_index_candidate_and_business_node(temp_db, 
     )
     assert node["review_status"] == "covered"
     assert "已确认 finding 闭合该审计对象" in node["coverage_note"]
+
+
+def test_relevance_compaction_preserves_focused_open_candidate_within_hard_budget():
+    data = {
+        "context_profile": {"focused_candidate_ids": ["cand_focus"]},
+        "audit_candidates": {
+            "items": [
+                {
+                    "id": "cand_focus",
+                    "status": "investigating",
+                    "severity": "high",
+                    "description": "required evidence " + "x" * 2_000,
+                },
+                *[
+                    {
+                        "id": f"cand_done_{index}",
+                        "status": "confirmed",
+                        "severity": "medium",
+                        "description": "historical " + "x" * 4_000,
+                    }
+                    for index in range(80)
+                ],
+            ]
+        },
+        "business_graph": {"nodes": []},
+        "audit_findings": [
+            {
+                "id": f"finding_{index}",
+                "status": "confirmed",
+                "description": "known issue " + "x" * 4_000,
+            }
+            for index in range(80)
+        ],
+        "facts": [{"id": "origin"}, {"id": "goal"}],
+        "intents": [],
+    }
+
+    text = export._fit_context_to_budget(data, "explore", 480 * 1024)
+    compacted = yaml.safe_load(text)
+
+    assert len(text.encode("utf-8")) <= 480 * 1024
+    assert any(
+        item["id"] == "cand_focus"
+        for item in compacted["audit_candidates"]["items"]
+    )

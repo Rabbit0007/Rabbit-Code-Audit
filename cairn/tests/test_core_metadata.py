@@ -272,8 +272,8 @@ def test_audit_finding_evidence_level_upgrades_after_independent_review(temp_db)
     )
     assert reviewed.status_code == 200
     assert reviewed.json()["status"] == "confirmed"
-    assert reviewed.json()["evidence_level"] == "L5"
+    assert reviewed.json()["evidence_level"] == "L3"
 
     exported = client.get(f"/projects/{project_id}/export?format=yaml")
     data = yaml.safe_load(exported.text)
-    assert data["audit_findings"][0]["evidence_level"] == "L5"
+    assert data["audit_findings"][0]["evidence_level"] == "L3"
