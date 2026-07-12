@@ -36,6 +36,15 @@ class SettingsHealthStats(BaseModel):
     export_records: int = 0
     audit_entries: int = 0
     notifications_unread: int = 0
+    open_intents: int = 0
+    pending_tool_tasks: int = 0
+    pending_review_tasks: int = 0
+    pending_report_tasks: int = 0
+    failed_tasks: int = 0
+    database_bytes: int = 0
+    disk_free_bytes: int = 0
+    backup_count: int = 0
+    latest_backup_at: str | None = None
 
 
 class SettingsHealthResponse(BaseModel):

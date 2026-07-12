@@ -34,6 +34,8 @@ from cairn.server.source_models import (
     SourceIndexSummary,
     SourceBootstrapBrief,
     SourceBootstrapCandidate,
+    SourceFileChange,
+    SourceImpactAnalysis,
     SourceSnapshot,
 )
 
@@ -609,6 +611,169 @@ def list_code_files(project_id: str, snapshot_id: str, limit: int = 5000) -> lis
         )
         for row in rows
     ]
+
+
+def analyze_source_impact(
+    project_id: str,
+    target_snapshot_id: str,
+    *,
+    base_snapshot_id: str | None = None,
+) -> SourceImpactAnalysis:
+    target = get_snapshot(project_id, target_snapshot_id)
+    if target.status != "ready":
+        raise ValueError("Target source snapshot is not ready")
+    with db.get_conn() as conn:
+        if base_snapshot_id is None:
+            previous = conn.execute(
+                """
+                SELECT id FROM source_snapshots
+                WHERE project_id = ? AND status = 'ready' AND created_at < ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (project_id, target.created_at),
+            ).fetchone()
+            base_snapshot_id = previous["id"] if previous else None
+        if base_snapshot_id:
+            base_row = conn.execute(
+                """
+                SELECT id FROM source_snapshots
+                WHERE id = ? AND project_id = ? AND status = 'ready'
+                """,
+                (base_snapshot_id, project_id),
+            ).fetchone()
+            if base_row is None:
+                raise ValueError("Base source snapshot not found or not ready")
+
+        def load_files(snapshot_id: str | None) -> dict[str, dict]:
+            if not snapshot_id:
+                return {}
+            rows = conn.execute(
+                "SELECT path, sha256, language FROM code_files WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchall()
+            return {row["path"]: dict(row) for row in rows}
+
+        base_files = load_files(base_snapshot_id)
+        target_files = load_files(target_snapshot_id)
+        changes: list[SourceFileChange] = []
+        unchanged = 0
+        for path in sorted(set(base_files) | set(target_files)):
+            old = base_files.get(path)
+            new = target_files.get(path)
+            if old is None:
+                change_type = "added"
+            elif new is None:
+                change_type = "deleted"
+            elif old["sha256"] != new["sha256"]:
+                change_type = "modified"
+            else:
+                unchanged += 1
+                continue
+            changes.append(
+                SourceFileChange(
+                    path=path,
+                    change_type=change_type,
+                    language=(new or old or {}).get("language"),
+                    old_sha256=old["sha256"] if old else None,
+                    new_sha256=new["sha256"] if new else None,
+                )
+            )
+
+        changed_paths = {item.path for item in changes}
+        impacted_paths = set(changed_paths)
+        relationship_snapshots = [target_snapshot_id] + ([base_snapshot_id] if base_snapshot_id else [])
+        placeholders = ",".join("?" for _ in relationship_snapshots)
+        relationships = conn.execute(
+            f"""
+            SELECT from_path, to_path FROM code_relationships
+            WHERE snapshot_id IN ({placeholders})
+            """,
+            relationship_snapshots,
+        ).fetchall()
+        adjacency: dict[str, set[str]] = {}
+        for row in relationships:
+            adjacency.setdefault(row["from_path"], set()).add(row["to_path"])
+            adjacency.setdefault(row["to_path"], set()).add(row["from_path"])
+        frontier = set(changed_paths)
+        for _depth in range(2):
+            frontier = {neighbor for path in frontier for neighbor in adjacency.get(path, set())} - impacted_paths
+            impacted_paths.update(frontier)
+            if not frontier:
+                break
+
+        entrypoint_rows = conn.execute(
+            f"""
+            SELECT method, route, path FROM code_entrypoints
+            WHERE snapshot_id IN ({placeholders})
+            """,
+            relationship_snapshots,
+        ).fetchall()
+        impacted_entrypoints = sorted(
+            {
+                " ".join(part for part in (row["method"], row["route"]) if part).strip()
+                for row in entrypoint_rows
+                if row["path"] in impacted_paths
+            }
+        )
+        node_rows = conn.execute(
+            "SELECT id, title, description, evidence_json FROM business_nodes WHERE project_id = ?",
+            (project_id,),
+        ).fetchall()
+        impacted_business_nodes = sorted(
+            row["id"]
+            for row in node_rows
+            if any(
+                path in f"{row['title']}\n{row['description']}\n{row['evidence_json']}"
+                for path in impacted_paths
+            )
+        )
+        candidate_rows = conn.execute(
+            """
+            SELECT id, file_path FROM audit_candidates
+            WHERE project_id = ? AND snapshot_id = ?
+            """,
+            (project_id, target_snapshot_id),
+        ).fetchall()
+        impacted_candidates = sorted(
+            row["id"] for row in candidate_rows if row["file_path"] in impacted_paths
+        )
+
+    added = sum(item.change_type == "added" for item in changes)
+    modified = sum(item.change_type == "modified" for item in changes)
+    deleted = sum(item.change_type == "deleted" for item in changes)
+    total_reference = max(1, len(base_files), len(target_files))
+    change_ratio = len(changes) / total_reference
+    reasons: list[str] = []
+    if base_snapshot_id is None:
+        reasons.append("没有可比较的历史快照，首次审计应覆盖全部源码")
+    if change_ratio >= 0.35:
+        reasons.append(f"变更文件占比 {change_ratio:.0%}，超过增量审计阈值 35%")
+    manifest_names = {
+        "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+        "requirements.txt", "poetry.lock", "pyproject.toml", "pom.xml",
+        "build.gradle", "go.mod", "go.sum", "cargo.toml", "cargo.lock",
+        "composer.json", "composer.lock",
+    }
+    if any(PurePosixPath(item.path).name.lower() in manifest_names for item in changes):
+        reasons.append("依赖清单或锁文件发生变化，需要重新检查供应链风险")
+    if any(item.change_type == "deleted" for item in changes):
+        reasons.append("存在删除文件，需要确认入口、鉴权或安全控制是否被移除")
+    return SourceImpactAnalysis(
+        project_id=project_id,
+        base_snapshot_id=base_snapshot_id,
+        target_snapshot_id=target_snapshot_id,
+        unchanged_file_count=unchanged,
+        added_file_count=added,
+        modified_file_count=modified,
+        deleted_file_count=deleted,
+        changed_files=changes,
+        impacted_paths=sorted(impacted_paths),
+        impacted_entrypoints=impacted_entrypoints,
+        impacted_business_node_ids=impacted_business_nodes,
+        impacted_candidate_ids=impacted_candidates,
+        full_reaudit_recommended=bool(reasons),
+        recommendation_reasons=reasons,
+    )
 
 
 def get_source_index_summary(project_id: str, snapshot_id: str) -> SourceIndexSummary:

@@ -250,7 +250,7 @@ def test_business_graph_merges_duplicate_edges(temp_db):
     assert len(client.get(f"/api/projects/{project_id}/business-graph").json()["edges"]) == 1
 
 
-def test_business_graph_keeps_unverified_evidence_state_separate_from_review_status(temp_db):
+def test_business_graph_reopens_unverified_model_node_instead_of_marking_it_covered(temp_db):
     client = _client(temp_db)
     project_id = _create_project(client)
     node = client.post(
@@ -263,8 +263,120 @@ def test_business_graph_keeps_unverified_evidence_state_separate_from_review_sta
         },
     ).json()
 
-    assert node["review_status"] == "covered"
+    assert node["review_status"] == "investigating"
     assert node["evidence_status"] == "unverified"
+
+
+def test_reason_graph_view_prioritizes_semantics_without_shrinking_full_coverage(temp_db, monkeypatch):
+    client = _client(temp_db)
+    project_id = _create_project(client)
+
+    for index in range(5):
+        client.post(
+            f"/api/projects/{project_id}/business-graph/nodes",
+            json={
+                "node_type": "endpoint",
+                "semantic_key": f"source:endpoint:{index}",
+                "title": f"静态入口 {index}",
+                "risk_level": "medium",
+                "created_by": "source_index",
+            },
+        )
+    semantic = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "feature",
+            "semantic_key": "feature:order_refund",
+            "title": "订单退款",
+            "risk_level": "medium",
+            "created_by": "worker-a",
+        },
+    ).json()
+    audit = client.post(
+        f"/api/projects/{project_id}/business-graph/nodes",
+        json={
+            "node_type": "risk",
+            "semantic_key": "risk:refund_replay",
+            "title": "重复退款风险",
+            "risk_level": "high",
+            "created_by": "worker-b",
+        },
+    ).json()
+
+    monkeypatch.setattr(export, "REASON_GRAPH_NODE_LIMIT", 2)
+    response = client.get(f"/projects/{project_id}/export?format=yaml&profile=reason")
+    assert response.status_code == 200
+    graph = yaml.safe_load(response.text)["business_graph"]
+
+    assert graph["coverage"]["total_nodes"] == 7
+    assert graph["view"]["nodes_included"] == 2
+    assert {node["id"] for node in graph["nodes"]} == {semantic["id"], audit["id"]}
+
+
+def test_context_budget_keeps_business_semantics_and_removes_dangling_edges():
+    semantic_nodes = [
+        {
+            "id": f"semantic-{index}",
+            "graph_layer": "semantic",
+            "review_status": "covered",
+            "description": "业务语义" * 200,
+        }
+        for index in range(2)
+    ]
+    evidence_nodes = [
+        {
+            "id": f"evidence-{index}",
+            "graph_layer": "evidence",
+            "review_status": "covered",
+            "description": "静态证据" * 200,
+        }
+        for index in range(30)
+    ]
+    nodes = [*evidence_nodes, *semantic_nodes]
+    edges = [
+        {
+            "id": f"edge-{index}",
+            "from": nodes[index]["id"],
+            "to": nodes[index + 1]["id"],
+            "relation": "relates_to",
+        }
+        for index in range(len(nodes) - 1)
+    ]
+    data = {
+        "context_profile": {"focused_candidate_ids": [], "required_fact_ids": []},
+        "business_graph": {
+            "coverage": {"total_nodes": len(nodes)},
+            "view": {
+                "nodes_included": len(nodes),
+                "nodes_omitted": 0,
+                "edges_included": len(edges),
+                "edges_omitted": 0,
+            },
+            "nodes": nodes,
+            "edges": edges,
+        },
+        "audit_candidates": {"items": []},
+        "audit_findings": [],
+        "facts": [],
+        "intents": [],
+    }
+
+    text = export._fit_context_to_budget(
+        data,
+        "reason",
+        6_000,
+        hard_max_bytes=50_000,
+    )
+    graph = yaml.safe_load(text)["business_graph"]
+    visible_ids = {node["id"] for node in graph["nodes"]}
+
+    assert {"semantic-0", "semantic-1"} <= visible_ids
+    assert graph["view"]["nodes_included"] == len(graph["nodes"])
+    assert graph["view"]["nodes_omitted"] == 32 - len(graph["nodes"])
+    assert all(
+        edge["from"] in visible_ids and edge["to"] in visible_ids
+        for edge in graph["edges"]
+    )
 
 
 def test_business_graph_validates_model_evidence_and_calibrates_confidence(

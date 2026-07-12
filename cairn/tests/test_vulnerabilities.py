@@ -23,8 +23,10 @@ Covers requirements 6.1-6.7, 7.1-7.6, 8.1-8.6.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
+import zipfile
 
 import pytest
 from fastapi import FastAPI
@@ -867,6 +869,8 @@ def test_export_markdown_content_and_scope(client, populated):
     assert resp.status_code == 200
     assert "text/markdown" in resp.headers["content-type"]
     assert "p1.md" in resp.headers["content-disposition"]
+    assert len(resp.headers["x-content-sha256"]) == 64
+    assert resp.headers["digest"].startswith("sha-256=")
     text = resp.text
     assert text.startswith("# Alpha - 代码审计报告")
     assert "## 执行摘要" in text
@@ -879,16 +883,22 @@ def test_export_markdown_content_and_scope(client, populated):
     assert "#### 复测记录模板" in text
     assert "#### 复测操作手册" in text
     assert "证据口径" in text
+    assert "### 源码版本与完整性" in text
+    assert "OWASP Top 10" in text
+    assert "CVSS v3.1" in text
+    assert "证据 SHA-256" in text
     assert "Beta" not in text
 
 
 def test_export_pdf_content(client, populated):
-    """PDF export returns a downloadable PDF report."""
+    """PDF export embeds its font so Chinese renders without client fonts."""
     resp = client.get("/api/vulnerabilities/export", params={"format": "pdf"})
     assert resp.status_code == 200
     assert "application/pdf" in resp.headers["content-type"]
     assert "vulnerabilities.pdf" in resp.headers["content-disposition"]
     assert resp.content.startswith(b"%PDF-")
+    assert b"/FontFile2" in resp.content
+    assert len(resp.content) > 50_000
 
 
 def test_export_docx_content(client, populated):
@@ -901,6 +911,46 @@ def test_export_docx_content(client, populated):
     )
     assert "vulnerabilities.docx" in resp.headers["content-disposition"]
     assert resp.content.startswith(b"PK")
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as archive:
+        document = archive.read("word/document.xml").decode("utf-8")
+        assert "源码版本与完整性" in document
+        assert "OWASP Top 10" in document
+        assert "CVSS v3.1" in document
+        assert "证据 SHA-256" in document
+        assert "word/footer1.xml" in archive.namelist()
+
+
+def test_export_delivery_bundle_contains_verified_multiformat_reports(client, populated):
+    """Delivery bundle contains human and machine-readable reports with verified hashes."""
+    resp = client.get(
+        "/api/vulnerabilities/export",
+        params={"format": "bundle", "project_id": "p1"},
+    )
+    assert resp.status_code == 200
+    assert "application/zip" in resp.headers["content-type"]
+    assert "p1.zip" in resp.headers["content-disposition"]
+
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as archive:
+        names = set(archive.namelist())
+        expected = {
+            "01-code-audit-report.docx",
+            "01-code-audit-report.pdf",
+            "01-code-audit-report.md",
+            "02-findings.json",
+            "README.txt",
+            "MANIFEST.json",
+        }
+        assert expected <= names
+        manifest = json.loads(archive.read("MANIFEST.json"))
+        assert manifest["schema_version"] == "rabbit-code-audit-delivery/v1"
+        assert manifest["report_id"].startswith("RCA-")
+        assert manifest["scope"]["project_ids"] == ["p1"]
+        assert manifest["delivery_quality"]["total"] == populated["p1_total"]
+        assert manifest["files"]
+        for item in manifest["files"]:
+            body = archive.read(item["path"])
+            assert item["size_bytes"] == len(body)
+            assert item["sha256"] == hashlib.sha256(body).hexdigest()
 
 
 # ---------------------------------------------------------------------------

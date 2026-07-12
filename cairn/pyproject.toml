@@ -15,6 +15,7 @@ dependencies = [
     "requests>=2.32.3",
     "bcrypt>=4.1",
     "python-multipart>=0.0.20",
+    "reportlab>=4.4,<5",
 ]
 
 [project.scripts]

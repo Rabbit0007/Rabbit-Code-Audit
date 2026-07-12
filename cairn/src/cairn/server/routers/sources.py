@@ -15,6 +15,7 @@ from cairn.server.source_models import (
     SourceBootstrapBrief,
     SourceIndexQuality,
     SourceIndexSummary,
+    SourceImpactAnalysis,
     SourceSnapshot,
 )
 from cairn.server.source_service import (
@@ -31,6 +32,7 @@ from cairn.server.source_service import (
     list_code_symbols,
     list_dependency_manifests,
     list_snapshots,
+    analyze_source_impact,
     reindex_source_snapshot,
     snapshot_container_path,
 )
@@ -94,6 +96,14 @@ def get_source_index(project_id: str, snapshot_id: str):
 def get_source_quality(project_id: str, snapshot_id: str):
     try:
         return get_source_index_quality(project_id, snapshot_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.get("/{snapshot_id}/changes", response_model=SourceImpactAnalysis)
+def get_source_changes(project_id: str, snapshot_id: str, base_snapshot_id: str | None = None):
+    try:
+        return analyze_source_impact(project_id, snapshot_id, base_snapshot_id=base_snapshot_id)
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
 

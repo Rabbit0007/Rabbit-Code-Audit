@@ -541,6 +541,12 @@ def _load_business_graph(
 def _business_node_effective_review(row, conclusion) -> tuple[str, str | None]:
     status = row["review_status"] or "unreviewed"
     coverage_note = row["coverage_note"]
+    if (
+        status == "covered"
+        and row["source_kind"] in ("model", "mixed")
+        and row["evidence_status"] != "source_backed"
+    ):
+        status = "investigating"
     if conclusion is None:
         return status, coverage_note
     if (
@@ -573,6 +579,7 @@ def _select_business_graph_rows(
 ):
     node_by_id = {row["id"]: row for row in nodes}
     include_ids: set[str] = set()
+    focused_node_ids: set[str] = set()
     if focus_candidate_ids:
         rows = conn.execute(
             f"""
@@ -584,8 +591,11 @@ def _select_business_graph_rows(
             """,
             (project_id, *sorted(focus_candidate_ids)),
         ).fetchall()
-        include_ids.update(row["business_node_id"] for row in rows)
+        focused_node_ids.update(row["business_node_id"] for row in rows)
+        include_ids.update(focused_node_ids)
     for row in nodes:
+        if row["graph_layer"] == "semantic":
+            include_ids.add(row["id"])
         if (
             row["graph_layer"] != "evidence"
             and row["risk_level"] in ("critical", "high", "unknown")
@@ -620,7 +630,47 @@ def _select_business_graph_rows(
                 adjacent_ids.add(neighbor_id)
                 evidence_neighbors.add(neighbor_id)
     limit = EXPLORE_GRAPH_NODE_LIMIT if profile == "explore" else REASON_GRAPH_NODE_LIMIT
-    ordered_ids = [row["id"] for row in nodes if row["id"] in adjacent_ids][:limit]
+    risk_rank = {"critical": 0, "high": 1, "unknown": 2, "medium": 3, "low": 4}
+    type_rank = {
+        "role": 0,
+        "state": 1,
+        "feature": 2,
+        "asset": 3,
+        "data_object": 4,
+        "control": 5,
+        "endpoint": 6,
+        "external_system": 7,
+        "risk": 8,
+    }
+
+    def graph_priority(row) -> tuple:
+        is_open = row["review_status"] in ("unreviewed", "investigating", "blocked")
+        if row["id"] in focused_node_ids:
+            group = 0
+        elif row["graph_layer"] == "semantic" and row["risk_level"] in ("critical", "high", "unknown"):
+            group = 1
+        elif row["graph_layer"] == "audit" and is_open and row["risk_level"] in ("critical", "high", "unknown"):
+            group = 2
+        elif row["graph_layer"] == "semantic":
+            group = 3
+        elif row["graph_layer"] != "evidence" and is_open:
+            group = 4
+        else:
+            group = 5
+        return (
+            group,
+            risk_rank.get(row["risk_level"], 5),
+            0 if row["evidence_status"] == "source_backed" else 1,
+            type_rank.get(row["node_type"], 9),
+            -float(row["confidence"] or 0),
+            row["id"],
+        )
+
+    ordered_rows = sorted(
+        (row for row in nodes if row["id"] in adjacent_ids),
+        key=graph_priority,
+    )[:limit]
+    ordered_ids = [row["id"] for row in ordered_rows]
     selected_ids = set(ordered_ids)
     selected_nodes = [node_by_id[node_id] for node_id in ordered_ids if node_id in node_by_id]
     selected_edges = [
@@ -2615,10 +2665,32 @@ def _fit_context_to_budget(
     focused = set(context_profile.get("focused_candidate_ids") or [])
     required_fact_ids = set(context_profile.get("required_fact_ids") or [])
     candidate_items = (data.get("audit_candidates") or {}).get("items") or []
-    business_nodes = (data.get("business_graph") or {}).get("nodes") or []
+    business_graph = data.get("business_graph") or {}
+    business_nodes = business_graph.get("nodes") or []
+    business_edges = business_graph.get("edges") or []
+    business_view = business_graph.get("view") or {}
+    total_business_nodes = int(business_view.get("nodes_included") or len(business_nodes)) + int(
+        business_view.get("nodes_omitted") or 0
+    )
+    total_business_edges = int(business_view.get("edges_included") or len(business_edges)) + int(
+        business_view.get("edges_omitted") or 0
+    )
     audit_findings = data.get("audit_findings") or []
     intents = data.get("intents") or []
     facts = data.get("facts") or []
+
+    def sync_business_graph_view() -> None:
+        visible_ids = {row.get("id") for row in business_nodes}
+        business_edges[:] = [
+            row
+            for row in business_edges
+            if row.get("from") in visible_ids and row.get("to") in visible_ids
+        ]
+        business_view["nodes_included"] = len(business_nodes)
+        business_view["nodes_omitted"] = max(0, total_business_nodes - len(business_nodes))
+        business_view["edges_included"] = len(business_edges)
+        business_view["edges_omitted"] = max(0, total_business_edges - len(business_edges))
+
     def serialize_if_fit() -> str | None:
         text = yaml.dump(data, allow_unicode=True, default_flow_style=False, sort_keys=False)
         if len(text.encode("utf-8")) <= max_bytes:
@@ -2645,11 +2717,19 @@ def _fit_context_to_budget(
     if text := serialize_if_fit():
         return text
 
-    unresolved_nodes = [
-        row for row in business_nodes if row.get("review_status") != "covered"
+    unresolved_nodes = [row for row in business_nodes if row.get("review_status") != "covered"]
+    covered_semantic_nodes = [
+        row
+        for row in business_nodes
+        if row.get("review_status") == "covered" and row.get("graph_layer") == "semantic"
     ]
-    covered_nodes = [row for row in business_nodes if row.get("review_status") == "covered"]
-    business_nodes[:] = [*unresolved_nodes, *covered_nodes[-20:]]
+    covered_other_nodes = [
+        row
+        for row in business_nodes
+        if row.get("review_status") == "covered" and row.get("graph_layer") != "semantic"
+    ]
+    business_nodes[:] = [*unresolved_nodes, *covered_semantic_nodes, *covered_other_nodes[-12:]]
+    sync_business_graph_view()
     if text := serialize_if_fit():
         return text
 

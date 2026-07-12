@@ -67,6 +67,10 @@ class ContainerManager:
                 name=name,
                 network_mode=self._config.network_mode,
                 cap_add=self._config.cap_add or None,
+                cap_drop=["ALL"],
+                security_opt=["no-new-privileges:true"],
+                init=True,
+                pids_limit=512,
                 volumes=self._container_volumes(project_id),
             )
             LOG.info("created container project=%s container=%s", project_id, name)
@@ -103,6 +107,10 @@ class ContainerManager:
                 name=name,
                 network_mode=self._config.network_mode,
                 cap_add=self._config.cap_add or None,
+                cap_drop=["ALL"],
+                security_opt=["no-new-privileges:true"],
+                init=True,
+                pids_limit=512,
                 volumes=None,
             )
         except DockerException as exc:

@@ -15,16 +15,23 @@ Response shapes follow :mod:`cairn.server.vulnerabilities_models`.
 from __future__ import annotations
 
 import csv
+import base64
 import hashlib
 import io
 import json
 import re
 import zipfile
+from pathlib import Path
 from urllib.parse import urlsplit
 from xml.sax.saxutils import escape as xml_escape
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
+from reportlab.lib.colors import HexColor
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
 
 from datetime import datetime, timezone
 
@@ -1346,6 +1353,7 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
     audit_details = _load_audit_finding_report_details(vulnerabilities)
     delivery_quality = _delivery_quality(vulnerabilities, report_enrichments)
     coverage = _load_delivery_coverage(vulnerabilities)
+    source_inventory = _source_inventory(vulnerabilities)
     report_id = _delivery_report_id(vulnerabilities)
     project_count = len(_unique([v.project_id for v in vulnerabilities]))
     severity_scope = "、".join(
@@ -1398,6 +1406,18 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
         "- **证据口径**：L3 表示源码证据和静态 PoC 已闭环；L5 仅用于真实动态验证或等价实测证据",
         "- **范围限制**：未提供的运行配置、生产网关策略、外部依赖、账号权限和真实数据不在静态结论覆盖范围内",
         "- **复测要求**：仅在取得授权的隔离测试环境执行，先备份数据并准备可回滚账号",
+        "",
+        "### 源码版本与完整性",
+        "",
+        "| 项目 | 快照 | Git Commit / Ref | 快照 SHA-256 | 文件数 |",
+        "| --- | --- | --- | --- | ---: |",
+        *[
+            f"| {_md_escape(str(item['project_name']))} | `{item['snapshot_id']}` | "
+            f"`{_md_escape(str(item.get('resolved_commit') or item.get('requested_ref') or 'ZIP'))}` | "
+            f"`{_md_escape(str(item.get('snapshot_sha256') or item.get('archive_sha256') or '未记录'))}` | "
+            f"{item.get('file_count') or 0} |"
+            for item in source_inventory
+        ],
         "",
         "## 交付质量与剩余风险",
         "",
@@ -1508,7 +1528,10 @@ def _render_markdown_export(vulnerabilities: list[Vulnerability]) -> str:
                     f"| Finding ID | `{_md_escape(str(audit_detail.get('id') or vuln.fact_id))}` |",
                     f"| 漏洞分类 | {_md_escape(str(audit_detail.get('category') or '未记录'))} |",
                     f"| CWE | {_md_escape(str(audit_detail.get('cwe') or '未记录'))} |",
+                    f"| OWASP Top 10 | {_md_escape(_owasp_category(audit_detail.get('cwe')))} |",
+                    "| CVSS v3.1 | 未定向评分；需结合部署环境、权限前提和实际影响确定向量 |",
                     f"| 证据等级 | {_md_escape(str(audit_detail.get('evidence_level') or '未记录'))} |",
+                    f"| 证据 SHA-256 | `{_evidence_sha256(vuln, audit_detail)}` |",
                     f"| 自动复核节点 | {_md_escape(str(audit_detail.get('reviewed_by') or '未记录'))} |",
                     f"| 入口 | {_md_escape(str(audit_detail.get('entry_point') or '未记录'))} |",
                     f"| 源码位置 | {_md_escape(_finding_location(audit_detail))} |",
@@ -1650,6 +1673,65 @@ def _delivery_report_id(vulnerabilities: list[Vulnerability]) -> str:
     )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12].upper()
     return f"RCA-{digest}"
+
+
+def _source_inventory(vulnerabilities: list[Vulnerability]) -> list[dict[str, object]]:
+    project_ids = _unique([item.project_id for item in vulnerabilities])
+    if not project_ids:
+        return []
+    placeholders = ",".join("?" for _ in project_ids)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT s.project_id, p.title AS project_name, s.id AS snapshot_id,
+                   s.source_type, s.original_name, s.repository_url,
+                   s.requested_ref, s.resolved_commit, s.archive_sha256,
+                   s.snapshot_sha256, s.file_count, s.total_bytes, s.created_at
+            FROM source_snapshots s
+            JOIN projects p ON p.id = s.project_id
+            WHERE s.project_id IN ({placeholders}) AND s.status = 'ready'
+              AND s.created_at = (
+                  SELECT MAX(s2.created_at) FROM source_snapshots s2
+                  WHERE s2.project_id = s.project_id AND s2.status = 'ready'
+              )
+            ORDER BY s.project_id
+            """,
+            project_ids,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _owasp_category(cwe: object) -> str:
+    value = str(cwe or "").upper()
+    number_match = re.search(r"CWE-(\d+)", value)
+    number = int(number_match.group(1)) if number_match else None
+    groups = {
+        "A01:2021 访问控制失效": {22, 23, 35, 200, 201, 284, 285, 352, 639, 862, 863},
+        "A02:2021 加密机制失效": {259, 295, 319, 321, 326, 327, 328, 330},
+        "A03:2021 注入": {74, 77, 78, 79, 89, 90, 91, 94, 917},
+        "A05:2021 安全配置错误": {16, 209, 548, 611},
+        "A07:2021 身份识别和身份验证失败": {287, 288, 307, 384, 798},
+        "A08:2021 软件和数据完整性失效": {345, 353, 494, 502, 829},
+        "A09:2021 安全日志和监控失效": {117, 223, 532, 778},
+        "A10:2021 服务端请求伪造": {918},
+    }
+    for label, numbers in groups.items():
+        if number in numbers:
+            return label
+    return "需结合业务场景映射"
+
+
+def _evidence_sha256(vuln: Vulnerability, detail: dict[str, object]) -> str:
+    payload = {
+        "finding_id": detail.get("id") or vuln.fact_id,
+        "title": vuln.title,
+        "evidence": vuln.evidence,
+        "proof_packets": vuln.proof_packets,
+        "reproduction_poc": vuln.reproduction_poc,
+        "location": _finding_location(detail),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _delivery_quality(
@@ -1870,6 +1952,7 @@ def _report_plain_lines(vulnerabilities: list[Vulnerability]) -> list[str]:
     report_enrichments = _load_report_enrichments(vulnerabilities)
     delivery_quality = _delivery_quality(vulnerabilities, report_enrichments)
     coverage = _load_delivery_coverage(vulnerabilities)
+    source_inventory = _source_inventory(vulnerabilities)
     lines = [
         _report_title(vulnerabilities),
         f"报告编号：{_delivery_report_id(vulnerabilities)}  版本：1.0",
@@ -1889,6 +1972,15 @@ def _report_plain_lines(vulnerabilities: list[Vulnerability]) -> list[str]:
         "报告概览",
         f"漏洞总数：{len(vulnerabilities)}",
         f"严重：{counts['critical']}    高危：{counts['high']}    中危：{counts['medium']}    低危：{counts['low']}",
+        "",
+        "源码版本与完整性",
+        *[
+            f"{item['project_name']} | 快照={item['snapshot_id']} | "
+            f"Commit/Ref={item.get('resolved_commit') or item.get('requested_ref') or 'ZIP'} | "
+            f"SHA-256={item.get('snapshot_sha256') or item.get('archive_sha256') or '未记录'} | "
+            f"文件数={item.get('file_count') or 0}"
+            for item in source_inventory
+        ],
         "",
     ]
     if not vulnerabilities:
@@ -1916,7 +2008,11 @@ def _report_plain_lines(vulnerabilities: list[Vulnerability]) -> list[str]:
                     f"发现时间：{vuln.discovered_at}",
                     f"漏洞分类：{detail.get('category') or '未记录'}",
                     f"CWE：{detail.get('cwe') or '未记录'}",
+                    f"OWASP Top 10：{_owasp_category(detail.get('cwe'))}",
+                    "CVSS v3.1：未定向评分；需结合部署环境、权限前提和实际影响确定向量",
                     f"证据等级：{detail.get('evidence_level') or '未记录'}",
+                    f"证据 SHA-256：{_evidence_sha256(vuln, detail)}",
+                    f"自动复核节点：{detail.get('reviewed_by') or '未记录'}",
                     f"入口：{detail.get('entry_point') or '未记录'}",
                     f"源码位置：{_finding_location(detail)}",
                     "漏洞描述：",
@@ -2011,106 +2107,141 @@ def _plain_retest_guide(
     return lines
 
 
-def _wrap_report_line(line: str, width: int = 42) -> list[str]:
-    if not line:
+_PDF_FONT_NAME = "RabbitNotoSansSC"
+_PDF_FONT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "assets"
+    / "fonts"
+    / "NotoSansSC-Regular.ttf"
+)
+
+
+def _ensure_pdf_font() -> None:
+    try:
+        pdfmetrics.getFont(_PDF_FONT_NAME)
+    except KeyError:
+        if not _PDF_FONT_PATH.is_file():
+            raise RuntimeError(f"Bundled PDF font is missing: {_PDF_FONT_PATH}")
+        pdfmetrics.registerFont(TTFont(_PDF_FONT_NAME, str(_PDF_FONT_PATH)))
+
+
+def _wrap_pdf_text(text: str, font_size: float, max_width: float) -> list[str]:
+    """Wrap mixed Chinese and source text by rendered width, without truncation."""
+    if not text:
         return [""]
-    chunks: list[str] = []
-    current = ""
-    units = re.split(r"(\s+)", line)
-    for unit in units:
-        if not unit:
+    lines: list[str] = []
+    current: list[str] = []
+    current_width = 0.0
+    for char in text:
+        if char == "\n":
+            lines.append("".join(current).rstrip())
+            current = []
+            current_width = 0.0
             continue
-        if unit.isspace():
-            if current and not current.endswith(" "):
-                current += " "
-            continue
-        while len(unit) > width:
-            if current:
-                chunks.append(current.rstrip())
-                current = ""
-            chunks.append(unit[:width])
-            unit = unit[width:]
-        if len(current) + len(unit) > width:
-            if current:
-                chunks.append(current.rstrip())
-            current = unit
+        char_width = pdfmetrics.stringWidth(char, _PDF_FONT_NAME, font_size)
+        if current and current_width + char_width > max_width:
+            lines.append("".join(current).rstrip())
+            current = [] if char.isspace() else [char]
+            current_width = 0.0 if char.isspace() else char_width
         else:
-            current += unit
-    if current:
-        chunks.append(current.rstrip())
-    return chunks or [""]
-
-
-def _pdf_hex_text(text: str) -> str:
-    return text.encode("utf-16-be", errors="replace").hex().upper()
+            current.append(char)
+            current_width += char_width
+    if current or not lines:
+        lines.append("".join(current).rstrip())
+    return lines
 
 
 def _render_pdf_export(vulnerabilities: list[Vulnerability]) -> bytes:
-    wrapped: list[str] = []
-    for line in _report_plain_lines(vulnerabilities):
-        wrapped.extend(_wrap_report_line(line, 54))
-
-    lines_per_page = 42
-    pages = [wrapped[i : i + lines_per_page] for i in range(0, len(wrapped), lines_per_page)]
-    pages = pages or [[_report_title(vulnerabilities), "", "当前范围内没有漏洞。"]]
-
-    objects: list[bytes] = [b"" for _ in range(5)]
-    page_object_numbers: list[int] = []
-    for page_lines in pages:
-        stream_lines = [
-            "0.96 0.98 1 rg 0 0 595 842 re f",
-            "0.02 0.32 0.62 rg 0 806 595 36 re f",
-            "0.86 0.92 1 rg 42 705 511 58 re f",
-        ]
-        y = 818
-        for idx, line in enumerate(page_lines):
-            font_size = 16 if idx == 0 else 10
-            if line in ("报告概览", "漏洞清单") or line.startswith("项目："):
-                font_size = 13
-                y -= 6
-            stream_lines.append(f"BT /F1 {font_size} Tf {48} {y} Td <{_pdf_hex_text(line)}> Tj ET")
-            y -= 16 if font_size >= 13 else 13
-        stream = "\n".join(stream_lines).encode("ascii")
-        content_obj = len(objects) + 1
-        objects.append(
-            b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream"
-        )
-        page_obj = len(objects) + 1
-        page_object_numbers.append(page_obj)
-        objects.append(
-            (
-                f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
-                f"/Resources << /Font << /F1 3 0 R >> >> /Contents {content_obj} 0 R >>"
-            ).encode("ascii")
-        )
-
-    objects[0] = b"<< /Type /Catalog /Pages 2 0 R >>"
-    kids = " ".join(f"{num} 0 R" for num in page_object_numbers)
-    objects[1] = f"<< /Type /Pages /Kids [{kids}] /Count {len(page_object_numbers)} >>".encode("ascii")
-    objects[2] = b"<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /UniGB-UCS2-H /DescendantFonts [4 0 R] >>"
-    objects[3] = b"<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 2 >> /FontDescriptor 5 0 R >>"
-    objects[4] = b"<< /Type /FontDescriptor /FontName /STSong-Light /Flags 6 /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 880 /Descent -120 /CapHeight 880 /StemV 80 >>"
-
+    _ensure_pdf_font()
     buffer = io.BytesIO()
-    buffer.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-    offsets = [0]
-    for index, obj in enumerate(objects, start=1):
-        offsets.append(buffer.tell())
-        buffer.write(f"{index} 0 obj\n".encode("ascii"))
-        buffer.write(obj)
-        buffer.write(b"\nendobj\n")
-    xref = buffer.tell()
-    buffer.write(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
-    buffer.write(b"0000000000 65535 f \n")
-    for offset in offsets[1:]:
-        buffer.write(f"{offset:010d} 00000 n \n".encode("ascii"))
-    buffer.write(
-        (
-            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
-            f"startxref\n{xref}\n%%EOF\n"
-        ).encode("ascii")
+    report = canvas.Canvas(
+        buffer,
+        pagesize=A4,
+        pageCompression=1,
+        invariant=False,
     )
+    report.setTitle(_report_title(vulnerabilities))
+    report.setAuthor("Rabbit Code Audit")
+    report.setSubject("代码安全审计交付报告")
+
+    page_width, page_height = A4
+    margin_x = 46
+    content_width = page_width - margin_x * 2
+    report_id = _delivery_report_id(vulnerabilities)
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    # Formal cover page.
+    report.setFillColor(HexColor("#0F4C81"))
+    report.rect(0, page_height - 76, page_width, 76, stroke=0, fill=1)
+    report.setFillColor(HexColor("#0F172A"))
+    report.setFont(_PDF_FONT_NAME, 24)
+    report.drawString(margin_x, page_height - 190, _report_title(vulnerabilities))
+    report.setFillColor(HexColor("#475569"))
+    report.setFont(_PDF_FONT_NAME, 11)
+    cover_lines = [
+        f"报告编号：{report_id}",
+        "报告版本：1.0",
+        f"漏洞数量：{len(vulnerabilities)}",
+        f"生成时间：{generated_at}",
+        "生成系统：Rabbit Code Audit",
+        "交付口径：静态推导与真实动态证据分开标记",
+    ]
+    cover_y = page_height - 250
+    for line in cover_lines:
+        report.drawString(margin_x, cover_y, line)
+        cover_y -= 25
+    report.setFillColor(HexColor("#64748B"))
+    report.setFont(_PDF_FONT_NAME, 9)
+    report.drawString(margin_x, 58, "仅限授权安全审计与复测使用")
+    report.showPage()
+
+    page_number = 2
+
+    def draw_page_frame() -> float:
+        report.setFillColor(HexColor("#0F4C81"))
+        report.rect(0, page_height - 36, page_width, 36, stroke=0, fill=1)
+        report.setFillColor(HexColor("#FFFFFF"))
+        report.setFont(_PDF_FONT_NAME, 9)
+        report.drawString(margin_x, page_height - 24, _report_title(vulnerabilities))
+        report.setFillColor(HexColor("#64748B"))
+        report.drawRightString(page_width - margin_x, 28, f"Rabbit Code Audit | {page_number}")
+        return page_height - 62
+
+    y = draw_page_frame()
+    major_headings = {"执行摘要", "审计范围与方法", "报告概览", "漏洞清单"}
+    report_lines = _report_plain_lines(vulnerabilities)
+    if report_lines and report_lines[0] == _report_title(vulnerabilities):
+        report_lines = report_lines[1:]
+
+    for line in report_lines:
+        is_major = line in major_headings or line.startswith("项目：")
+        is_subheading = bool(line) and line.endswith("：") and len(line) <= 24
+        font_size = 14 if is_major else (11 if is_subheading else 9.5)
+        line_height = 20 if is_major else (16 if is_subheading else 13.5)
+        before = 8 if is_major else (4 if is_subheading else 0)
+        fragments = _wrap_pdf_text(line, font_size, content_width)
+        required_height = before + line_height * max(1, len(fragments))
+        if y - required_height < 48:
+            report.showPage()
+            page_number += 1
+            y = draw_page_frame()
+        y -= before
+        report.setFillColor(HexColor("#0F4C81") if is_major else HexColor("#0F172A"))
+        report.setFont(_PDF_FONT_NAME, font_size)
+        for fragment in fragments:
+            if fragment:
+                report.drawString(margin_x, y, fragment)
+            y -= line_height
+
+    report.save()
     return buffer.getvalue()
+
+
+_DOCX_FONT_XML = (
+    '<w:rFonts w:ascii="Arial Unicode MS" w:hAnsi="Arial Unicode MS" '
+    'w:eastAsia="Arial Unicode MS" w:cs="Arial Unicode MS"/>'
+    '<w:lang w:val="zh-CN" w:eastAsia="zh-CN"/>'
+)
 
 
 def _docx_paragraph(text: str, style: str | None = None, color: str | None = None) -> str:
@@ -2119,21 +2250,44 @@ def _docx_paragraph(text: str, style: str | None = None, color: str | None = Non
     return (
         "<w:p>"
         f"<w:pPr>{style_xml}</w:pPr>"
-        f"<w:r><w:rPr>{color_xml}</w:rPr><w:t xml:space=\"preserve\">{xml_escape(text)}</w:t></w:r>"
+        f"<w:r><w:rPr>{_DOCX_FONT_XML}{color_xml}</w:rPr>"
+        f"<w:t xml:space=\"preserve\">{xml_escape(text)}</w:t></w:r>"
         "</w:p>"
     )
 
 
-def _docx_table(rows: list[list[str]], header: bool = False) -> str:
-    xml = ['<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="0" w:type="auto"/></w:tblPr>']
+def _docx_table(
+    rows: list[list[str]],
+    header: bool = False,
+    widths: list[int] | None = None,
+) -> str:
+    column_count = max((len(row) for row in rows), default=1)
+    if widths is not None:
+        if len(widths) != column_count or sum(widths) != 9360:
+            raise ValueError("DOCX table widths must match the columns and total 9360 twips")
+    elif column_count == 2:
+        widths = [2500, 6860]
+    else:
+        base = 9360 // column_count
+        widths = [base] * column_count
+        widths[-1] += 9360 - sum(widths)
+    grid = "".join(f'<w:gridCol w:w="{width}"/>' for width in widths)
+    xml = [
+        '<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/>'
+        '<w:tblW w:w="9360" w:type="dxa"/><w:tblLayout w:type="fixed"/>'
+        '<w:tblInd w:w="120" w:type="dxa"/></w:tblPr>'
+        f"<w:tblGrid>{grid}</w:tblGrid>"
+    ]
     for row_index, row in enumerate(rows):
-        xml.append("<w:tr>")
-        for cell in row:
+        repeat = "<w:tblHeader/>" if header and row_index == 0 else ""
+        xml.append(f"<w:tr><w:trPr><w:cantSplit/>{repeat}</w:trPr>")
+        for cell_index, cell in enumerate(row):
             shade = '<w:shd w:fill="F3F7FB"/>' if header and row_index == 0 else ""
             xml.append(
-                "<w:tc><w:tcPr>"
+                f'<w:tc><w:tcPr><w:tcW w:w="{widths[cell_index]}" w:type="dxa"/><w:vAlign w:val="center"/>'
                 + shade
-                + "</w:tcPr><w:p><w:r><w:t xml:space=\"preserve\">"
+                + f"</w:tcPr><w:p><w:r><w:rPr>{_DOCX_FONT_XML}</w:rPr>"
+                + '<w:t xml:space="preserve">'
                 + xml_escape(str(cell or ""))
                 + "</w:t></w:r></w:p></w:tc>"
             )
@@ -2153,6 +2307,14 @@ def _render_docx_export(vulnerabilities: list[Vulnerability]) -> bytes:
     report_enrichments = _load_report_enrichments(vulnerabilities)
     delivery_quality = _delivery_quality(vulnerabilities, report_enrichments)
     coverage = _load_delivery_coverage(vulnerabilities)
+    source_inventory = _source_inventory(vulnerabilities)
+    delivery_ready = not (
+        delivery_quality["missing_retest"]
+        or coverage["open_required_candidates"]
+        or coverage["open_high_risk_business_nodes"]
+        or coverage["pending_review_findings"]
+        or coverage["pending_report_tasks"]
+    )
     body: list[str] = [
         _docx_paragraph(_report_title(vulnerabilities), style="Title", color="0F172A"),
         _docx_paragraph(
@@ -2164,6 +2326,7 @@ def _render_docx_export(vulnerabilities: list[Vulnerability]) -> bytes:
             f"本报告记录 {len(vulnerabilities)} 项系统已确认代码安全发现。"
             "静态 PoC 与预期结果来自源码推导，真实动态请求/响应会单独标记。"
         ),
+        _docx_paragraph(f"交付状态：{'可交付' if delivery_ready else '有条件交付'}", style="Heading2"),
         _docx_paragraph("交付质量与剩余风险", style="Heading1"),
         _docx_table(
             [
@@ -2182,6 +2345,21 @@ def _render_docx_export(vulnerabilities: list[Vulnerability]) -> bytes:
             "采用源码索引、业务图、数据流验证、自动复核和报告证据补全。"
             "仅应在授权隔离测试环境执行复测，并提前准备数据备份和回滚方案。"
         ),
+        _docx_paragraph("源码版本与完整性", style="Heading2"),
+        _docx_table(
+            [["项目 / 快照", "Commit / Ref", "SHA-256", "文件数"]]
+            + [
+                [
+                    f"{item['project_name']}\n{item['snapshot_id']}",
+                    str(item.get("resolved_commit") or item.get("requested_ref") or "ZIP"),
+                    str(item.get("snapshot_sha256") or item.get("archive_sha256") or "未记录"),
+                    str(item.get("file_count") or 0),
+                ]
+                for item in source_inventory
+            ],
+            header=True,
+            widths=[2500, 1500, 4360, 1000],
+        ) if source_inventory else _docx_paragraph("当前导出范围未记录 ready 源码快照。"),
         _docx_paragraph("报告概览", style="Heading1"),
         _docx_table(
             [
@@ -2196,18 +2374,20 @@ def _render_docx_export(vulnerabilities: list[Vulnerability]) -> bytes:
             [
                 _docx_paragraph("漏洞清单", style="Heading1"),
                 _docx_table(
-                    [["ID", "漏洞名称", "项目", "严重程度", "确认事实"]]
+                    [["ID", "漏洞名称 / 项目", "严重程度", "源码位置"]]
                     + [
                         [
                             f"H-{idx:02d}",
-                            v.title,
-                            f"{v.project_name} ({v.project_id})",
+                            f"{v.title}\n{v.project_name} ({v.project_id})",
                             _SEVERITY_LABELS.get(v.severity, v.severity),
-                            v.fact_id,
+                            _finding_location(
+                                _audit_detail_for_vulnerability(v, audit_details)
+                            ),
                         ]
                         for idx, v in enumerate(vulnerabilities, start=1)
                     ],
                     header=True,
+                    widths=[900, 3760, 1100, 3600],
                 ),
             ]
         )
@@ -2229,7 +2409,11 @@ def _render_docx_export(vulnerabilities: list[Vulnerability]) -> bytes:
                             ["工作节点", vuln.source_worker or "未记录"],
                             ["漏洞分类", str(detail.get("category") or "未记录")],
                             ["CWE", str(detail.get("cwe") or "未记录")],
+                            ["OWASP Top 10", _owasp_category(detail.get("cwe"))],
+                            ["CVSS v3.1", "未定向评分；需结合部署环境、权限前提和实际影响确定向量"],
                             ["证据等级", str(detail.get("evidence_level") or "未记录")],
+                            ["证据 SHA-256", _evidence_sha256(vuln, detail)],
+                            ["自动复核节点", str(detail.get("reviewed_by") or "未记录")],
                             ["入口", str(detail.get("entry_point") or "未记录")],
                             ["源码位置", _finding_location(detail)],
                         ],
@@ -2261,7 +2445,10 @@ def _render_docx_export(vulnerabilities: list[Vulnerability]) -> bytes:
                 body.append(_docx_paragraph("未记录真实请求/响应数据包。"))
             for packet_index, packet in enumerate(packets, start=1):
                 body.append(_docx_paragraph(f"证明 {packet_index}：{packet.get('title') or '漏洞证明'}", style="Heading4"))
-                body.append(_docx_table([["请求数据包", "响应/回显"], [packet.get("request") or "未记录", packet.get("response") or "未记录"]], header=True))
+                body.append(_docx_paragraph("请求数据包", style="Heading4"))
+                body.append(_docx_pre_block(packet.get("request") or "未记录"))
+                body.append(_docx_paragraph("响应/回显", style="Heading4"))
+                body.append(_docx_pre_block(packet.get("response") or "未记录"))
                 if packet.get("note"):
                     body.append(_docx_paragraph(f"说明：{packet['note']}"))
             body.append(_docx_paragraph("复测操作手册", style="Heading3"))
@@ -2304,21 +2491,30 @@ def _render_docx_export(vulnerabilities: list[Vulnerability]) -> bytes:
         body.append(_docx_paragraph("当前范围内没有漏洞。"))
     document_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
         "<w:body>"
         + "".join(body)
-        + '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>'
+        + '<w:sectPr><w:footerReference w:type="default" r:id="rId1"/>'
+        '<w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>'
         "</w:body></w:document>"
     )
     styles_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:docDefaults><w:rPrDefault><w:rPr>'
+        + _DOCX_FONT_XML
+        +
+        '<w:sz w:val="21"/><w:szCs w:val="21"/></w:rPr></w:rPrDefault>'
+        '<w:pPrDefault><w:pPr><w:spacing w:after="120" w:line="320" w:lineRule="auto"/></w:pPr></w:pPrDefault>'
+        '</w:docDefaults>'
+        '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>'
         '<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/>'
-        '<w:rPr><w:b/><w:sz w:val="40"/></w:rPr></w:style>'
-        '<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="Heading 1"/><w:pPr><w:spacing w:before="360" w:after="120"/></w:pPr><w:rPr><w:b/><w:sz w:val="30"/><w:color w:val="0F4C81"/></w:rPr></w:style>'
-        '<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="Heading 2"/><w:pPr><w:spacing w:before="280" w:after="80"/></w:pPr><w:rPr><w:b/><w:sz w:val="24"/></w:rPr></w:style>'
-        '<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="Heading 3"/><w:pPr><w:spacing w:before="220" w:after="80"/></w:pPr><w:rPr><w:b/><w:sz w:val="21"/><w:color w:val="334155"/></w:rPr></w:style>'
-        '<w:style w:type="paragraph" w:styleId="Heading4"><w:name w:val="Heading 4"/><w:pPr><w:spacing w:before="160" w:after="80"/></w:pPr><w:rPr><w:b/><w:sz w:val="20"/></w:rPr></w:style>'
+        '<w:rPr>' + _DOCX_FONT_XML + '<w:b/><w:sz w:val="40"/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="Heading 1"/><w:pPr><w:spacing w:before="360" w:after="120"/></w:pPr><w:rPr>' + _DOCX_FONT_XML + '<w:b/><w:sz w:val="30"/><w:color w:val="0F4C81"/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="Heading 2"/><w:pPr><w:spacing w:before="280" w:after="80"/></w:pPr><w:rPr>' + _DOCX_FONT_XML + '<w:b/><w:sz w:val="24"/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="Heading 3"/><w:pPr><w:spacing w:before="220" w:after="80"/></w:pPr><w:rPr>' + _DOCX_FONT_XML + '<w:b/><w:sz w:val="21"/><w:color w:val="334155"/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Heading4"><w:name w:val="Heading 4"/><w:pPr><w:spacing w:before="160" w:after="80"/></w:pPr><w:rPr>' + _DOCX_FONT_XML + '<w:b/><w:sz w:val="20"/></w:rPr></w:style>'
         '<w:style w:type="table" w:styleId="TableGrid"><w:name w:val="Table Grid"/><w:tblPr><w:tblBorders><w:top w:val="single" w:sz="4" w:color="D7DEE8"/><w:left w:val="single" w:sz="4" w:color="D7DEE8"/><w:bottom w:val="single" w:sz="4" w:color="D7DEE8"/><w:right w:val="single" w:sz="4" w:color="D7DEE8"/><w:insideH w:val="single" w:sz="4" w:color="D7DEE8"/><w:insideV w:val="single" w:sz="4" w:color="D7DEE8"/></w:tblBorders><w:tblCellMar><w:top w:w="120" w:type="dxa"/><w:left w:w="120" w:type="dxa"/><w:bottom w:w="120" w:type="dxa"/><w:right w:w="120" w:type="dxa"/></w:tblCellMar></w:tblPr></w:style>'
         "</w:styles>"
     )
@@ -2332,6 +2528,7 @@ def _render_docx_export(vulnerabilities: list[Vulnerability]) -> bytes:
             '<Default Extension="xml" ContentType="application/xml"/>'
             '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
             '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+            '<Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>'
             "</Types>",
         )
         docx.writestr(
@@ -2343,6 +2540,127 @@ def _render_docx_export(vulnerabilities: list[Vulnerability]) -> bytes:
         )
         docx.writestr("word/document.xml", document_xml)
         docx.writestr("word/styles.xml", styles_xml)
+        docx.writestr(
+            "word/_rels/document.xml.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>'
+            "</Relationships>",
+        )
+        docx.writestr(
+            "word/footer1.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            '<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>Rabbit Code Audit | </w:t></w:r>'
+            '<w:fldSimple w:instr="PAGE"><w:r><w:t>1</w:t></w:r></w:fldSimple></w:p></w:ftr>',
+        )
+    return buffer.getvalue()
+
+
+def _render_delivery_bundle(vulnerabilities: list[Vulnerability]) -> bytes:
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    report_id = _delivery_report_id(vulnerabilities)
+    report_enrichments = _load_report_enrichments(vulnerabilities)
+    delivery_quality = _delivery_quality(vulnerabilities, report_enrichments)
+    coverage = _load_delivery_coverage(vulnerabilities)
+    source_inventory = _source_inventory(vulnerabilities)
+    project_ids = _unique([item.project_id for item in vulnerabilities])
+    project_names = _unique([item.project_name for item in vulnerabilities])
+
+    files: list[tuple[str, str, bytes]] = [
+        (
+            "01-code-audit-report.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            _render_docx_export(vulnerabilities),
+        ),
+        ("01-code-audit-report.pdf", "application/pdf", _render_pdf_export(vulnerabilities)),
+        (
+            "01-code-audit-report.md",
+            "text/markdown; charset=utf-8",
+            _render_markdown_export(vulnerabilities).encode("utf-8"),
+        ),
+        (
+            "02-findings.json",
+            "application/json",
+            _render_json_export(vulnerabilities).encode("utf-8"),
+        ),
+    ]
+
+    warnings: list[str] = []
+    if delivery_quality["missing_retest"]:
+        warnings.append(f"{delivery_quality['missing_retest']} 项漏洞缺少完整静态复测材料")
+    if coverage["open_required_candidates"]:
+        warnings.append(f"{coverage['open_required_candidates']} 条严重/高危/未知候选尚未闭合")
+    if coverage["open_high_risk_business_nodes"]:
+        warnings.append(f"{coverage['open_high_risk_business_nodes']} 个高风险业务节点尚未覆盖")
+    if coverage["pending_review_findings"]:
+        warnings.append(f"{coverage['pending_review_findings']} 条 Finding 尚待自动复核")
+    if coverage["pending_report_tasks"]:
+        warnings.append(f"{coverage['pending_report_tasks']} 个报告材料任务尚未完成")
+
+    readme = "\n".join(
+        [
+            "Rabbit Code Audit 审计交付包",
+            "",
+            f"报告编号：{report_id}",
+            f"生成时间：{generated_at}",
+            f"交付状态：{'可交付' if not warnings else '有条件交付'}",
+            "",
+            "文件说明：",
+            "- 01-code-audit-report.docx：正式可编辑报告",
+            "- 01-code-audit-report.pdf：正式只读报告",
+            "- 01-code-audit-report.md：完整技术报告与代码块原文",
+            "- 02-findings.json：结构化漏洞数据",
+            "- MANIFEST.json：范围、源码快照、交付状态和文件 SHA-256",
+            "",
+            "证据口径：静态 PoC 和预期结果来自源码推导；真实动态请求/响应会在报告中单独标记。",
+            "复测要求：仅在授权隔离环境执行，执行前准备数据备份和回滚方案。",
+            "完整性校验：对交付包内文件计算 SHA-256，并与 MANIFEST.json 对照。",
+            "",
+            *( ["交付注意事项：", *[f"- {item}" for item in warnings]] if warnings else [] ),
+            "",
+        ]
+    ).encode("utf-8")
+    files.append(("README.txt", "text/plain; charset=utf-8", readme))
+
+    manifest_files = [
+        {
+            "path": path,
+            "media_type": media_type,
+            "size_bytes": len(body),
+            "sha256": hashlib.sha256(body).hexdigest(),
+        }
+        for path, media_type, body in files
+    ]
+    manifest = {
+        "schema_version": "rabbit-code-audit-delivery/v1",
+        "report_id": report_id,
+        "report_version": "1.0",
+        "generated_at": generated_at,
+        "title": _report_title(vulnerabilities),
+        "delivery_status": "ready" if not warnings else "conditional",
+        "warnings": warnings,
+        "scope": {
+            "project_ids": project_ids,
+            "project_names": project_names,
+            "finding_count": len(vulnerabilities),
+            "finding_ids": [item.id for item in vulnerabilities],
+            "severity_summary": _summarize(vulnerabilities),
+        },
+        "delivery_quality": delivery_quality,
+        "coverage": coverage,
+        "source_snapshots": source_inventory,
+        "canonical_report": "01-code-audit-report.md",
+        "digest_algorithm": "SHA-256",
+        "files": manifest_files,
+    }
+    manifest_body = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path, _media_type, body in files:
+            archive.writestr(path, body)
+        archive.writestr("MANIFEST.json", manifest_body)
     return buffer.getvalue()
 
 
@@ -2369,6 +2687,7 @@ def _record_export(
     project_id: str | None,
     severity: str | None,
     status: str | None,
+    content_sha256: str,
 ) -> None:
     """Persist a single export action to the ``export_records`` table.
 
@@ -2382,8 +2701,8 @@ def _record_export(
                 """
                 INSERT INTO export_records
                     (created_at, format, filename, scope, vulnerability_count,
-                     project_id, project_name, severity, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     project_id, project_name, severity, status, content_sha256)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     datetime.now(timezone.utc).isoformat(),
@@ -2395,6 +2714,7 @@ def _record_export(
                     project_name,
                     severity,
                     status,
+                    content_sha256,
                 ),
             )
     except Exception:  # pragma: no cover - logging must not break the download
@@ -2414,7 +2734,7 @@ def list_export_records(limit: int = Query(default=50, ge=1, le=200)) -> list[Ex
         rows = conn.execute(
             """
             SELECT id, created_at, format, filename, scope, vulnerability_count,
-                   project_id, project_name, severity, status
+                   project_id, project_name, severity, status, content_sha256
             FROM export_records
             ORDER BY datetime(created_at) DESC, id DESC
             LIMIT ?
@@ -2440,11 +2760,29 @@ def clear_export_records() -> dict[str, str]:
     return {"status": "cleared"}
 
 
+def _export_integrity(body: str | bytes) -> tuple[str, str]:
+    raw = body.encode("utf-8") if isinstance(body, str) else body
+    digest = hashlib.sha256(raw).digest()
+    return digest.hex(), base64.b64encode(digest).decode("ascii")
+
+
+def _download_headers(filename: str, body: str | bytes) -> tuple[dict[str, str], str]:
+    hexdigest, encoded = _export_integrity(body)
+    return (
+        {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Digest": f"sha-256={encoded}",
+            "X-Content-SHA256": hexdigest,
+        },
+        hexdigest,
+    )
+
+
 @router.get("/export")
 def export_vulnerabilities(
     format: str = Query(
         default="json",
-        description="Export format; one of 'json', 'csv', 'md', 'pdf', 'docx', or 'word'.",
+        description="Export format; one of 'json', 'csv', 'md', 'pdf', 'docx', 'bundle', or 'zip'.",
     ),
     severity: str | None = Query(
         default=None,
@@ -2484,8 +2822,8 @@ def export_vulnerabilities(
     an unknown severity simply matches nothing and produces a summary-only file.
     """
     normalized = format.lower()
-    if normalized not in ("json", "csv", "md", "markdown", "pdf", "docx", "word"):
-        raise HTTPException(status_code=422, detail="Supported formats: json, csv, md, pdf, docx")
+    if normalized not in ("json", "csv", "md", "markdown", "pdf", "docx", "word", "bundle", "zip"):
+        raise HTTPException(status_code=422, detail="Supported formats: json, csv, md, pdf, docx, bundle")
 
     selected_ids = [item.strip() for item in (vulnerability_ids or "").split(",") if item.strip()] or None
     vulnerabilities = _query_filtered_vulnerabilities(
@@ -2499,52 +2837,66 @@ def export_vulnerabilities(
     if normalized == "json":
         body = _render_json_export(vulnerabilities)
         filename = _export_filename(vulnerabilities, "json")
-        _record_export(vulnerabilities, fmt="json", filename=filename, project_id=project_id, severity=severity, status=status)
+        headers, content_sha256 = _download_headers(filename, body)
+        _record_export(vulnerabilities, fmt="json", filename=filename, project_id=project_id, severity=severity, status=status, content_sha256=content_sha256)
         return Response(
             content=body,
             media_type="application/json",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"'
-            },
+            headers=headers,
         )
 
     if normalized in ("md", "markdown"):
         body = _render_markdown_export(vulnerabilities)
         filename = _export_filename(vulnerabilities, "md")
-        _record_export(vulnerabilities, fmt="md", filename=filename, project_id=project_id, severity=severity, status=status)
+        headers, content_sha256 = _download_headers(filename, body)
+        _record_export(vulnerabilities, fmt="md", filename=filename, project_id=project_id, severity=severity, status=status, content_sha256=content_sha256)
         return Response(
             content=body,
             media_type="text/markdown; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers=headers,
         )
 
     if normalized == "pdf":
         body = _render_pdf_export(vulnerabilities)
         filename = _export_filename(vulnerabilities, "pdf")
-        _record_export(vulnerabilities, fmt="pdf", filename=filename, project_id=project_id, severity=severity, status=status)
+        headers, content_sha256 = _download_headers(filename, body)
+        _record_export(vulnerabilities, fmt="pdf", filename=filename, project_id=project_id, severity=severity, status=status, content_sha256=content_sha256)
         return Response(
             content=body,
             media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers=headers,
         )
 
     if normalized in ("docx", "word"):
         body = _render_docx_export(vulnerabilities)
         filename = _export_filename(vulnerabilities, "docx")
-        _record_export(vulnerabilities, fmt="docx", filename=filename, project_id=project_id, severity=severity, status=status)
+        headers, content_sha256 = _download_headers(filename, body)
+        _record_export(vulnerabilities, fmt="docx", filename=filename, project_id=project_id, severity=severity, status=status, content_sha256=content_sha256)
         return Response(
             content=body,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers=headers,
+        )
+
+    if normalized in ("bundle", "zip"):
+        body = _render_delivery_bundle(vulnerabilities)
+        filename = _export_filename(vulnerabilities, "zip")
+        headers, content_sha256 = _download_headers(filename, body)
+        _record_export(vulnerabilities, fmt="bundle", filename=filename, project_id=project_id, severity=severity, status=status, content_sha256=content_sha256)
+        return Response(
+            content=body,
+            media_type="application/zip",
+            headers=headers,
         )
 
     body = _render_csv_export(vulnerabilities)
     filename = _export_filename(vulnerabilities, "csv")
-    _record_export(vulnerabilities, fmt="csv", filename=filename, project_id=project_id, severity=severity, status=status)
+    headers, content_sha256 = _download_headers(filename, body)
+    _record_export(vulnerabilities, fmt="csv", filename=filename, project_id=project_id, severity=severity, status=status, content_sha256=content_sha256)
     return Response(
         content=body,
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers=headers,
     )
 
 

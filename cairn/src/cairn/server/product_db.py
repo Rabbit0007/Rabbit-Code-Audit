@@ -122,7 +122,8 @@ CREATE TABLE IF NOT EXISTS export_records (
     project_id TEXT,
     project_name TEXT,
     severity TEXT,
-    status TEXT
+    status TEXT,
+    content_sha256 TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_export_records_time
@@ -553,6 +554,34 @@ CREATE INDEX IF NOT EXISTS idx_review_tasks_project
     ON review_tasks(project_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_review_tasks_finding
     ON review_tasks(project_id, finding_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS quality_benchmark_runs (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    snapshot_id TEXT REFERENCES source_snapshots(id) ON DELETE SET NULL,
+    suite_name TEXT NOT NULL,
+    expectations_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_quality_benchmark_project
+    ON quality_benchmark_runs(project_id, created_at);
+
+CREATE TABLE IF NOT EXISTS backup_records (
+    id TEXT PRIMARY KEY,
+    filename TEXT NOT NULL,
+    path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    label TEXT,
+    integrity_status TEXT NOT NULL CHECK(integrity_status IN ('ok', 'failed')),
+    created_at TEXT NOT NULL,
+    verified_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_backup_records_time
+    ON backup_records(created_at);
 """
 
 VULNERABILITY_COLUMNS: dict[str, str] = {
@@ -674,6 +703,10 @@ REVIEW_TASK_COLUMNS: dict[str, str] = {
     "excluded_workers_json": "TEXT NOT NULL DEFAULT '[]'",
     "blocked_reason": "TEXT",
     "retry_count": "INTEGER NOT NULL DEFAULT 0",
+}
+
+EXPORT_RECORD_COLUMNS: dict[str, str] = {
+    "content_sha256": "TEXT",
 }
 
 BUSINESS_NODE_CONCLUSION_COLUMNS: dict[str, str] = {
@@ -835,6 +868,7 @@ def configure_product_db() -> None:
         _ensure_columns(conn, "worker_task_history", WORKER_TASK_HISTORY_COLUMNS)
         _ensure_columns(conn, "audit_log", AUDIT_LOG_COLUMNS)
         _ensure_columns(conn, "notifications", NOTIFICATION_COLUMNS)
+        _ensure_columns(conn, "export_records", EXPORT_RECORD_COLUMNS)
         _ensure_columns(conn, "report_enrichment_tasks", REPORT_ENRICHMENT_COLUMNS)
         _backfill_failed_report_enrichments(conn)
         _ensure_columns(conn, "review_tasks", REVIEW_TASK_COLUMNS)

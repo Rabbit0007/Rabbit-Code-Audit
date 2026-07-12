@@ -194,7 +194,11 @@ def create_business_node(project_id: str, body: CreateBusinessNodeRequest) -> Bu
         )
         evidence_status = _evidence_status(evidence, source_kind)
         confidence = _calibrated_confidence(body.confidence, evidence, source_kind)
-        review_status = body.review_status
+        review_status = _review_status_for_evidence(
+            body.review_status,
+            evidence_status,
+            source_kind,
+        )
         semantic_key = _semantic_key(body.semantic_key, body.node_type, body.title)
         existing = conn.execute(
             "SELECT * FROM business_nodes WHERE project_id = ? AND semantic_key = ?",
@@ -213,6 +217,16 @@ def create_business_node(project_id: str, body: CreateBusinessNodeRequest) -> Bu
                 _decode_json_list(existing["contributors_json"]),
                 [existing["created_by"], body.created_by],
             )
+            merged_source_kind = _merged_source_kind(existing["source_kind"], source_kind)
+            merged_evidence_status = _stronger_evidence_status(
+                existing["evidence_status"],
+                evidence_status,
+            )
+            merged_review_status = _review_status_for_evidence(
+                _more_complete_review(existing["review_status"], review_status),
+                merged_evidence_status,
+                merged_source_kind,
+            )
             conn.execute(
                 """
                 UPDATE business_nodes
@@ -226,7 +240,7 @@ def create_business_node(project_id: str, body: CreateBusinessNodeRequest) -> Bu
                 (
                     _richer_text(existing["description"], body.description),
                     _higher_risk(existing["risk_level"], body.risk_level),
-                    _more_complete_review(existing["review_status"], review_status),
+                    merged_review_status,
                     _richer_text(existing["coverage_note"], body.coverage_note),
                     body.last_intent_id or existing["last_intent_id"],
                     json.dumps(risk_tags, ensure_ascii=False),
@@ -238,8 +252,8 @@ def create_business_node(project_id: str, body: CreateBusinessNodeRequest) -> Bu
                         source_kind,
                     ),
                     _higher_layer(existing["graph_layer"], graph_layer),
-                    _merged_source_kind(existing["source_kind"], source_kind),
-                    _stronger_evidence_status(existing["evidence_status"], evidence_status),
+                    merged_source_kind,
+                    merged_evidence_status,
                     json.dumps(contributors, ensure_ascii=False),
                     now,
                     existing["id"],
@@ -575,6 +589,20 @@ def _evidence_status(evidence: list[str], source_kind: str) -> str:
     if source_kind == "static_index":
         return "inferred"
     return "unverified"
+
+
+def _review_status_for_evidence(
+    requested: str,
+    evidence_status: str,
+    source_kind: str,
+) -> str:
+    if (
+        requested == "covered"
+        and source_kind in {"model", "mixed"}
+        and evidence_status != "source_backed"
+    ):
+        return "investigating"
+    return requested
 
 
 def _validated_evidence_refs(

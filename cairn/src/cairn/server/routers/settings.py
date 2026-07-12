@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import shutil
 
 import requests
 from fastapi import APIRouter
@@ -32,6 +33,13 @@ def _utcnow() -> datetime:
 
 def _format_utc(value: datetime) -> str:
     return value.strftime(_TIMESTAMP_FORMAT)
+
+
+def _disk_usage(path):
+    current = path
+    while not current.exists() and current != current.parent:
+        current = current.parent
+    return shutil.disk_usage(current)
 
 
 def _parse_utc(value: str | None) -> datetime | None:
@@ -189,6 +197,35 @@ def health() -> SettingsHealthResponse:
             export_records=int(conn.execute("SELECT COUNT(*) AS n FROM export_records").fetchone()["n"]),
             audit_entries=int(conn.execute("SELECT COUNT(*) AS n FROM audit_log").fetchone()["n"]),
             notifications_unread=int(conn.execute("SELECT COUNT(*) AS n FROM notifications WHERE read = 0").fetchone()["n"]),
+            open_intents=int(
+                conn.execute("SELECT COUNT(*) AS n FROM intents WHERE status IN ('open', 'claimed', 'cooldown')").fetchone()["n"]
+            ),
+            pending_tool_tasks=int(
+                conn.execute("SELECT COUNT(*) AS n FROM tool_scan_tasks WHERE status IN ('pending', 'running')").fetchone()["n"]
+            ),
+            pending_review_tasks=int(
+                conn.execute("SELECT COUNT(*) AS n FROM review_tasks WHERE status NOT IN ('completed', 'failed')").fetchone()["n"]
+            ),
+            pending_report_tasks=int(
+                conn.execute("SELECT COUNT(*) AS n FROM report_enrichment_tasks WHERE status IN ('pending', 'running')").fetchone()["n"]
+            ),
+            failed_tasks=int(
+                conn.execute(
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM tool_scan_tasks WHERE status = 'failed') +
+                        (SELECT COUNT(*) FROM review_tasks WHERE status = 'failed') +
+                        (SELECT COUNT(*) FROM report_enrichment_tasks WHERE status = 'failed')
+                        AS n
+                    """
+                ).fetchone()["n"]
+            ),
+            database_bytes=db.current_path().stat().st_size if db.current_path().exists() else 0,
+            disk_free_bytes=_disk_usage(artifact_root()).free,
+            backup_count=int(conn.execute("SELECT COUNT(*) AS n FROM backup_records").fetchone()["n"]),
+            latest_backup_at=(
+                conn.execute("SELECT MAX(created_at) AS value FROM backup_records WHERE integrity_status = 'ok'").fetchone()["value"]
+            ),
         )
         alerts.extend(_idle_project_alerts(conn, settings.project_idle_alert_hours))
 
@@ -201,6 +238,57 @@ def health() -> SettingsHealthResponse:
             detail="系统设置、项目和报告接口均由当前服务提供。",
         )
     )
+    queue_total = stats.pending_tool_tasks + stats.pending_review_tasks + stats.pending_report_tasks
+    queue_status = "warning" if stats.failed_tasks or queue_total > 1000 else "ok"
+    checks.append(
+        SettingsHealthCheck(
+            key="task_queues",
+            label="任务队列",
+            status=queue_status,
+            summary=f"待处理 {queue_total} / 失败 {stats.failed_tasks}",
+            detail=(
+                f"工具 {stats.pending_tool_tasks}，复核 {stats.pending_review_tasks}，"
+                f"报告 {stats.pending_report_tasks}，开放意图 {stats.open_intents}。"
+            ),
+        )
+    )
+    free_gib = stats.disk_free_bytes / (1024**3)
+    disk_status = "error" if free_gib < 1 else "warning" if free_gib < 5 else "ok"
+    checks.append(
+        SettingsHealthCheck(
+            key="storage",
+            label="存储容量",
+            status=disk_status,
+            summary=f"可用 {free_gib:.1f} GiB",
+            detail=f"数据库占用 {stats.database_bytes / (1024**2):.1f} MiB，备份 {stats.backup_count} 份。",
+        )
+    )
+    backup_status = "ok" if stats.latest_backup_at or stats.projects == 0 else "warning"
+    checks.append(
+        SettingsHealthCheck(
+            key="backup",
+            label="备份与恢复",
+            status=backup_status,
+            summary=f"可用备份 {stats.backup_count}",
+            detail=(f"最近完整备份：{stats.latest_backup_at}" if stats.latest_backup_at else "尚未创建经过校验的数据库备份。"),
+        )
+    )
+    if stats.failed_tasks:
+        alerts.append(
+            SettingsAlert(
+                level="warning",
+                title="存在失败的后台任务",
+                detail=f"工具、复核或报告队列中共有 {stats.failed_tasks} 个失败任务，请在对应页面重试。",
+            )
+        )
+    if disk_status != "ok":
+        alerts.append(
+            SettingsAlert(
+                level="danger" if disk_status == "error" else "warning",
+                title="可用磁盘空间不足",
+                detail=f"当前仅剩 {free_gib:.1f} GiB，继续导入大型源码可能失败。",
+            )
+        )
     checks.append(
         SettingsHealthCheck(
             key="database",

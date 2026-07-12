@@ -32,6 +32,7 @@ Only when Goal is definitively satisfied:
 - Do not enumerate every route, file, candidate, or static graph node. Group repeated routes and related files into modules and defer detailed vulnerability validation to follow-up intents.
 - Keep the initial business graph compact: create at most 20 business nodes and 30 business edges, selecting only source-backed module, trust-boundary, asset, and high-value entry-point knowledge.
 - The existing static graph is the `evidence` layer. Do not recreate routes, handlers, files, or index risk candidates as new nodes. Add only business semantics that static syntax cannot express, such as roles, business functions, business resources, states, approval/control rules, trust boundaries, and external business systems.
+- Keep business behavior and vulnerability claims in separate layers. A semantic feature describes what the system does even when it is secure; SQL injection, XSS, authorization bypass, and similar vulnerability concepts must use `node_type: "risk"` and `graph_layer: "audit"`, never a semantic feature title.
 - Every model-created node must use `graph_layer: "semantic"` (or `"audit"` only for a real audit-risk concept), a stable lowercase `semantic_key` such as `feature:order_refund`, `role:finance_reviewer`, or `state:order_paid`, a calibrated `confidence` from 0 to 1, and at least one exact `path:line` source evidence item.
 - Reuse an existing business node ID from the supplied graph when it already represents the same concept. Never create a synonym node merely to use a different title.
 - Record confirmed repository facts, not speculative vulnerabilities.
@@ -39,6 +40,7 @@ Only when Goal is definitively satisfied:
 - Build an initial business map when the code exposes clear business functions, roles, routes, resources, states, or trust boundaries.
 - For each `business_nodes` item, set `node_type` to exactly one of `feature`, `role`, `endpoint`, `data_object`, `state`, `control`, `asset`, `risk`, or `external_system`. If no precise type fits, use `feature` for business behavior and `risk` for risk points.
 - For each `business_nodes` item, set `risk_level` to one of `critical`, `high`, `medium`, `low`, or `unknown`, and `review_status` to one of `unreviewed`, `investigating`, `covered`, or `blocked`. During bootstrap, prefer `unreviewed` unless the node is fully covered by the initial inventory.
+- Never set `review_status: "covered"` without at least one exact `path:line` item that you read in this session. Missing or approximate evidence keeps the node `unreviewed` or `investigating`.
 - For each `business_edges` item, set `relation` to exactly one of `contains`, `exposes`, `calls`, `uses`, `owns`, `guards`, `transitions_to`, `depends_on`, `risk_of`, or `relates_to`. Use `relates_to` when no precise relation fits.
 - Do not create a fixed checklist of business logic vulnerabilities. Infer business rules from this repository when later investigation requires it.
 - Use `business_nodes` and `business_edges` only for source-backed business knowledge, not guesses. Node `ref` values are temporary labels used only to connect edges in this response.

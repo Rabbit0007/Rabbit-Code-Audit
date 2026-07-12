@@ -91,3 +91,4 @@ class ExportRecord(BaseModel):
     project_name: str | None = None
     severity: str | None = None
     status: str | None = None
+    content_sha256: str | None = None

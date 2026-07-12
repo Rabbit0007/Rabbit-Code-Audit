@@ -190,15 +190,17 @@ def reconcile_project_business_graph(
 ) -> dict[str, int]:
     rows = conn.execute(
         """
-        SELECT id, evidence_json, confidence, evidence_status, source_snapshot_id
+        SELECT id, evidence_json, confidence, evidence_status, source_snapshot_id,
+               review_status, source_kind
         FROM business_nodes
-        WHERE project_id = ? AND source_kind = 'model'
+        WHERE project_id = ? AND source_kind IN ('model', 'mixed')
         """,
         (project_id,),
     ).fetchall()
     updated_nodes = 0
     linked_edges = 0
     dropped_evidence = 0
+    reopened_nodes = 0
     for row in rows:
         effective_snapshot = row["source_snapshot_id"] or snapshot_id
         original = _decode_list(row["evidence_json"])
@@ -206,17 +208,23 @@ def reconcile_project_business_graph(
         dropped_evidence += max(0, len(original) - len(validated))
         status = "source_backed" if validated else "unverified"
         confidence = calibrated_model_confidence(float(row["confidence"] or 0), validated)
+        review_status = row["review_status"]
+        if review_status == "covered" and status != "source_backed":
+            review_status = "investigating"
+            reopened_nodes += 1
         changed = (
             validated != original
             or status != row["evidence_status"]
             or confidence != float(row["confidence"] or 0)
             or effective_snapshot != row["source_snapshot_id"]
+            or review_status != row["review_status"]
         )
         if changed:
             conn.execute(
                 """
                 UPDATE business_nodes
                 SET evidence_json = ?, evidence_status = ?, confidence = ?,
+                    review_status = ?,
                     source_snapshot_id = ?, revision = revision + 1, updated_at = ?
                 WHERE id = ? AND project_id = ?
                 """,
@@ -224,6 +232,7 @@ def reconcile_project_business_graph(
                     json.dumps(validated, ensure_ascii=False),
                     status,
                     confidence,
+                    review_status,
                     effective_snapshot,
                     now,
                     row["id"],
@@ -254,6 +263,7 @@ def reconcile_project_business_graph(
         "dropped_evidence": dropped_evidence,
         "linked_edges": linked_edges,
         "capped_edges": int(capped_edges or 0),
+        "reopened_nodes": reopened_nodes,
     }
 
 

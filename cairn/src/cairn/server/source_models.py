@@ -51,6 +51,31 @@ class CodeFile(BaseModel):
     is_binary: bool = False
 
 
+class SourceFileChange(BaseModel):
+    path: str
+    change_type: Literal["added", "modified", "deleted"]
+    language: str | None = None
+    old_sha256: str | None = None
+    new_sha256: str | None = None
+
+
+class SourceImpactAnalysis(BaseModel):
+    project_id: str
+    base_snapshot_id: str | None = None
+    target_snapshot_id: str
+    unchanged_file_count: int = 0
+    added_file_count: int = 0
+    modified_file_count: int = 0
+    deleted_file_count: int = 0
+    changed_files: list[SourceFileChange] = Field(default_factory=list)
+    impacted_paths: list[str] = Field(default_factory=list)
+    impacted_entrypoints: list[str] = Field(default_factory=list)
+    impacted_business_node_ids: list[str] = Field(default_factory=list)
+    impacted_candidate_ids: list[str] = Field(default_factory=list)
+    full_reaudit_recommended: bool = False
+    recommendation_reasons: list[str] = Field(default_factory=list)
+
+
 class CodeSymbol(BaseModel):
     id: str
     snapshot_id: str

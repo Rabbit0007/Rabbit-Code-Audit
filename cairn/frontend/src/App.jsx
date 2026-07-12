@@ -18,6 +18,7 @@ import {
   Download,
   Eye,
   EyeOff,
+  FileArchive,
   FileText,
   Folder,
   History,
@@ -524,7 +525,13 @@ export default function App() {
         )}
       </main>
       {passwordOpen && <PasswordModal onClose={() => setPasswordOpen(false)} runAction={runAction} />}
-      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} runAction={runAction} />}
+      {settingsOpen && (
+        <SettingsModal
+          onClose={() => setSettingsOpen(false)}
+          runAction={runAction}
+          confirmAction={confirmAction}
+        />
+      )}
       {confirmState && (
         <ConfirmModal
           {...confirmState.options}
@@ -2362,6 +2369,9 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
 
   const project = detail?.project;
   const facts = detail?.facts || [];
+  const semanticBusinessNodeCount = businessGraph.nodes.filter(
+    (node) => (node.graph_layer || "semantic") === "semantic",
+  ).length;
   const intents = detail?.intents || [];
   const sources = detail?.sources || [];
   const currentSource =
@@ -2655,7 +2665,7 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
           <div className="status-pill">
             <span>{facts.length} 个事实</span>
             <span>{intents.length} 个意图</span>
-            <span>{businessGraph.nodes.length} 个业务节点</span>
+            <span>{semanticBusinessNodeCount} 个业务语义</span>
           </div>
           <button className="ghost-button compact" type="button" onClick={() => exportProject("yaml")}>
             <Download size={16} />
@@ -3166,12 +3176,15 @@ function Inspector({
 }) {
   const facts = detail.facts;
   const intents = detail.intents;
+  const semanticBusinessNodeCount = businessGraph.nodes.filter(
+    (node) => (node.graph_layer || "semantic") === "semantic",
+  ).length;
   const fact = selected?.type === "fact" ? facts.find((item) => item.id === selected.id) : null;
   const intent = selected?.type === "intent" ? intents.find((item) => item.id === selected.id) : null;
   const tabs = [
     ["details", "详情", null],
     ["sources", "源码", sources.length],
-    ["business", "业务", businessGraph.nodes.length],
+    ["business", "业务", semanticBusinessNodeCount],
     ["hints", "提示", detail.hints.length],
     ["tools", "工具", toolPlan.length + toolScanTasks.length],
     ["findings", "发现", auditFindings.length + auditCandidates.length],
@@ -4144,12 +4157,22 @@ function isHighRiskBusinessNode(node) {
 }
 
 function hasBusinessCoverage(node) {
+  if (
+    ["model", "mixed"].includes(node.source_kind || "model")
+    && (node.evidence_status || "unverified") !== "source_backed"
+  ) {
+    return false;
+  }
   if (node.review_status === "covered") return true;
   return node.review_status === "blocked" && String(node.coverage_note || "").trim();
 }
 
 function getBusinessConclusionIssue(node, conclusion, auditFindingById) {
   if (!isHighRiskBusinessNode(node)) return null;
+  if (
+    ["model", "mixed"].includes(node.source_kind || "model")
+    && (node.evidence_status || "unverified") !== "source_backed"
+  ) return "源码证据未验证";
   if (!hasBusinessCoverage(node)) return "缺少覆盖";
   if (!conclusion) return "缺少结论";
   if (conclusion.conclusion === "confirmed_finding") {
@@ -4173,7 +4196,7 @@ function BusinessGraphPanel({
   const nodes = graph.nodes || [];
   const edges = graph.edges || [];
   const conclusions = graph.conclusions || [];
-  const [layerFilter, setLayerFilter] = useState("all");
+  const [layerFilter, setLayerFilter] = useState("semantic");
   const layerCounts = useMemo(
     () =>
       nodes.reduce(
@@ -5278,13 +5301,21 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
     await load();
   };
 
-  const exportMd = async ({ selected = [], title = "vulnerabilities", scopeFilters = {} }) => {
-    const params = new URLSearchParams({ format: "md" });
+  const exportReport = async ({ selected = [], title = "vulnerabilities", scopeFilters = {}, format = "bundle" }) => {
+    const formatMeta = {
+      bundle: { extension: "zip", label: "审计交付包" },
+      docx: { extension: "docx", label: "Word 报告" },
+      pdf: { extension: "pdf", label: "PDF 报告" },
+      md: { extension: "md", label: "Markdown 报告" },
+    }[format] || { extension: format, label: "审计报告" };
+    const params = new URLSearchParams({ format });
     if (selected.length) params.set("vulnerability_ids", selected.join(","));
     if (!selected.length && scopeFilters.project_id) params.set("project_id", scopeFilters.project_id);
     if (!selected.length && scopeFilters.severity) params.set("severity", scopeFilters.severity);
     if (!selected.length && scopeFilters.status) params.set("status", scopeFilters.status);
-    await runAction("MD 报告已生成", () => downloadFromApi(`/api/vulnerabilities/export?${params}`, `${title}.md`));
+    await runAction(`${formatMeta.label}已生成`, () =>
+      downloadFromApi(`/api/vulnerabilities/export?${params}`, `${title}.${formatMeta.extension}`),
+    );
   };
 
   const enqueueReportMaterials = async (items) => {
@@ -5403,7 +5434,7 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
             onClick={() => setExportOpen(true)}
           >
             <Download size={18} />
-            MD 导出
+            报告交付
           </button>
         }
       />
@@ -5523,7 +5554,7 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
                     onSelect={() => toggleSelected(vuln.id)}
                     expanded={!!expandedVulns[vuln.id]}
                     onToggle={() => setExpandedVulns({ ...expandedVulns, [vuln.id]: !expandedVulns[vuln.id] })}
-                    onExport={() => exportMd({ selected: [vuln.id], title: `${vuln.project_id}-${vuln.fact_id}` })}
+                    onExport={() => exportReport({ selected: [vuln.id], title: `${vuln.project_id}-${vuln.fact_id}` })}
                     onStatusChange={(status) => updateVulnerabilityStatus(vuln, status)}
                   />
                 ))}
@@ -5594,11 +5625,12 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
           visibleCount={filteredVulnCount}
           onClose={() => setExportOpen(false)}
           onEnqueueReportMaterials={enqueueReportMaterials}
-          onSubmit={async ({ mode, scopeFilters }) => {
-            await exportMd({
+          onSubmit={async ({ mode, scopeFilters, format }) => {
+            await exportReport({
               selected: mode === "selected" ? selectedIds : [],
               title: mode === "selected" ? "rabbit-selected-vulnerabilities" : "rabbit-vulnerabilities",
               scopeFilters,
+              format,
             });
             setExportOpen(false);
           }}
@@ -5622,6 +5654,7 @@ function ReportExportModal({
 }) {
   const [form, setForm] = useState({
     mode: selectedCount ? "selected" : "filtered",
+    format: "bundle",
     project_id: filters.project_id || "",
     severity: filters.severity || "",
     status: filters.status || "",
@@ -5662,6 +5695,7 @@ function ReportExportModal({
     try {
       await onSubmit({
         mode: form.mode,
+        format: form.format,
         scopeFilters: {
           project_id: form.project_id,
           severity: form.severity,
@@ -5681,8 +5715,30 @@ function ReportExportModal({
     }
   };
   return (
-    <Modal title="MD 报告导出" subtitle="导出的 Markdown 会包含摘要页、漏洞清单、修复建议汇总和逐项证据。" onClose={onClose}>
+    <Modal title="审计报告交付" subtitle="生成可归档交付包，或单独导出 Word、PDF 与 Markdown。" onClose={onClose}>
       <form className="stack-form modal-body" onSubmit={submit}>
+        <div className="report-format-picker" role="group" aria-label="报告格式">
+          {[
+            ["bundle", "交付包", "Word、PDF、MD、JSON 与校验清单"],
+            ["docx", "Word", "正式可编辑报告"],
+            ["pdf", "PDF", "正式只读报告"],
+            ["md", "Markdown", "完整技术原文"],
+          ].map(([key, label, description]) => (
+            <button
+              className={cn(form.format === key && "active")}
+              type="button"
+              aria-pressed={form.format === key}
+              key={key}
+              onClick={() => setForm({ ...form, format: key })}
+            >
+              {key === "bundle" ? <FileArchive size={17} /> : <FileText size={17} />}
+              <span>
+                <strong>{label}</strong>
+                <small>{description}</small>
+              </span>
+            </button>
+          ))}
+        </div>
         <label>
           <span>导出范围</span>
           <select value={form.mode} onChange={(event) => setForm({ ...form, mode: event.target.value })}>
@@ -5722,7 +5778,7 @@ function ReportExportModal({
             </div>
           </>
         )}
-        <div className="soft-box compact">
+        <div className={cn("soft-box compact report-readiness", missingReportMaterials.length ? "warning-box" : "ready")}>
           当前导出范围预估 {scopedVulnerabilities.length} 条；其中 {missingReportMaterials.length} 条已确认漏洞缺少已完成的报告材料。
           {activeReportMaterials.length ? ` ${activeReportMaterials.length} 个报告材料任务正在等待或生成。` : " "}
           导出不会自动触发扫描或动态验证。
@@ -5739,7 +5795,7 @@ function ReportExportModal({
           <button className="ghost-button" type="button" onClick={onClose}>取消</button>
           <button className="primary-button compact" type="submit" disabled={saving || (form.mode === "selected" && !selectedCount)}>
             {saving ? <Loader2 className="spin" size={18} /> : <Download size={18} />}
-            导出 MD
+            {form.format === "bundle" ? "生成交付包" : `导出 ${form.format === "docx" ? "Word" : form.format.toUpperCase()}`}
           </button>
         </div>
       </form>
@@ -5773,7 +5829,7 @@ function ExportRecordsView({ setToast, confirmAction }) {
     return () => window.clearInterval(timer);
   }, [load]);
 
-  const formatLabels = { md: "Markdown", markdown: "Markdown", json: "JSON", csv: "CSV", pdf: "PDF", docx: "Word", word: "Word" };
+  const formatLabels = { bundle: "交付包", zip: "交付包", md: "Markdown", markdown: "Markdown", json: "JSON", csv: "CSV", pdf: "PDF", docx: "Word", word: "Word" };
 
   const redownload = async (record) => {
     setBusyId(record.id);
@@ -7521,12 +7577,14 @@ function PasswordModal({ onClose, runAction }) {
   );
 }
 
-function SettingsModal({ onClose, runAction }) {
+function SettingsModal({ onClose, runAction, confirmAction }) {
   const [settings, setSettings] = useState(null);
   const [health, setHealth] = useState(null);
   const [healthLoading, setHealthLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [cleaning, setCleaning] = useState(false);
+  const [backups, setBackups] = useState([]);
+  const [backupBusy, setBackupBusy] = useState(null);
 
   const settingsFallback = useMemo(
     () => ({
@@ -7564,6 +7622,19 @@ function SettingsModal({ onClose, runAction }) {
     loadHealth();
   }, [loadHealth]);
 
+  const loadBackups = useCallback(async () => {
+    try {
+      const rows = await apiRequest("/api/maintenance/backups?limit=20");
+      setBackups(Array.isArray(rows) ? rows : []);
+    } catch {
+      setBackups([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadBackups();
+  }, [loadBackups]);
+
   const submit = async (event) => {
     event.preventDefault();
     setSaving(true);
@@ -7582,6 +7653,52 @@ function SettingsModal({ onClose, runAction }) {
       await loadHealth();
     } finally {
       setCleaning(false);
+    }
+  };
+
+  const createBackup = async () => {
+    setBackupBusy("create");
+    try {
+      await runAction("数据库备份已创建并通过完整性校验", () =>
+        apiRequest("/api/maintenance/backups", {
+          method: "POST",
+          body: { label: "手动备份" },
+        }),
+      );
+      await Promise.all([loadBackups(), loadHealth()]);
+    } finally {
+      setBackupBusy(null);
+    }
+  };
+
+  const verifyBackup = async (backup) => {
+    setBackupBusy(backup.id);
+    try {
+      await runAction("备份完整性校验通过", () =>
+        apiRequest(`/api/maintenance/backups/${backup.id}/verify`, { method: "POST" }),
+      );
+      await loadBackups();
+    } finally {
+      setBackupBusy(null);
+    }
+  };
+
+  const restoreBackup = async (backup) => {
+    const confirmed = await confirmAction({
+      title: "恢复数据库备份？",
+      message: `将数据库恢复到 ${formatTime(backup.created_at)} 的状态。系统会先创建恢复前安全备份，所有项目必须处于停止状态。`,
+      tone: "danger",
+      confirmLabel: "确认恢复",
+    });
+    if (!confirmed) return;
+    setBackupBusy(`restore:${backup.id}`);
+    try {
+      await runAction("数据库已恢复，恢复前安全备份已保留", () =>
+        apiRequest(`/api/maintenance/backups/${backup.id}/restore`, { method: "POST" }),
+      );
+      await Promise.all([loadBackups(), loadHealth()]);
+    } finally {
+      setBackupBusy(null);
     }
   };
 
@@ -7655,6 +7772,53 @@ function SettingsModal({ onClose, runAction }) {
                 <small className="field-hint">同一 Worker 暂时拒绝任务后，再次尝试分配的等待时间。</small>
               </label>
             </div>
+          </section>
+
+          <section className="settings-section">
+            <div className="settings-section-head">
+              <div>
+                <h3>备份与恢复</h3>
+                <p>创建 SQLite 一致性备份并校验 SHA-256；恢复前会自动保留当前数据库。</p>
+              </div>
+              <button className="primary-outline compact" type="button" onClick={createBackup} disabled={Boolean(backupBusy)}>
+                {backupBusy === "create" ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
+                创建备份
+              </button>
+            </div>
+            {backups.length === 0 ? (
+              <div className="soft-box">尚无数据库备份。建议在导入大型项目和系统升级前创建备份。</div>
+            ) : (
+              <div className="backup-list">
+                {backups.map((backup) => (
+                  <article className="backup-row" key={backup.id}>
+                    <div className="backup-main">
+                      <strong>{backup.label || backup.filename}</strong>
+                      <span>{formatTime(backup.created_at)} · {formatBytes(backup.size_bytes)}</span>
+                      <code title={backup.sha256}>SHA-256 {backup.sha256.slice(0, 20)}...</code>
+                    </div>
+                    <Badge tone={backup.integrity_status === "ok" ? "success" : "danger"}>
+                      {backup.integrity_status === "ok" ? "校验通过" : "校验失败"}
+                    </Badge>
+                    <div className="button-row">
+                      <button className="ghost-button compact" type="button" onClick={() => verifyBackup(backup)} disabled={Boolean(backupBusy)}>
+                        {backupBusy === backup.id ? <Loader2 className="spin" size={15} /> : <ShieldCheck size={15} />}
+                        校验
+                      </button>
+                      <button
+                        className="ghost-button compact danger"
+                        type="button"
+                        onClick={() => restoreBackup(backup)}
+                        disabled={Boolean(backupBusy) || Number(health?.summary?.active_projects || 0) > 0 || backup.integrity_status !== "ok"}
+                        title={Number(health?.summary?.active_projects || 0) > 0 ? "请先停止所有活动项目" : "恢复此备份"}
+                      >
+                        {backupBusy === `restore:${backup.id}` ? <Loader2 className="spin" size={15} /> : <History size={15} />}
+                        恢复
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
           </section>
 
           <section className="settings-section">

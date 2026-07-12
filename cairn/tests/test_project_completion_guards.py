@@ -570,7 +570,7 @@ def test_complete_rejects_covered_high_risk_business_node_without_conclusion(tem
             "risk_level": "high",
             "review_status": "covered",
             "coverage_note": "reviewed upload validation and execution boundary",
-            "created_by": "worker-1",
+            "created_by": "user:completion-guard-test",
         },
     )
     assert response.status_code == 201

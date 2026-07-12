@@ -41,6 +41,12 @@ services:
       # Defaults to 30s in code; set here only to override.
       CAIRN_DISPATCHER_INTERNAL_TEST_TIMEOUT: "30"
       CAIRN_DISPATCHER_INTERNAL_TIMEOUT: "5"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
     healthcheck:
       test:
         - "CMD"
@@ -71,6 +77,12 @@ services:
       CAIRN_MODEL_PROXY_URL: "http://rabbit-audit-dispatcher:8989/internal/model-proxy/v1"
       PI_API_KEY: "${PI_API_KEY:?Set PI_API_KEY for model workers}"
       GLM_API_KEY: "${GLM_API_KEY:?Set GLM_API_KEY for disabled GLM worker configuration}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
     depends_on:
       audit-worker-image:
         condition: service_completed_successfully
