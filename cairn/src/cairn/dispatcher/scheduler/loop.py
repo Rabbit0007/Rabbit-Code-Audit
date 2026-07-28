@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
@@ -7,20 +8,24 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 import requests
 
-from cairn.dispatcher.config import DispatchConfig, WorkerConfig
+from cairn.dispatcher.config import DispatchConfig, WorkerConfig, shared_model_key
 from cairn.dispatcher.contracts import MAX_REASON_INTENT_SOURCE_FILES, REASON_SOURCE_FILE_RE
 from cairn.dispatcher.models import ReasonCheckpoint, RunningTask, TaskOutcome
 from cairn.dispatcher.protocol.client import CairnClient
 from cairn.dispatcher.runtime.cancellation import TaskCancellation
 from cairn.dispatcher.runtime.containers import ContainerManager
-from cairn.dispatcher.runtime.startup_healthcheck import format_failure_summary, run_startup_healthchecks
+from cairn.dispatcher.runtime.startup_healthcheck import (
+    format_failure_summary,
+    run_single_startup_healthcheck,
+    run_startup_healthchecks,
+)
 from cairn.dispatcher.scheduler.worker_select import choose_worker
 from cairn.dispatcher.tasks.bootstrap import run_bootstrap_task
 from cairn.dispatcher.tasks.explore import run_explore_task
@@ -61,12 +66,16 @@ BOOTSTRAP_INTENT_CREATOR = "dispatcher.bootstrap"
 COMPLETION_CHECK_TRIGGER = "completion_check"
 FINDING_ID_RE = re.compile(r"\bfinding_[0-9a-fA-F]{8,32}\b")
 REVIEW_INTENT_MARKERS = ("确认", "复核", "review", "reviews", "pending_review")
+REASON_OVERFLOW_BATCH_MAX_CANDIDATES = 8
+REASON_OVERFLOW_BATCH_MAX_SOURCE_FILES = 4
+REASON_OVERFLOW_BATCH_CREATOR = "dispatcher.reason_batch"
 
 
 @dataclass(slots=True)
 class WorkerSelection:
     worker: WorkerConfig | None
     blocked_busy: list[str]
+    blocked_shared_model: list[str]
     blocked_unhealthy: list[str]
     blocked_rate_limited: list[str]
     blocked_rejected: list[str]
@@ -335,8 +344,6 @@ class DispatcherLoop:
         self._startup_runtime_recovered = True
         for summary in summaries:
             if summary.status != "active":
-                continue
-            if summary.working_intent_count <= 0 and summary.reason is None:
                 continue
             try:
                 recovered = self.container_manager.restart_for_dispatcher_recovery(summary.id)
@@ -722,7 +729,21 @@ class DispatcherLoop:
                 reason_trigger = COMPLETION_CHECK_TRIGGER
             if reason_trigger is not None:
                 if not self._reason_parse_cooldown(project.project.id, reason_trigger):
-                    export_yaml = self.client.export_project(summary.id, profile="reason")
+                    try:
+                        export_yaml = self.client.export_project(summary.id, profile="reason")
+                    except requests.HTTPError as exc:
+                        response = exc.response
+                        if response is not None and response.status_code == 507:
+                            if self._enqueue_reason_overflow_batches(project, reason_trigger):
+                                return True
+                            self._log_changed(
+                                f"{skip_scope}:reason_context_overflow",
+                                logging.WARNING,
+                                "reason context overflow project=%s; no eligible audit-candidate batches were created",
+                                summary.id,
+                            )
+                            return False
+                        raise
                     if self._dispatch_reason(project, export_yaml, reason_trigger):
                         return True
 
@@ -900,6 +921,128 @@ class DispatcherLoop:
         self._clear_project_log_state(project.project.id)
         LOG.info("dispatched reason project=%s worker=%s trigger=%s", project.project.id, worker.name, trigger)
         return True
+
+    def _enqueue_reason_overflow_batches(self, project: ProjectDetail, trigger: str) -> bool:
+        """Turn an oversized reason context into bounded, focused explore work.
+
+        A reason export refuses to omit mandatory security coverage.  Rather
+        than enlarging every project's model context or dropping evidence, each
+        high-risk unresolved candidate is placed in a small intent batch.  The
+        existing explore path already exports candidate-focused YAML and writes
+        findings back to the project; once those batches change the project,
+        the normal reason pass can safely summarize the updated state.
+        """
+        project_id = project.project.id
+        try:
+            candidates = self.client.list_audit_candidates(project_id)
+        except Exception:
+            LOG.warning("failed to list candidates for reason overflow project=%s", project_id, exc_info=True)
+            return False
+
+        batches = self._reason_overflow_candidate_batches(candidates)
+        if not batches:
+            return False
+
+        created = 0
+        for index, batch in enumerate(batches, start=1):
+            candidate_ids = [str(candidate["id"]) for candidate in batch]
+            source_files = sorted(
+                {
+                    str(candidate["file_path"])
+                    for candidate in batch
+                    if candidate.get("file_path")
+                }
+            )
+            batch_digest = hashlib.sha256(",".join(candidate_ids).encode("utf-8")).hexdigest()[:16]
+            description = (
+                f"分批源码审计 {index}/{len(batches)}：仅处理以下高风险候选并回写可验证证据："
+                f"{', '.join(candidate_ids)}。"
+            )
+            if source_files:
+                description += f" 优先检查文件：{', '.join(source_files)}。"
+            response = self.client.create_intent(
+                project_id,
+                ["origin"],
+                description,
+                REASON_OVERFLOW_BATCH_CREATOR,
+                target_kind="audit_candidate_batch",
+                target_id=f"reason-batch-{batch_digest}",
+                objective="分批处理超大项目的高风险源码审计上下文",
+                evidence_gap="为指定候选补充源码级证据、可复现性与结论",
+            )
+            if response.ok:
+                created += 1
+                continue
+            if response.status_code == 403:
+                LOG.info("project became inactive while queuing reason overflow batches project=%s", project_id)
+                return created > 0
+            LOG.warning(
+                "failed to create reason overflow batch project=%s batch=%s/%s status=%s",
+                project_id,
+                index,
+                len(batches),
+                response.status_code,
+            )
+
+        if not created:
+            return False
+
+        # Avoid retrying the same oversized reason pass while its focused
+        # explore work is pending.  New facts from those batches will naturally
+        # trigger the usual reason cycle afterwards.
+        self.reason_checkpoints[project_id] = ReasonCheckpoint(
+            fact_count=len(project.facts),
+            hint_count=len(project.hints),
+            open_intent_count=self._project_open_intent_count(project),
+        )
+        LOG.warning(
+            "reason context overflow project=%s trigger=%s; queued %s focused audit batches",
+            project_id,
+            trigger,
+            created,
+        )
+        return True
+
+    @staticmethod
+    def _reason_overflow_candidate_batches(candidates: list[dict]) -> list[list[dict]]:
+        severity_rank = {"critical": 0, "high": 1, "unknown": 2}
+        eligible = [
+            candidate
+            for candidate in candidates
+            if candidate.get("status") in {"candidate", "investigating"}
+            and candidate.get("severity") in severity_rank
+            and not (
+                candidate.get("source") == "index"
+                and candidate.get("candidate_type") in {"entrypoint", "web_entrypoint"}
+            )
+        ]
+        eligible.sort(
+            key=lambda candidate: (
+                severity_rank[str(candidate.get("severity"))],
+                str(candidate.get("file_path") or ""),
+                str(candidate.get("id") or ""),
+            )
+        )
+
+        batches: list[list[dict]] = []
+        current: list[dict] = []
+        current_files: set[str] = set()
+        for candidate in eligible:
+            file_path = str(candidate.get("file_path") or "")
+            next_files = current_files | ({file_path} if file_path else set())
+            if current and (
+                len(current) >= REASON_OVERFLOW_BATCH_MAX_CANDIDATES
+                or len(next_files) > REASON_OVERFLOW_BATCH_MAX_SOURCE_FILES
+            ):
+                batches.append(current)
+                current = []
+                current_files = set()
+            current.append(candidate)
+            if file_path:
+                current_files.add(file_path)
+        if current:
+            batches.append(current)
+        return batches
 
     def _dispatch_bootstrap(self, project: ProjectDetail, intent: Intent) -> bool:
         if self._source_preflight_blocked(project.project.id, "bootstrap"):
@@ -1247,6 +1390,7 @@ class DispatcherLoop:
         excluded_workers = excluded_workers or set()
         candidates: list[WorkerConfig] = []
         blocked_busy: list[str] = []
+        blocked_shared_model: list[str] = []
         blocked_unhealthy: list[str] = []
         blocked_rate_limited: list[str] = []
         blocked_rejected: list[str] = []
@@ -1256,6 +1400,9 @@ class DispatcherLoop:
         running_counts = self._worker_counts()
         with self._config_lock:
             workers = list(self.config.workers)
+            runtime = getattr(self.config, "runtime", None)
+            shared_model_max_running = getattr(runtime, "shared_model_max_running", None)
+        shared_model_counts = self._shared_model_counts(workers)
         for worker in workers:
             if not worker.enabled:
                 blocked_disabled.append(worker.name)
@@ -1269,6 +1416,16 @@ class DispatcherLoop:
             running = running_counts.get(worker.name, 0)
             if running >= worker.max_running:
                 blocked_busy.append(f"{worker.name}({running}/{worker.max_running})")
+                continue
+            model_key = shared_model_key(worker)
+            if (
+                shared_model_max_running is not None
+                and model_key is not None
+                and shared_model_counts.get(model_key, 0) >= shared_model_max_running
+            ):
+                blocked_shared_model.append(
+                    f"{worker.name}({shared_model_counts[model_key]}/{shared_model_max_running})"
+                )
                 continue
             unhealthy_until = self.worker_unhealthy_until.get(worker.name, 0)
             if unhealthy_until > now:
@@ -1285,10 +1442,11 @@ class DispatcherLoop:
             candidates.append(worker)
         if not candidates:
             LOG.debug(
-                "worker selection project=%s task=%s no candidates blocked_busy=%s blocked_unhealthy=%s blocked_rate_limited=%s blocked_rejected=%s blocked_task_type=%s blocked_disabled=%s blocked_policy=%s",
+                "worker selection project=%s task=%s no candidates blocked_busy=%s blocked_shared_model=%s blocked_unhealthy=%s blocked_rate_limited=%s blocked_rejected=%s blocked_task_type=%s blocked_disabled=%s blocked_policy=%s",
                 project_id,
                 task_type,
                 blocked_busy,
+                blocked_shared_model,
                 blocked_unhealthy,
                 blocked_rate_limited,
                 blocked_rejected,
@@ -1299,6 +1457,7 @@ class DispatcherLoop:
             return WorkerSelection(
                 worker=None,
                 blocked_busy=blocked_busy,
+                blocked_shared_model=blocked_shared_model,
                 blocked_unhealthy=blocked_unhealthy,
                 blocked_rate_limited=blocked_rate_limited,
                 blocked_rejected=blocked_rejected,
@@ -1308,11 +1467,12 @@ class DispatcherLoop:
             )
         ordered = choose_worker(candidates, running_counts)
         LOG.debug(
-            "worker selection project=%s task=%s candidates=%s blocked_busy=%s blocked_unhealthy=%s blocked_rate_limited=%s blocked_rejected=%s blocked_task_type=%s blocked_disabled=%s blocked_policy=%s chosen=%s",
+            "worker selection project=%s task=%s candidates=%s blocked_busy=%s blocked_shared_model=%s blocked_unhealthy=%s blocked_rate_limited=%s blocked_rejected=%s blocked_task_type=%s blocked_disabled=%s blocked_policy=%s chosen=%s",
             project_id,
             task_type,
             [f"{worker.name}({running_counts.get(worker.name, 0)}/{worker.max_running},p{worker.priority})" for worker in candidates],
             blocked_busy,
+            blocked_shared_model,
             blocked_unhealthy,
             blocked_rate_limited,
             blocked_rejected,
@@ -1324,6 +1484,7 @@ class DispatcherLoop:
         return WorkerSelection(
             worker=ordered[0] if ordered else None,
             blocked_busy=blocked_busy,
+            blocked_shared_model=blocked_shared_model,
             blocked_unhealthy=blocked_unhealthy,
             blocked_rate_limited=blocked_rate_limited,
             blocked_rejected=blocked_rejected,
@@ -1340,6 +1501,20 @@ class DispatcherLoop:
             *getattr(self, "report_futures", {}).values(),
         ]:
             counts[task.worker_name] = counts.get(task.worker_name, 0) + 1
+        return counts
+
+    def _shared_model_counts(self, workers: list[WorkerConfig]) -> dict[tuple[str, str, str, str], int]:
+        workers_by_name = {worker.name: worker for worker in workers}
+        counts: dict[tuple[str, str, str, str], int] = {}
+        for task in [
+            *self.futures.values(),
+            *getattr(self, "review_futures", {}).values(),
+            *getattr(self, "report_futures", {}).values(),
+        ]:
+            worker = workers_by_name.get(task.worker_name)
+            key = shared_model_key(worker) if worker is not None else None
+            if key is not None:
+                counts[key] = counts.get(key, 0) + 1
         return counts
 
     def _project_running_task_count(self, project_id: str) -> int:
@@ -2200,6 +2375,35 @@ class DispatcherLoop:
         if not results:
             LOG.warning("startup healthcheck skipped because no workers are enabled")
             return
+        # A shared upstream can transiently queue one probe even though the
+        # Worker is usable.  Retry each failed role once in isolation before
+        # surfacing it as unavailable; a persistent failure still remains
+        # visible and, in strict mode, still fails the command.
+        workers_by_name = {
+            worker.name: worker
+            for worker in getattr(self.config, "workers", [])
+        }
+        retried_keys: set[tuple[str, ...]] = set()
+        for index, result in enumerate(results):
+            worker = workers_by_name.get(result.worker_name)
+            if result.ok or worker is None:
+                continue
+            retry_key = shared_model_key(worker) or ("worker", worker.name)
+            if retry_key in retried_keys:
+                continue
+            retried_keys.add(retry_key)
+            LOG.info("retrying failed startup healthcheck worker=%s", result.worker_name)
+            retry = run_single_startup_healthcheck(self.config, self.container_manager, worker)
+            if retry.ok:
+                for candidate_index, candidate in enumerate(results):
+                    candidate_worker = workers_by_name.get(candidate.worker_name)
+                    candidate_key = (
+                        shared_model_key(candidate_worker) or ("worker", candidate.worker_name)
+                        if candidate_worker is not None
+                        else ("worker", candidate.worker_name)
+                    )
+                    if candidate_key == retry_key:
+                        results[candidate_index] = replace(retry, worker_name=candidate.worker_name)
         self.startup_unhealthy_workers = {result.worker_name for result in results if not result.ok}
         if any(result.ok for result in results):
             if self.startup_unhealthy_workers:

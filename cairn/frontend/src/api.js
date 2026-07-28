@@ -1,3 +1,13 @@
+export const AUTH_REQUIRED_EVENT = "rabbit:auth-required";
+
+function notifyAuthenticationRequired(path) {
+  if (typeof window === "undefined") return;
+  const authEntryPoint = /^\/api\/auth\/(?:login|register|captcha|me)(?:\?|$)/.test(path);
+  if (!authEntryPoint) {
+    window.dispatchEvent(new CustomEvent(AUTH_REQUIRED_EVENT));
+  }
+}
+
 export async function apiRequest(path, options = {}) {
   const { method = "GET", body, headers = {} } = options;
   const formData = body instanceof FormData;
@@ -21,6 +31,7 @@ export async function apiRequest(path, options = {}) {
     : await response.text().catch(() => "");
 
   if (!response.ok) {
+    if (response.status === 401) notifyAuthenticationRequired(path);
     const detail = payload?.detail ?? payload?.message ?? payload;
     const message =
       typeof detail === "string"
@@ -38,6 +49,7 @@ export async function apiRequest(path, options = {}) {
 export async function downloadFromApi(path, fallbackName = "rabbit-export.md") {
   const response = await fetch(path, { credentials: "same-origin" });
   if (!response.ok) {
+    if (response.status === 401) notifyAuthenticationRequired(path);
     const text = await response.text().catch(() => "");
     throw new Error(text || `下载失败：HTTP ${response.status}`);
   }

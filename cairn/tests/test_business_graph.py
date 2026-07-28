@@ -139,7 +139,7 @@ def test_business_graph_crud_and_export(temp_db):
     assert graph_after_delete["edges"] == []
 
 
-def test_business_graph_accepts_index_generated_inheritance_relations(temp_db):
+def test_business_graph_accepts_index_generated_type_relations(temp_db):
     client = _client(temp_db)
     project_id = _create_project(client)
 
@@ -160,7 +160,7 @@ def test_business_graph_accepts_index_generated_inheritance_relations(temp_db):
         },
     ).json()
 
-    for relation in ("extends", "extended_by"):
+    for relation in ("implements", "implemented_by", "extends", "extended_by"):
         response = client.post(
             f"/api/projects/{project_id}/business-graph/edges",
             json={
@@ -175,7 +175,12 @@ def test_business_graph_accepts_index_generated_inheritance_relations(temp_db):
 
     graph = client.get(f"/api/projects/{project_id}/business-graph")
     assert graph.status_code == 200
-    assert {edge["relation"] for edge in graph.json()["edges"]} == {"extends", "extended_by"}
+    assert {edge["relation"] for edge in graph.json()["edges"]} == {
+        "implements",
+        "implemented_by",
+        "extends",
+        "extended_by",
+    }
 
 
 def test_business_graph_merges_nodes_by_semantic_key(temp_db):

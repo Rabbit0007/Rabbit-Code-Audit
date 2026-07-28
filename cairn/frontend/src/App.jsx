@@ -5,6 +5,7 @@ import {
   Activity,
   AlertCircle,
   AlertTriangle,
+  ArrowUpRight,
   ArrowLeft,
   Bell,
   Bot,
@@ -36,6 +37,9 @@ import {
   Play,
   Plus,
   RefreshCw,
+  Server,
+  SlidersHorizontal,
+  Timer,
   Save,
   Search,
   Settings,
@@ -48,7 +52,7 @@ import {
   User,
   X,
 } from "lucide-react";
-import { apiRequest, downloadFromApi } from "./api";
+import { apiRequest, AUTH_REQUIRED_EVENT, downloadFromApi } from "./api";
 import {
   SEVERITY_META,
   STATUS_META,
@@ -397,7 +401,7 @@ function useAsyncAction(setToast) {
         return result;
       } catch (error) {
         if (error?.status === 401) {
-          setToast({ type: "danger", message: "登录状态已失效，请重新登录" });
+          setToast({ type: "warning", message: "登录状态已失效，请重新登录" });
         } else {
           setToast({ type: "danger", message: error.message || "操作失败" });
         }
@@ -412,6 +416,7 @@ export default function App() {
   const route = useRoute();
   const [user, setUser] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
+  const [authNotice, setAuthNotice] = useState("");
   const [toast, setToast] = useState(null);
   const [passwordOpen, setPasswordOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -454,11 +459,22 @@ export default function App() {
     try {
       const me = await apiRequest("/api/auth/me");
       setUser(me);
+      setAuthNotice("");
     } catch {
       setUser(null);
     } finally {
       setAuthChecked(true);
     }
+  }, []);
+
+  useEffect(() => {
+    const onAuthenticationRequired = () => {
+      setUser(null);
+      setAuthChecked(true);
+      setAuthNotice("登录状态已失效，请重新登录后继续当前操作。");
+    };
+    window.addEventListener(AUTH_REQUIRED_EVENT, onAuthenticationRequired);
+    return () => window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthenticationRequired);
   }, []);
 
   useEffect(() => {
@@ -486,7 +502,7 @@ export default function App() {
   }
 
   if (!user) {
-    return <AuthPage onAuthed={loadUser} setToast={setToast} />;
+    return <AuthPage onAuthed={loadUser} setToast={setToast} notice={authNotice} />;
   }
 
   return (
@@ -1284,7 +1300,7 @@ function focusFirstAuthError(inputRefs, fieldErrors) {
   }
 }
 
-function AuthPage({ onAuthed, setToast }) {
+function AuthPage({ onAuthed, setToast, notice = "" }) {
   const [mode, setMode] = useState("login");
   const [form, setForm] = useState({ username: "", password: "", confirm_password: "", captcha_answer: "" });
   const [captcha, setCaptcha] = useState(null);
@@ -1463,6 +1479,12 @@ function AuthPage({ onAuthed, setToast }) {
             <ShieldCheck size={16} />
             <span>验证码校验、失败次数限制和安全 Session 已启用</span>
           </div>
+          {notice && (
+            <div className="auth-form-alert session-notice" role="status">
+              <AlertCircle size={16} />
+              <span>{notice}</span>
+            </div>
+          )}
           {formError && (
             <div className="auth-form-alert" role="alert">
               <AlertCircle size={17} />
@@ -1678,6 +1700,39 @@ function EmptyState({ icon: Icon = Sparkles, title, subtitle, action }) {
   );
 }
 
+function PageErrorState({ title = "数据暂时不可用", message, onRetry }) {
+  return (
+    <div className="page-error-state" role="alert">
+      <span className="page-error-icon"><AlertCircle size={22} /></span>
+      <div>
+        <h3>{title}</h3>
+        <p>{message || "服务没有返回有效数据，请稍后重试。"}</p>
+      </div>
+      <button className="ghost-button compact" type="button" onClick={onRetry}>
+        <RefreshCw size={15} />
+        重试
+      </button>
+    </div>
+  );
+}
+
+function LoadingGrid({ count = 3, className = "project-grid" }) {
+  return (
+    <div className={cn(className, "loading-grid")} aria-label="正在加载">
+      {Array.from({ length: count }, (_, index) => (
+        <div className="loading-card" key={index}>
+          <span className="loading-line wide" />
+          <span className="loading-line medium" />
+          <div className="loading-stat-row">
+            <span /><span /><span />
+          </div>
+          <span className="loading-line full" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function Badge({ tone = "muted", children }) {
   return <span className={cn("badge", tone)}>{children}</span>;
 }
@@ -1876,17 +1931,22 @@ function DashboardPage({ runAction, setToast }) {
 function ProjectsPage({ runAction, setToast, confirmAction }) {
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
   const [newOpen, setNewOpen] = useState(false);
   const [reopenTarget, setReopenTarget] = useState(null);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
+    setLoadError("");
     try {
       setProjects(await apiRequest("/projects"));
     } catch (error) {
-      setToast({ type: "danger", message: error.message || "项目加载失败" });
+      setLoadError(error?.status === 401 ? "登录状态已失效，请重新登录。" : (error.message || "项目加载失败"));
+      if (error?.status !== 401) setToast({ type: "danger", message: error.message || "项目加载失败" });
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [setToast]);
 
@@ -1901,6 +1961,15 @@ function ProjectsPage({ runAction, setToast, confirmAction }) {
     const stopped = projects.filter((project) => project.status === "stopped").length;
     return { total, active, completed, stopped };
   }, [projects]);
+
+  const filteredProjects = useMemo(() => {
+    const normalized = query.trim().toLowerCase();
+    return projects.filter((project) => {
+      const matchesStatus = statusFilter === "all" || project.status === statusFilter;
+      const matchesQuery = !normalized || `${project.title} ${project.id}`.toLowerCase().includes(normalized);
+      return matchesStatus && matchesQuery;
+    });
+  }, [projects, query, statusFilter]);
 
   const deleteProject = async (project) => {
     const ok = await confirmAction({
@@ -1954,22 +2023,38 @@ function ProjectsPage({ runAction, setToast, confirmAction }) {
               <Plus size={18} />
               新建项目
             </button>
-            <button className="ghost-button" type="button" onClick={load}>
-              <RefreshCw size={18} />
+            <button className="ghost-button" type="button" onClick={() => load()} disabled={loading}>
+              <RefreshCw className={cn(loading && "spin")} size={18} />
               刷新
             </button>
           </>
         }
       />
       <section className="content-wrap">
-        <div className="metric-grid">
-          <MetricCard label="全部项目" value={counts.total} tone="info" />
-          <MetricCard label="运行中" value={counts.active} tone="success" />
-          <MetricCard label="已完成" value={counts.completed} tone="muted" />
-          <MetricCard label="已停止" value={counts.stopped} tone="warning" />
+            <div className="metric-grid">
+          <MetricCard label="全部项目" value={counts.total} tone="info" onClick={() => setStatusFilter("all")} />
+          <MetricCard label="运行中" value={counts.active} tone="success" onClick={() => setStatusFilter("active")} />
+          <MetricCard label="已完成" value={counts.completed} tone="muted" onClick={() => setStatusFilter("completed")} />
+          <MetricCard label="已停止" value={counts.stopped} tone="warning" onClick={() => setStatusFilter("stopped")} />
+        </div>
+        {loadError && projects.length > 0 && <PageErrorState message={loadError} onRetry={() => load()} />}
+        <div className="collection-toolbar">
+          <div className="collection-search">
+            <Search size={16} />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索项目名称或编号" aria-label="搜索项目名称或编号" />
+            {query && <button type="button" onClick={() => setQuery("")} aria-label="清除搜索"><X size={14} /></button>}
+          </div>
+          <div className="segmented filter-segment" role="tablist" aria-label="项目状态筛选">
+            {[['all', '全部'], ['active', '运行中'], ['stopped', '已停止'], ['completed', '已完成']].map(([value, label]) => (
+              <button key={value} type="button" className={cn(statusFilter === value && "active")} onClick={() => setStatusFilter(value)}>{label}</button>
+            ))}
+          </div>
+          <span className="collection-count"><SlidersHorizontal size={14} /> {filteredProjects.length} 个项目</span>
         </div>
         {loading ? (
-          <EmptyState icon={Loader2} title="正在加载项目" />
+          <LoadingGrid count={3} />
+        ) : loadError && projects.length === 0 ? (
+          <PageErrorState title="项目列表加载失败" message={loadError} onRetry={() => load()} />
         ) : projects.length === 0 ? (
           <EmptyState
             icon={Folder}
@@ -1982,9 +2067,11 @@ function ProjectsPage({ runAction, setToast, confirmAction }) {
               </button>
             }
           />
+        ) : filteredProjects.length === 0 ? (
+          <EmptyState icon={Search} title="没有匹配的项目" subtitle="换一个关键词或清除当前筛选条件。" action={<button className="ghost-button compact" type="button" onClick={() => { setQuery(""); setStatusFilter("all"); }}><X size={15} /> 清除筛选</button>} />
         ) : (
           <div className="project-grid">
-            {projects.map((project) => (
+            {filteredProjects.map((project) => (
               <ProjectCard
                 key={project.id}
                 project={project}
@@ -6520,67 +6607,51 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
   const [workers, setWorkers] = useState([]);
   const [config, setConfig] = useState(null);
   const [history, setHistory] = useState({});
-  const [expanded, setExpanded] = useState({});
   const [editor, setEditor] = useState(null);
+  const [historyWorker, setHistoryWorker] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
   const [lastUpdated, setLastUpdated] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [loadErrors, setLoadErrors] = useState({ status: "", config: "" });
+  const [workerQuery, setWorkerQuery] = useState("");
+  const [workerFilter, setWorkerFilter] = useState("all");
+  const [workerView, setWorkerView] = useState("nodes");
   const [toolTaskQueue, setToolTaskQueue] = useState([]);
   const [reportTaskQueue, setReportTaskQueue] = useState([]);
   const [taskBusyId, setTaskBusyId] = useState(null);
-  const expandedRef = useRef(expanded);
-
-  useEffect(() => {
-    expandedRef.current = expanded;
-  }, [expanded]);
 
   const fetchWorkerHistory = useCallback((workerName) => {
     return apiRequest(`/api/workers/${encodeURIComponent(workerName)}/history`);
   }, []);
 
   const load = useCallback(async () => {
-    try {
-      const [statusList, configPayload, toolQueuePayload, reportQueuePayload] = await Promise.all([
-        apiRequest("/api/workers").catch((error) => {
-          setToast({ type: "warning", message: error.message || "工作节点状态暂不可用" });
-          return [];
-        }),
-        apiRequest("/api/workers/config").catch((error) => {
-          setToast({ type: "warning", message: error.message || "Worker 配置暂不可用" });
-          return null;
-        }),
-        apiRequest("/api/tool-scan-tasks?limit=80").catch(() => []),
-        apiRequest("/api/report-enrichment-tasks?limit=80").catch(() => []),
-      ]);
-      setWorkers(statusList);
-      setConfig(configPayload);
-      setToolTaskQueue(Array.isArray(toolQueuePayload) ? toolQueuePayload : []);
-      setReportTaskQueue(Array.isArray(reportQueuePayload) ? reportQueuePayload : []);
+    setRefreshing(true);
+    setLoadErrors({ status: "", config: "" });
+    const [statusResult, configResult, toolQueueResult, reportQueueResult] = await Promise.allSettled([
+      apiRequest("/api/workers"),
+      apiRequest("/api/workers/config"),
+      apiRequest("/api/tool-scan-tasks?limit=80"),
+      apiRequest("/api/report-enrichment-tasks?limit=80"),
+    ]);
+    if (statusResult.status === "fulfilled" && Array.isArray(statusResult.value)) {
+      setWorkers(statusResult.value);
       setLastUpdated(new Date());
-      const expandedWorkers = Object.entries(expandedRef.current)
-        .filter(([, open]) => open)
-        .map(([name]) => name);
-      if (expandedWorkers.length) {
-        const rowsByWorker = await Promise.all(
-          expandedWorkers.map(async (name) => {
-            try {
-              return [name, await fetchWorkerHistory(name)];
-            } catch {
-              return [name, null];
-            }
-          }),
-        );
-        setHistory((prev) => {
-          const next = { ...prev };
-          for (const [name, rows] of rowsByWorker) {
-            if (Array.isArray(rows)) next[name] = rows;
-          }
-          return next;
-        });
-      }
-    } finally {
-      setLoading(false);
+    } else if (statusResult.status === "rejected" && statusResult.reason?.status !== 401) {
+      setLoadErrors((prev) => ({ ...prev, status: statusResult.reason?.message || "实时状态暂不可用" }));
     }
-  }, [fetchWorkerHistory, setToast]);
+    if (configResult.status === "fulfilled" && configResult.value) {
+      setConfig(configResult.value);
+      setLastUpdated(new Date());
+    } else if (configResult.status === "rejected" && configResult.reason?.status !== 401) {
+      setLoadErrors((prev) => ({ ...prev, config: configResult.reason?.message || "Worker 配置暂不可用" }));
+    }
+    if (toolQueueResult.status === "fulfilled") setToolTaskQueue(Array.isArray(toolQueueResult.value) ? toolQueueResult.value : []);
+    if (reportQueueResult.status === "fulfilled") setReportTaskQueue(Array.isArray(reportQueueResult.value) ? reportQueueResult.value : []);
+    setLoading(false);
+    setRefreshing(false);
+  }, []);
 
   useEffect(() => {
     load();
@@ -6636,16 +6707,40 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
   };
 
   const loadHistory = async (workerName, options = {}) => {
-    if (!options.force && history[workerName]) return;
-    const rows = await runAction(null, () => fetchWorkerHistory(workerName));
-    setHistory((prev) => ({ ...prev, [workerName]: rows }));
+    if (!options.force && history[workerName]) return history[workerName];
+    setHistoryLoading(true);
+    setHistoryError("");
+    try {
+      const rows = await fetchWorkerHistory(workerName);
+      setHistory((prev) => ({ ...prev, [workerName]: Array.isArray(rows) ? rows : [] }));
+      return rows;
+    } catch (error) {
+      if (error?.status !== 401) setHistoryError(error.message || "任务历史加载失败");
+      return [];
+    } finally {
+      setHistoryLoading(false);
+    }
   };
 
-  const toggleHistory = async (workerName) => {
-    const open = !expanded[workerName];
-    setExpanded((prev) => ({ ...prev, [workerName]: open }));
-    if (open) await loadHistory(workerName, { force: true });
+  const openHistory = async (workerName) => {
+    setHistoryWorker(workerName);
+    await loadHistory(workerName, { force: true });
   };
+
+  const visibleFilteredWorkers = useMemo(() => {
+    const normalized = workerQuery.trim().toLowerCase();
+    return visibleWorkers.filter((worker) => {
+      const status = statusByName.get(worker.name) || worker;
+      const effective = status.status || (worker.enabled === false ? "disabled" : "offline");
+      const matchesFilter = workerFilter === "all"
+        || (workerFilter === "online" && (effective === "idle" || effective === "busy"))
+        || (workerFilter === "busy" && effective === "busy")
+        || (workerFilter === "offline" && effective === "offline")
+        || (workerFilter === "disabled" && effective === "disabled");
+      const matchesQuery = !normalized || `${worker.name} ${worker.type} ${workerModelLabel(worker)}`.toLowerCase().includes(normalized);
+      return matchesFilter && matchesQuery;
+    });
+  }, [statusByName, visibleWorkers, workerFilter, workerQuery]);
 
   const saveEditor = async (worker) => {
     if (!config) return;
@@ -6719,6 +6814,12 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
     }
   };
 
+  const selectedHistoryRows = historyWorker ? history[historyWorker] || [] : [];
+  const selectedHistoryWorker = historyWorker ? visibleWorkers.find((worker) => worker.name === historyWorker) : null;
+  const queueCount = toolTaskQueue.length + reportTaskQueue.length;
+  const hasWorkerData = visibleWorkers.length > 0;
+  const workerDataUnavailable = !loading && !hasWorkerData && (loadErrors.status || loadErrors.config);
+
   return (
     <>
       <PageHeader
@@ -6732,11 +6833,11 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
               新增 Worker
             </button>
             <div className="status-pill">
-              <span className="dot success" />
+              <span className={cn("dot", lastUpdated ? "success" : "warning")} />
               <span>{lastUpdated ? `更新于 ${lastUpdated.toLocaleTimeString("zh-CN")}` : "待更新"}</span>
             </div>
-            <button className="ghost-button" type="button" onClick={load}>
-              <RefreshCw size={18} />
+            <button className="ghost-button" type="button" onClick={load} disabled={refreshing}>
+              <RefreshCw className={cn(refreshing && "spin")} size={18} />
               刷新
             </button>
           </>
@@ -6744,11 +6845,13 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
       />
       <section className="content-wrap">
         {loading ? (
-          <EmptyState icon={Loader2} title="正在读取工作节点" />
-        ) : visibleWorkers.length === 0 ? (
+          <LoadingGrid count={6} className="worker-grid" />
+        ) : workerDataUnavailable ? (
+          <PageErrorState title="工作节点暂时不可用" message={loadErrors.status || loadErrors.config} onRetry={load} />
+        ) : !hasWorkerData ? (
           <EmptyState
             icon={Bot}
-            title="暂无 Worker"
+            title="还没有配置工作节点"
             subtitle="新增 Worker 后，调度器会按优先级和并发配置分配任务。"
             action={
               <button className="primary-button compact" type="button" disabled={!config} onClick={() => setEditor(defaultWorkerDraft([]))}>
@@ -6760,103 +6863,79 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
         ) : (
           <>
             <div className="metric-grid">
-              <MetricCard label="在线" value={workerCounts.online} tone="success" />
-              <MetricCard label="离线" value={workerCounts.offline} tone="muted" />
-              <MetricCard label="运行中" value={workerCounts.running} tone="info" />
-              <MetricCard label="任务数" value={workerCounts.tasks} tone="info" />
+              <MetricCard label="在线" value={workerCounts.online} tone="success" onClick={() => setWorkerFilter("online")} />
+              <MetricCard label="离线" value={workerCounts.offline} tone="muted" onClick={() => setWorkerFilter("offline")} />
+              <MetricCard label="运行中" value={workerCounts.running} tone="info" onClick={() => setWorkerFilter("busy")} />
+              <MetricCard label="累计任务" value={workerCounts.tasks} tone="info" onClick={() => setWorkerView("queues")} />
             </div>
-            <div className="worker-grid">
-            {visibleWorkers.map((worker) => {
-              const status = statusByName.get(worker.name) || worker;
-              const statusMeta = STATUS_META[status.status || (worker.enabled === false ? "disabled" : "offline")] || STATUS_META.offline;
-              return (
-                <article className="worker-card" key={worker.name}>
-                  <header>
-                    <span className={cn("worker-dot", statusMeta.tone)} />
-                    <div>
-                      <h3>{worker.name}</h3>
-                      <p>
-                        {worker.type} · {workerModelLabel(worker)}
-                      </p>
-                    </div>
-                    <Badge tone={statusMeta.tone}>{statusMeta.label}</Badge>
-                  </header>
-                  {status.current_task && <p className="current-task">{status.current_task}</p>}
-                  <div className="project-stats">
-                    <MiniStat label="任务数" value={status.tasks_completed ?? 0} />
-                    <MiniStat label="平均" value={status.avg_duration_seconds ? `${status.avg_duration_seconds}s` : "-"} />
-                    <MiniStat label="心跳" value={relativeHeartbeat(status.last_heartbeat_seconds_ago)} />
+            {(loadErrors.status || loadErrors.config) && (
+              <div className="data-warning-banner" role="status">
+                <AlertTriangle size={16} />
+                <span>{loadErrors.status || loadErrors.config}</span>
+                <button type="button" onClick={load}>重新读取</button>
+              </div>
+            )}
+            <div className="workspace-switcher" role="tablist" aria-label="工作节点视图">
+              <button type="button" className={cn(workerView === "nodes" && "active")} onClick={() => setWorkerView("nodes")}><Server size={16} /> 节点概览 <span>{visibleWorkers.length}</span></button>
+              <button type="button" className={cn(workerView === "queues" && "active")} onClick={() => setWorkerView("queues")}><Timer size={16} /> 任务队列 <span>{queueCount}</span></button>
+            </div>
+            {workerView === "nodes" ? (
+              <>
+                <div className="collection-toolbar worker-toolbar">
+                  <div className="collection-search">
+                    <Search size={16} />
+                    <input value={workerQuery} onChange={(event) => setWorkerQuery(event.target.value)} placeholder="搜索节点、类型或模型" aria-label="搜索工作节点" />
+                    {workerQuery && <button type="button" onClick={() => setWorkerQuery("")} aria-label="清除搜索"><X size={14} /></button>}
                   </div>
-                  <div className="card-actions">
-                    <button
-                      className={cn("ghost-button compact", worker.enabled === false ? "" : "warning")}
-                      type="button"
-                      disabled={!config}
-                      onClick={() => setEnabled(worker, worker.enabled === false)}
-                    >
-                      {worker.enabled === false ? <Play size={16} /> : <Pause size={16} />}
-                      {worker.enabled === false ? "启用" : "关闭"}
-                    </button>
-                    <button className="ghost-button compact" type="button" disabled={!config} onClick={() => testWorker(worker)}>
-                      <Activity size={16} />
-                      测试
-                    </button>
-                    <button className="ghost-button compact" type="button" disabled={!config} onClick={() => setEditor(worker)}>
-                      <Settings size={16} />
-                      编辑
-                    </button>
+                  <div className="segmented filter-segment" role="tablist" aria-label="工作节点筛选">
+                    {[['all', '全部'], ['online', '在线'], ['busy', '运行中'], ['offline', '离线'], ['disabled', '已关闭']].map(([value, label]) => (
+                      <button key={value} type="button" className={cn(workerFilter === value && "active")} onClick={() => setWorkerFilter(value)}>{label}</button>
+                    ))}
                   </div>
-                  <button className="history-toggle" type="button" onClick={() => toggleHistory(worker.name)}>
-                    {expanded[worker.name] ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
-                    {expanded[worker.name] ? "隐藏任务历史" : "显示任务历史"}
-                  </button>
-                  {expanded[worker.name] && (
-                    <div className="history-list">
-                      {(history[worker.name] || []).length === 0 ? (
-                        <p>该工作节点暂无任务历史记录。</p>
-                      ) : (
-                        history[worker.name].map((row, index) => (
-                          <article
-                            className={cn(row.outcome !== "success" && "history-row-attention")}
-                            key={`${row.started_at}-${index}`}
-                          >
-                            <div className="history-row-header">
-                              <strong>{row.task_type}</strong>
-                              <Badge tone={workerHistoryOutcomeTone(row)}>{workerHistoryOutcomeLabel(row)}</Badge>
+                  <span className="collection-count"><SlidersHorizontal size={14} /> {visibleFilteredWorkers.length} 个节点</span>
+                </div>
+                {visibleFilteredWorkers.length === 0 ? (
+                  <EmptyState icon={Search} title="没有匹配的工作节点" subtitle="尝试清除搜索或切换状态筛选。" action={<button className="ghost-button compact" type="button" onClick={() => { setWorkerQuery(""); setWorkerFilter("all"); }}><X size={15} /> 清除筛选</button>} />
+                ) : (
+                  <div className="worker-grid">
+                    {visibleFilteredWorkers.map((worker) => {
+                      const status = statusByName.get(worker.name) || worker;
+                      const statusMeta = STATUS_META[status.status || (worker.enabled === false ? "disabled" : "offline")] || STATUS_META.offline;
+                      const taskTypes = worker.task_types || [];
+                      return (
+                        <article className="worker-card" key={worker.name}>
+                          <header className="worker-card-header">
+                            <span className={cn("worker-status-orb", statusMeta.tone)}><span /></span>
+                            <div className="worker-heading">
+                              <div className="worker-name-line"><h3>{worker.name}</h3><Badge tone={statusMeta.tone}>{statusMeta.label}</Badge></div>
+                              <p>{worker.type} <span>·</span> {workerModelLabel(worker)}</p>
                             </div>
-                            <span>{row.description}</span>
-                            <small>
-                              {row.project_name} · {formatTime(row.started_at)}
-                            </small>
-                            {workerHistoryErrorText(row) && <small className="history-error">{workerHistoryErrorText(row)}</small>}
-                          </article>
-                        ))
-                      )}
-                    </div>
-                  )}
-                </article>
-              );
-            })}
-          </div>
-            <TaskOperationsPanel
-              title="工具扫描队列"
-              emptyText="暂无工具扫描任务。"
-              tasks={toolTaskQueue}
-              busyId={taskBusyId}
-              onCancel={cancelQueueTask}
-              onRetry={retryQueueTask}
-              onRefresh={load}
-            />
-            <TaskOperationsPanel
-              title="报告材料队列"
-              emptyText="暂无报告材料任务。"
-              kind="report"
-              tasks={reportTaskQueue}
-              busyId={taskBusyId}
-              onCancel={cancelReportQueueTask}
-              onRetry={retryReportQueueTask}
-              onRefresh={load}
-            />
+                          </header>
+                          {taskTypes.length > 0 && <div className="worker-task-chips">{taskTypes.slice(0, 4).map((type) => <span key={type}>{type}</span>)}{taskTypes.length > 4 && <span>+{taskTypes.length - 4}</span>}</div>}
+                          {status.current_task ? <div className="worker-current-task"><Activity size={15} /><span>{status.current_task}</span></div> : <div className="worker-current-task quiet"><Circle size={12} /><span>当前没有运行中的任务</span></div>}
+                          <div className="project-stats worker-stats">
+                            <MiniStat label="任务数" value={status.tasks_completed ?? 0} />
+                            <MiniStat label="平均耗时" value={status.avg_duration_seconds ? `${status.avg_duration_seconds}s` : "-"} />
+                            <MiniStat label="最近心跳" value={relativeHeartbeat(status.last_heartbeat_seconds_ago)} />
+                          </div>
+                          <div className="card-actions worker-actions">
+                            <button className={cn("ghost-button compact", worker.enabled === false ? "success" : "warning")} type="button" disabled={!config} onClick={() => setEnabled(worker, worker.enabled === false)}>{worker.enabled === false ? <Play size={16} /> : <Pause size={16} />}{worker.enabled === false ? "启用" : "关闭"}</button>
+                            <button className="ghost-button compact" type="button" disabled={!config} onClick={() => testWorker(worker)}><Activity size={16} /> 测试</button>
+                            <button className="ghost-button compact" type="button" disabled={!config} onClick={() => setEditor(worker)}><Settings size={16} /> 编辑</button>
+                          </div>
+                          <button className="history-toggle" type="button" onClick={() => openHistory(worker.name)}><History size={17} /> 查看任务历史 <ArrowUpRight size={15} /></button>
+                        </article>
+                      );
+                    })}
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="queue-stack">
+                <TaskOperationsPanel title="工具扫描队列" emptyText="暂无工具扫描任务。" tasks={toolTaskQueue} busyId={taskBusyId} onCancel={cancelQueueTask} onRetry={retryQueueTask} onRefresh={load} />
+                <TaskOperationsPanel title="报告材料队列" emptyText="暂无报告材料任务。" kind="report" tasks={reportTaskQueue} busyId={taskBusyId} onCancel={cancelReportQueueTask} onRetry={retryReportQueueTask} onRefresh={load} />
+              </div>
+            )}
           </>
         )}
       </section>
@@ -6868,7 +6947,49 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
           onDelete={config?.workers?.some((item) => item.name === editor.name) ? () => deleteWorker(editor) : null}
         />
       )}
+      {historyWorker && (
+        <WorkerHistoryDrawer
+          worker={selectedHistoryWorker}
+          rows={selectedHistoryRows}
+          loading={historyLoading}
+          error={historyError}
+          onClose={() => setHistoryWorker(null)}
+          onRefresh={() => loadHistory(historyWorker, { force: true })}
+        />
+      )}
     </>
+  );
+}
+
+function WorkerHistoryDrawer({ worker, rows, loading, error, onClose, onRefresh }) {
+  const [filter, setFilter] = useState("all");
+  useModalLifecycle(onClose);
+  const visibleRows = rows.filter((row) => filter === "all" || (filter === "success" ? row.outcome === "success" : row.outcome !== "success"));
+  const failedCount = rows.filter((row) => row.outcome !== "success").length;
+  const successCount = rows.length - failedCount;
+  return (
+    <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <aside className="worker-history-drawer" role="dialog" aria-modal="true" aria-label="任务历史">
+        <header className="drawer-header">
+          <div>
+            <span className="eyebrow">执行记录</span>
+            <h2>{worker?.name || "工作节点"}</h2>
+            <p>{worker?.type || "-"} · {worker ? workerModelLabel(worker) : ""}</p>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="关闭任务历史" title="关闭"><X size={18} /></button>
+        </header>
+        <div className="drawer-summary"><div><strong>{rows.length}</strong><span>最近记录</span></div><div><strong>{successCount}</strong><span>成功</span></div><div><strong className={failedCount ? "danger-text" : ""}>{failedCount}</strong><span>需关注</span></div></div>
+        <div className="drawer-toolbar"><div className="segmented filter-segment"><button type="button" className={cn(filter === "all" && "active")} onClick={() => setFilter("all")}>全部</button><button type="button" className={cn(filter === "success" && "active")} onClick={() => setFilter("success")}>成功</button><button type="button" className={cn(filter === "failed" && "active")} onClick={() => setFilter("failed")}>失败/中断</button></div><button className="ghost-button compact" type="button" onClick={onRefresh} disabled={loading}><RefreshCw className={cn(loading && "spin")} size={15} /> 刷新</button></div>
+        <div className="drawer-body">
+          {error ? <PageErrorState title="历史记录加载失败" message={error} onRetry={onRefresh} /> : loading && rows.length === 0 ? <div className="drawer-loading"><Loader2 className="spin" size={22} />正在读取记录</div> : visibleRows.length === 0 ? <EmptyState icon={History} title="暂无任务历史" subtitle="节点执行任务后，最近记录会显示在这里。" /> : visibleRows.map((row, index) => (
+            <article className={cn("history-timeline-row", row.outcome !== "success" && "attention")} key={`${row.started_at}-${row.task_type}-${index}`}>
+              <span className="history-timeline-dot" />
+              <div className="history-timeline-content"><div className="history-row-header"><strong>{row.task_type}</strong><Badge tone={workerHistoryOutcomeTone(row)}>{workerHistoryOutcomeLabel(row)}</Badge></div><p>{row.description}</p><div className="history-meta"><span>{row.project_name}</span><span>{formatTime(row.started_at)}</span>{row.duration_seconds != null && <span><Timer size={13} /> {row.duration_seconds}s</span>}</div>{workerHistoryErrorText(row) && <details><summary>查看错误详情</summary><pre>{workerHistoryErrorText(row)}</pre></details>}</div>
+            </article>
+          ))}
+        </div>
+      </aside>
+    </div>
   );
 }
 

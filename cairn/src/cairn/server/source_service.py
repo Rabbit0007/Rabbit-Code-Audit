@@ -477,6 +477,20 @@ def artifact_root() -> Path:
     return root
 
 
+def import_staging_root() -> Path:
+    """Return durable workspace storage for transient source-import files.
+
+    Source archives can be substantially larger once extracted.  Keeping them
+    in the container's security-hardened ``/tmp`` tmpfs couples the supported
+    import size to that memory-backed mount, so use the artifact volume instead
+    and let deployments override the location when needed.
+    """
+    configured = os.getenv("CAIRN_IMPORT_TEMP_ROOT")
+    root = Path(configured).expanduser() if configured else artifact_root() / "import-staging"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def snapshot_path(snapshot_id: str) -> Path:
     return artifact_root() / "snapshots" / snapshot_id / "source"
 
@@ -519,7 +533,9 @@ def import_git_source(project_id: str, repository_url: str, requested_ref: str |
     )
     destination = snapshot_path(snapshot_id)
     try:
-        with tempfile.TemporaryDirectory(prefix="rabbit-audit-git-") as temp_dir:
+        with tempfile.TemporaryDirectory(
+            prefix="rabbit-audit-git-", dir=import_staging_root()
+        ) as temp_dir:
             checkout = Path(temp_dir) / "source"
             _run_git(["clone", "--no-local", "--no-hardlinks", repository_url, str(checkout)])
             if requested_ref:
@@ -550,7 +566,9 @@ def import_zip_source(project_id: str, original_name: str, stream: BinaryIO) -> 
     )
     destination = snapshot_path(snapshot_id)
     try:
-        with tempfile.TemporaryDirectory(prefix="rabbit-audit-zip-") as temp_dir:
+        with tempfile.TemporaryDirectory(
+            prefix="rabbit-audit-zip-", dir=import_staging_root()
+        ) as temp_dir:
             archive_path = Path(temp_dir) / "upload.zip"
             archive_sha256 = _copy_limited(stream, archive_path, MAX_ARCHIVE_BYTES)
             extracted = Path(temp_dir) / "source"
@@ -4287,9 +4305,11 @@ def _ensure_code_index(snapshot: SourceSnapshot) -> None:
             (snapshot.id, snapshot.id, snapshot.id),
         ).fetchone()["count"]
         if existing:
-            _ensure_snapshot_capabilities(conn, snapshot, root)
-            _ensure_snapshot_audit_candidates(conn, snapshot, root)
-            _ensure_business_graph_seed(conn, snapshot.id)
+            # Ready snapshots are fully indexed and seeded in
+            # ``_finalize_snapshot``.  Read endpoints call this compatibility
+            # helper frequently; re-running the idempotent seed still opens a
+            # long SQLite write transaction and causes lock contention with
+            # task heartbeats and history writes.
             return
         files = _load_code_files(conn, snapshot.id)
         code_index = extract_code_index(snapshot.id, root, files)

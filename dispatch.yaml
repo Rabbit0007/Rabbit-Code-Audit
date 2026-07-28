@@ -1,10 +1,13 @@
 server: http://rabbit-audit-server:8000
 runtime:
-  max_workers: 8
+  max_workers: 5
   max_running_projects: 3
   max_project_workers: 4
   interval: 3
   healthcheck_timeout: 45
+  # All five Pi roles use the same LuminAI endpoint/model.  Keep their combined
+  # in-flight calls within the three requests that the endpoint handles reliably.
+  shared_model_max_running: 3
   prompt_group: default
 tasks:
   bootstrap:
@@ -37,138 +40,12 @@ container:
   artifact_host_path: null
   artifact_mount_path: /audit-data
 common_env:
-  PI_MODEL: deepseek-v4-pro
-  PI_BASE_URL: https://api.deepseek.com
-  PI_API_KEY: ${PI_API_KEY}
+  PI_MODEL: gpt-5.6-sol
+  PI_BASE_URL: https://vip.luminai.cc/v1
+  PI_API_KEY: ${LUMINAI_API_KEY}
   PI_PROVIDER_API: openai-completions
 workers:
-- name: gpt-5.5-1
-  type: pi
-  enabled: false
-  task_types:
-  - bootstrap
-  - reason
-  - explore
-  max_running: 1
-  priority: 0
-  env:
-    PI_MODEL: gpt-5.5
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: sk-
-    PI_PROVIDER_API: openai-completions
-- name: gpt-5.5-2
-  type: pi
-  enabled: false
-  task_types:
-  - bootstrap
-  - reason
-  - explore
-  max_running: 1
-  priority: 1
-  env:
-    PI_MODEL: gpt-5.5
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: sk-
-    PI_PROVIDER_API: openai-completions
-- name: gpt-5.5-3
-  type: pi
-  enabled: false
-  task_types:
-  - bootstrap
-  - reason
-  - explore
-  max_running: 1
-  priority: 2
-  env:
-    PI_MODEL: gpt-5.5
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: sk-
-    PI_PROVIDER_API: openai-completions
-- name: xplt-deepseek-v4-pro-1
-  type: pi
-  enabled: false
-  task_types:
-  - bootstrap
-  - reason
-  - explore
-  max_running: 1
-  priority: 3
-  env:
-    PI_MODEL: ByteDance-volcengine/DeepSeek-V4-Pro
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: sk-
-    PI_PROVIDER_API: openai-completions
-- name: xplt-deepseek-v4-pro-2
-  type: pi
-  enabled: false
-  task_types:
-  - bootstrap
-  - reason
-  - explore
-  max_running: 1
-  priority: 4
-  env:
-    PI_MODEL: ByteDance-volcengine/DeepSeek-V4-Pro
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: sk-
-    PI_PROVIDER_API: openai-completions
-- name: xplt-deepseek-v4-pro-3
-  type: pi
-  enabled: false
-  task_types:
-  - bootstrap
-  - reason
-  - explore
-  max_running: 1
-  priority: 5
-  env:
-    PI_MODEL: ByteDance-volcengine/DeepSeek-V4-Pro
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: sk-
-    PI_PROVIDER_API: openai-completions
-- name: claude-sonnet-4-6-1
-  type: pi
-  enabled: false
-  task_types:
-  - bootstrap
-  - reason
-  - explore
-  max_running: 1
-  priority: 6
-  env:
-    PI_MODEL: claude-sonnet-4-6
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: sk-
-    PI_PROVIDER_API: openai-completions
-- name: claude-sonnet-4-6-2
-  type: pi
-  enabled: false
-  task_types:
-  - bootstrap
-  - reason
-  - explore
-  max_running: 1
-  priority: 7
-  env:
-    PI_MODEL: claude-sonnet-4-6
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: sk-
-    PI_PROVIDER_API: openai-completions
-- name: claude-sonnet-4-6-3
-  type: pi
-  enabled: false
-  task_types:
-  - bootstrap
-  - reason
-  - explore
-  max_running: 1
-  priority: 8
-  env:
-    PI_MODEL: claude-sonnet-4-6
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: sk-
-    PI_PROVIDER_API: openai-completions
-- name: deepseek-v4-pro-1
+- name: gpt-5-6-sol-audit-1
   type: pi
   enabled: true
   task_types:
@@ -177,13 +54,7 @@ workers:
   - explore
   max_running: 1
   priority: 0
-  env:
-    PI_MODEL: deepseek-v4-pro
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: ${PI_API_KEY}
-    PI_PROVIDER_API: openai-completions
-    PI_MODEL_CONTEXT_WINDOW: '1000000'
-- name: deepseek-v4-pro-2
+- name: gpt-5-6-sol-audit-2
   type: pi
   enabled: true
   task_types:
@@ -191,14 +62,8 @@ workers:
   - reason
   - explore
   max_running: 1
-  priority: 1
-  env:
-    PI_MODEL: deepseek-v4-pro
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: ${PI_API_KEY}
-    PI_PROVIDER_API: openai-completions
-    PI_MODEL_CONTEXT_WINDOW: '1000000'
-- name: deepseek-v4-pro-3
+  priority: 0
+- name: gpt-5-6-sol-audit-3
   type: pi
   enabled: true
   task_types:
@@ -206,138 +71,18 @@ workers:
   - reason
   - explore
   max_running: 1
-  priority: 2
-  env:
-    PI_MODEL: deepseek-v4-pro
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: ${PI_API_KEY}
-    PI_PROVIDER_API: openai-completions
-    PI_MODEL_CONTEXT_WINDOW: '1000000'
-- name: glm-5-1
+  priority: 0
+- name: gpt-5-6-sol-report-1
   type: pi
-  enabled: false
-  task_types:
-  - bootstrap
-  - reason
-  - explore
-  max_running: 1
-  priority: 12
-  env:
-    PI_MODEL: glm-5
-    PI_BASE_URL: http://10.2.8.77:3000/v1
-    PI_API_KEY: sk-c8I3u5nHDsQpnMsT737071E106E34076A9B9140964Ac13B1
-    PI_PROVIDER_API: openai-completions
-- name: glm-5-2
-  type: pi
-  enabled: false
-  task_types:
-  - bootstrap
-  - reason
-  - explore
-  max_running: 1
-  priority: 13
-  env:
-    PI_MODEL: glm-5
-    PI_BASE_URL: http://10.2.8.77:3000/v1
-    PI_API_KEY: sk-c8I3u5nHDsQpnMsT737071E106E34076A9B9140964Ac13B1
-    PI_PROVIDER_API: openai-completions
-- name: glm-5-3
-  type: pi
-  enabled: false
-  task_types:
-  - bootstrap
-  - reason
-  - explore
-  max_running: 1
-  priority: 14
-  env:
-    PI_MODEL: glm-5
-    PI_BASE_URL: http://10.2.8.77:3000/v1
-    PI_API_KEY: sk-c8I3u5nHDsQpnMsT737071E106E34076A9B9140964Ac13B1
-    PI_PROVIDER_API: openai-completions
-- name: report-enrichment-1
-  type: pi
-  enabled: false
+  enabled: true
   task_types:
   - report_enrichment
   max_running: 1
-  priority: 15
-  env:
-    PI_MODEL: deepseek-v4-pro
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: sk-
-    PI_PROVIDER_API: openai-completions
-- name: report-enrichment-gpt55-1
-  type: pi
-  enabled: false
-  task_types:
-  - report_enrichment
-  max_running: 1
-  priority: 16
-  env:
-    PI_MODEL: gpt-5.5
-    PI_BASE_URL: https://vsllm.com/v1
-    PI_API_KEY: sk-
-    PI_PROVIDER_API: openai-completions
-- name: review-gpt55-1
-  type: pi
-  enabled: false
-  task_types:
-  - review
-  max_running: 1
-  priority: 17
-  env:
-    PI_MODEL: gpt-5.5
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: sk-
-    PI_PROVIDER_API: openai-completions
-- name: glm-5-review-1
-  type: pi
-  enabled: false
-  task_types:
-  - review
-  max_running: 1
-  priority: 18
-  env:
-    PI_MODEL: glm-5
-    PI_BASE_URL: http://10.2.8.77:3000/v1
-    PI_API_KEY: sk-c8I3u5nHDsQpnMsT737071E106E34076A9B9140964Ac13B1
-    PI_PROVIDER_API: openai-completions
-- name: glm-5-report-1
-  type: pi
-  enabled: false
-  task_types:
-  - report_enrichment
-  max_running: 1
-  priority: 19
-  env:
-    PI_MODEL: glm-5
-    PI_BASE_URL: http://10.2.8.77:3000/v1
-    PI_API_KEY: sk-c8I3u5nHDsQpnMsT737071E106E34076A9B9140964Ac13B1
-    PI_PROVIDER_API: openai-completions
-- name: deepseek-v4-pro-review-1
+  priority: 0
+- name: gpt-5-6-sol-retest-1
   type: pi
   enabled: true
   task_types:
   - review
   max_running: 1
   priority: 0
-  env:
-    PI_MODEL: deepseek-v4-pro
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: ${PI_API_KEY}
-    PI_PROVIDER_API: openai-completions
-    PI_MODEL_CONTEXT_WINDOW: '1000000'
-- name: deepseek-v4-pro-report-1
-  type: pi
-  enabled: true
-  task_types:
-  - report_enrichment
-  max_running: 1
-  priority: 0
-  env:
-    PI_MODEL: deepseek-v4-pro
-    PI_BASE_URL: https://api.deepseek.com
-    PI_API_KEY: ${PI_API_KEY}
-    PI_PROVIDER_API: openai-completions
-    PI_MODEL_CONTEXT_WINDOW: '1000000'

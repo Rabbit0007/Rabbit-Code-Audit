@@ -11,9 +11,10 @@ Behaviour (requirements 3.1, 3.2, 3.4, 3.5, 3.6, 5.1, 5.2, 5.3, 5.4):
 - Validates the token against the ``sessions`` table created by
   :mod:`cairn.server.auth_db`. A session is valid when the token exists and its
   ``expires_at`` is strictly in the future.
-- On a valid session, extends the expiration by the configured period (sliding
-  window, requirement 3.5), refreshes the cookie's ``Max-Age``, and injects the
-  user onto ``request.state``.
+- On a valid session nearing expiry, extends the expiration by the configured
+  period (sliding window, requirement 3.5), refreshes the cookie's ``Max-Age``,
+  and injects the user onto ``request.state``.  Healthy sessions remain read-only
+  so routine UI polling does not create SQLite write contention.
 - On a missing, malformed, expired, or unknown token, rejects the request and
   clears the (stale) session cookie (requirements 3.2, 3.6, 5.4):
     - browser navigation requests (``Accept: text/html``) receive a 302 redirect
@@ -99,6 +100,7 @@ INTERNAL_TOKEN_HEADER = "x-cairn-internal-token"
 # the format the auth router stores ``sessions.expires_at`` in).
 _TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _TRUTHY = {"1", "true", "yes", "on"}
+_SESSION_REFRESH_FRACTION = 0.5
 
 # Paths exempt from authentication (requirement 5.2).
 EXEMPT_PATHS = frozenset(
@@ -240,6 +242,7 @@ def require_auth(request: Request, response: Response) -> sqlite3.Row:
 
     user_row: sqlite3.Row | None = None
     session_duration = DEFAULT_SESSION_DURATION
+    refresh_session = False
     if token:
         with get_conn() as conn:
             try:
@@ -266,29 +269,36 @@ def require_auth(request: Request, response: Response) -> sqlite3.Row:
                             "DELETE FROM sessions WHERE token = ?", (token,)
                         )
                     else:
-                        # Sliding-window extension (requirement 3.5): push the
-                        # expiry out by the configured period.
-                        new_expires = now + session_duration
-                        conn.execute(
-                            "UPDATE sessions SET expires_at = ? WHERE token = ?",
-                            (_format_timestamp(new_expires), token),
-                        )
+                        # Keep the sliding window without turning every
+                        # authenticated API read into a SQLite write.  The
+                        # session is refreshed once it has consumed half of
+                        # its lifetime, which still gives an active user ample
+                        # time to make another request before expiry.
+                        refresh_after = session_duration * _SESSION_REFRESH_FRACTION
+                        if expires_at - now <= refresh_after:
+                            new_expires = now + session_duration
+                            conn.execute(
+                                "UPDATE sessions SET expires_at = ? WHERE token = ?",
+                                (_format_timestamp(new_expires), token),
+                            )
+                            refresh_session = True
                         user_row = candidate
 
     if user_row is None:
         raise _reject(request)
 
-    # Refresh the cookie's Max-Age so the sliding window is reflected client-side
-    # too, preserving the HTTP-only/Secure/SameSite attributes (requirement 3.4).
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=token,
-        max_age=int(session_duration.total_seconds()),
-        httponly=True,
-        secure=cookie_secure_for_request(request),
-        samesite="strict",
-        path="/",
-    )
+    if refresh_session:
+        # Reflect the renewed server-side expiry in the browser cookie too,
+        # preserving the HTTP-only/Secure/SameSite attributes.
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=token,
+            max_age=int(session_duration.total_seconds()),
+            httponly=True,
+            secure=cookie_secure_for_request(request),
+            samesite="strict",
+            path="/",
+        )
 
     request.state.user = {
         "id": user_row["id"],

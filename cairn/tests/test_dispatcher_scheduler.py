@@ -17,7 +17,7 @@ from cairn.dispatcher.scheduler.loop import (
     DispatcherLoop,
 )
 from cairn.dispatcher.tasks.reason import _fallback_intents_from_graph
-from cairn.dispatcher.contracts import validate_reason_payload
+from cairn.dispatcher.contracts import REASON_SOURCE_FILE_RE, validate_reason_payload
 
 
 def _scheduler_loop() -> DispatcherLoop:
@@ -61,6 +61,24 @@ def _worker(
     )
 
 
+def _pi_worker(name: str, task_types: list[str]) -> WorkerConfig:
+    return WorkerConfig.model_validate(
+        {
+            "name": name,
+            "type": "pi",
+            "task_types": task_types,
+            "max_running": 1,
+            "priority": 0,
+            "env": {
+                "PI_MODEL": "shared-model",
+                "PI_BASE_URL": "https://models.example.test/v1",
+                "PI_API_KEY": "secret",
+                "PI_PROVIDER_API": "openai-completions",
+            },
+        }
+    )
+
+
 def test_reason_contract_rejects_intents_covering_too_many_source_files():
     payload = {
         "accepted": True,
@@ -78,7 +96,53 @@ def test_reason_contract_rejects_intents_covering_too_many_source_files():
         validate_reason_payload(payload, open_intents_empty=True, max_intents=3)
 
 
-def test_dispatcher_startup_restarts_active_container_with_claimed_work():
+def test_reason_context_overflow_queues_bounded_candidate_batches():
+    loop = _scheduler_loop()
+    created: list[dict] = []
+    candidates = [
+        {
+            "id": f"cand_{index:016x}",
+            "status": "candidate",
+            "severity": "high",
+            "source": "index",
+            "candidate_type": "data_flow",
+            "file_path": f"app/module_{index // 2}.py",
+        }
+        for index in range(10)
+    ]
+    loop.client = SimpleNamespace(
+        list_audit_candidates=lambda project_id: candidates,
+        create_intent=lambda project_id, from_ids, description, creator, **kwargs: (
+            created.append(
+                {
+                    "project_id": project_id,
+                    "from": from_ids,
+                    "description": description,
+                    "creator": creator,
+                    **kwargs,
+                }
+            )
+            or SimpleNamespace(ok=True, status_code=201)
+        ),
+    )
+    loop._project_open_intent_count = lambda project: 0
+    project = SimpleNamespace(
+        project=SimpleNamespace(id="proj_1"),
+        facts=[SimpleNamespace(id="origin")],
+        hints=[],
+        intents=[],
+    )
+
+    assert loop._enqueue_reason_overflow_batches(project, "initial") is True
+    assert len(created) == 2
+    assert all(item["from"] == ["origin"] for item in created)
+    assert all(item["target_kind"] == "audit_candidate_batch" for item in created)
+    assert all(item["creator"] == "dispatcher.reason_batch" for item in created)
+    assert all(len(REASON_SOURCE_FILE_RE.findall(item["description"])) <= 4 for item in created)
+    assert loop.reason_checkpoints["proj_1"] == ReasonCheckpoint(1, 0, 0)
+
+
+def test_dispatcher_startup_restarts_every_active_container_to_clear_orphaned_execs():
     loop = _scheduler_loop()
     recovered: list[str] = []
     loop._startup_runtime_recovered = False
@@ -89,9 +153,15 @@ def test_dispatcher_startup_restarts_active_container_with_claimed_work():
         SimpleNamespace(
             id="proj_1",
             status="active",
+            working_intent_count=0,
+            reason=None,
+        ),
+        SimpleNamespace(
+            id="proj_stopped",
+            status="stopped",
             working_intent_count=2,
             reason=None,
-        )
+        ),
     ]
 
     loop._recover_active_project_containers(summaries)
@@ -389,6 +459,32 @@ def test_report_rate_limit_cooldown_blocks_only_that_task_type():
     assert report_selection.blocked_rate_limited[0].startswith("worker-a(")
     assert explore_selection.worker is not None
     assert explore_selection.worker.name == "worker-a"
+
+
+def test_shared_pi_model_capacity_is_reserved_across_worker_roles():
+    loop = _scheduler_loop()
+    audit_workers = [_pi_worker(f"audit-{index}", ["explore"]) for index in range(1, 4)]
+    report_worker = _pi_worker("report", ["report_enrichment"])
+    loop._config_lock = threading.RLock()
+    loop.config = SimpleNamespace(
+        workers=[*audit_workers, report_worker],
+        runtime=SimpleNamespace(shared_model_max_running=3),
+    )
+    loop.futures = {
+        Future(): RunningTask("proj_1", "explore", worker.name, TaskCancellation())
+        for worker in audit_workers
+    }
+
+    blocked = loop._select_worker("proj_1", "report_enrichment")
+
+    assert blocked.worker is None
+    assert blocked.blocked_shared_model == ["report(3/3)"]
+
+    loop.futures.pop(next(iter(loop.futures)))
+    available = loop._select_worker("proj_1", "report_enrichment")
+
+    assert available.worker is not None
+    assert available.worker.name == "report"
 
 
 def test_worker_retry_cooldowns_use_server_settings():

@@ -78,6 +78,13 @@ def _register(client):
     return resp
 
 
+def _session_cookie_header(response):
+    for header in response.headers.get_list("set-cookie"):
+        if header.startswith(f"{SESSION_COOKIE_NAME}="):
+            return header
+    return None
+
+
 def _captcha_payload(client):
     resp = client.get("/api/auth/captcha")
     assert resp.status_code == 200
@@ -257,3 +264,27 @@ def test_valid_session_extends_expiration_sliding_window(app_client, monkeypatch
         tzinfo=timezone.utc
     )
     assert extended > datetime.now(timezone.utc) + timedelta(hours=1)
+
+
+def test_healthy_session_validation_does_not_write_or_refresh_cookie(
+    app_client, monkeypatch
+):
+    monkeypatch.setenv(INTERNAL_TOKEN_ENV, "secret-internal-token")
+    _register(app_client)
+    token = app_client.cookies.get(SESSION_COOKIE_NAME)
+    assert token is not None
+
+    with db.get_conn() as conn:
+        expires_before = conn.execute(
+            "SELECT expires_at FROM sessions WHERE token = ?", (token,)
+        ).fetchone()["expires_at"]
+
+    response = app_client.get(PROTECTED_PATH)
+    assert response.status_code == 200
+    assert _session_cookie_header(response) is None
+
+    with db.get_conn() as conn:
+        expires_after = conn.execute(
+            "SELECT expires_at FROM sessions WHERE token = ?", (token,)
+        ).fetchone()["expires_at"]
+    assert expires_after == expires_before

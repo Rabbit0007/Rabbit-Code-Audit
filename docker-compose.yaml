@@ -35,6 +35,10 @@ services:
       CAIRN_DISPATCHER_INTERNAL_URL: "http://rabbit-audit-dispatcher:8989"
       CAIRN_DISPATCHER_INTERNAL_TOKEN: "${CAIRN_DISPATCHER_INTERNAL_TOKEN:?Set CAIRN_DISPATCHER_INTERNAL_TOKEN for dispatcher internal API auth}"
       CAIRN_ARTIFACT_ROOT: "/Users/rabbit/.rabbit-code-audit-preview/artifacts"
+      # Multipart uploads and source extraction can exceed the hardened 256 MiB
+      # /tmp tmpfs, so stage them on the persistent artifact volume instead.
+      TMPDIR: "/Users/rabbit/.rabbit-code-audit-preview"
+      CAIRN_IMPORT_TEMP_ROOT: "/Users/rabbit/.rabbit-code-audit-preview/artifacts/import-staging"
       # Timeout (seconds) for the longer-running worker connectivity test and
       # config read/write proxy calls to the dispatcher internal API. Independent
       # of CAIRN_DISPATCHER_INTERNAL_TIMEOUT (status polling, default 2.0s).
@@ -76,6 +80,7 @@ services:
       CAIRN_MODEL_PROXY_TOKEN: "${CAIRN_MODEL_PROXY_TOKEN:?Set CAIRN_MODEL_PROXY_TOKEN for isolated model proxy auth}"
       CAIRN_MODEL_PROXY_URL: "http://rabbit-audit-dispatcher:8989/internal/model-proxy/v1"
       PI_API_KEY: "${PI_API_KEY:?Set PI_API_KEY for model workers}"
+      LUMINAI_API_KEY: "${LUMINAI_API_KEY:?Set LUMINAI_API_KEY for LuminAI model workers}"
       GLM_API_KEY: "${GLM_API_KEY:?Set GLM_API_KEY for disabled GLM worker configuration}"
     cap_drop:
       - ALL

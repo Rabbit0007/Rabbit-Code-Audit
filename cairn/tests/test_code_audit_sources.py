@@ -304,6 +304,36 @@ def test_zip_source_import_creates_immutable_snapshot_and_file_index(temp_db, mo
 
     project = client.get(f"/projects/{project_id}").json()
     assert project["sources"][0]["id"] == snapshot["id"]
+    staging_root = tmp_path / "artifacts" / "import-staging"
+    assert staging_root.is_dir()
+    assert list(staging_root.iterdir()) == []
+
+
+def test_ready_source_index_reads_do_not_reseed_business_graph(temp_db, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAIRN_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = _client(temp_db)
+    project_id = _create_project(client)
+    payload = _zip_bytes({"demo/app.py": b"def hello():\n    return 'hello'\n"})
+    snapshot = client.post(
+        f"/api/projects/{project_id}/sources/zip",
+        files={"archive": ("demo.zip", payload, "application/zip")},
+    ).json()
+
+    def fail_if_reseeded(*_args, **_kwargs):
+        raise AssertionError("ready source index reads must not reseed the business graph")
+
+    monkeypatch.setattr(source_service, "_ensure_business_graph_seed", fail_if_reseeded)
+    summary = source_service.get_source_index_summary(project_id, snapshot["id"])
+
+    assert summary.symbol_count >= 0
+
+
+def test_import_staging_root_allows_a_deployment_override(monkeypatch, tmp_path):
+    configured_root = tmp_path / "separate-import-volume"
+    monkeypatch.setenv("CAIRN_IMPORT_TEMP_ROOT", str(configured_root))
+
+    assert source_service.import_staging_root() == configured_root
+    assert configured_root.is_dir()
 
 
 def test_source_import_builds_lightweight_code_structure_index(temp_db, monkeypatch, tmp_path):

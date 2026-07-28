@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from cairn.dispatcher.config import DispatchConfig, WorkerConfig
+from cairn.dispatcher.config import DispatchConfig, WorkerConfig, shared_model_key
 from cairn.dispatcher.runtime.containers import ContainerManager
 from cairn.dispatcher.tasks.common import run_healthcheck
 from cairn.dispatcher.workers.registry import get_driver
@@ -36,8 +36,24 @@ def run_startup_healthchecks(
         LOG.warning("[!] Startup healthcheck skipped: no enabled workers")
         return []
 
+    # Audit, report, and retest roles can share one exact Pi endpoint/model.
+    # Probe that connection once, then reflect its result to every role in the
+    # group.  Repeating identical probes both wastes capacity and can make a
+    # healthy role appear unavailable merely because another probe was queued.
+    representative_by_key: dict[tuple[str, ...], WorkerConfig] = {}
+    representative_for_worker: dict[str, WorkerConfig] = {}
+    for worker in workers:
+        key = shared_model_key(worker) or ("worker", worker.name)
+        representative = representative_by_key.setdefault(key, worker)
+        representative_for_worker[worker.name] = representative
+    probe_workers = list(representative_by_key.values())
+
     container_name = container_manager.create_startup_container()
-    parallelism = max(1, min(len(workers), config.runtime.max_workers, 8))
+    parallelism = max(1, min(len(probe_workers), config.runtime.max_workers, 8))
+    shared_keys = {shared_model_key(worker) for worker in probe_workers}
+    shared_limit = config.runtime.shared_model_max_running
+    if shared_limit is not None and len(shared_keys) == 1 and None not in shared_keys:
+        parallelism = min(parallelism, shared_limit)
     LOG.info(
         "[*] Startup healthcheck: workers=%s parallelism=%s",
         len(workers),
@@ -53,7 +69,7 @@ def run_startup_healthchecks(
                     worker,
                     config.runtime.healthcheck_timeout,
                 ): worker.name
-                for worker in workers
+                for worker in probe_workers
             }
             results: list[StartupHealthcheckResult] = []
             for future in as_completed(future_map):
@@ -77,6 +93,11 @@ def run_startup_healthchecks(
         LOG.debug("removing startup healthcheck container container=%s", container_name)
         container_manager.remove_container(container_name, force=True)
 
+    results_by_worker = {result.worker_name: result for result in results}
+    results = [
+        replace(results_by_worker[representative_for_worker[worker.name].name], worker_name=worker.name)
+        for worker in workers
+    ]
     results.sort(key=lambda result: result.worker_name)
     _log_report(results, show_commands=show_commands)
     return results

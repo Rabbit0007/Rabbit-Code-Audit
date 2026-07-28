@@ -262,6 +262,7 @@ class RuntimeConfig(BaseModel):
     max_project_workers: int = Field(gt=0)
     interval: int = Field(gt=0)
     healthcheck_timeout: int = Field(gt=0)
+    shared_model_max_running: int | None = Field(default=None, gt=0)
     prompt_group: str = Field(min_length=1)
 
 
@@ -299,6 +300,25 @@ class WorkerConfig(BaseModel):
         if self.type == "mock":
             resolve_mock_behavior(self.name, self.env)
         return self
+
+
+def shared_model_key(worker: WorkerConfig) -> tuple[str, str, str, str] | None:
+    """Return a quota-sharing key for workers backed by the same Pi model.
+
+    Worker names identify roles (audit, report, retest), not independent model
+    capacity.  Pi workers that use the same endpoint, provider API, and model
+    therefore need to share a scheduler limit.  Credentials are deliberately
+    excluded so they are never copied into status output or log messages.
+    """
+    if getattr(worker, "type", None) != "pi":
+        return None
+    env = getattr(worker, "env", {})
+    return (
+        "pi",
+        env.get("PI_BASE_URL", "").rstrip("/"),
+        env.get("PI_PROVIDER_API", ""),
+        env.get("PI_MODEL", ""),
+    )
 
 
 class DispatchConfig(BaseModel):

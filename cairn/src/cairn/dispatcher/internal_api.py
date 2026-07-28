@@ -66,6 +66,9 @@ WORKER_TEST_PATH = "/internal/workers/test"
 MODEL_PROXY_PATH = "/internal/model-proxy/v1/chat/completions"
 SECRET_MASK = "********"
 SECRET_KEY_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+MODEL_PROXY_CONNECT_TIMEOUT_SECONDS = 10
+MODEL_PROXY_STREAM_IDLE_TIMEOUT_SECONDS = 30
+MODEL_PROXY_RESPONSE_TIMEOUT_SECONDS = 120
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -511,6 +514,7 @@ def create_internal_app(loop: "DispatcherLoop"):
             else f"{base_url}/v1/chat/completions"
         )
         try:
+            is_streaming = bool(payload.get("stream"))
             upstream = requests.post(
                 upstream_url,
                 json=payload,
@@ -518,8 +522,15 @@ def create_internal_app(loop: "DispatcherLoop"):
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
-                timeout=(10, 600),
-                stream=bool(payload.get("stream")),
+                # A Worker is cancelled after its task budget.  Do not leave a
+                # silent stream alive for the former 600-second read timeout:
+                # it would keep consuming the upstream's scarce concurrency
+                # after the Worker has already been reclaimed.
+                timeout=(
+                    MODEL_PROXY_CONNECT_TIMEOUT_SECONDS,
+                    MODEL_PROXY_STREAM_IDLE_TIMEOUT_SECONDS if is_streaming else MODEL_PROXY_RESPONSE_TIMEOUT_SECONDS,
+                ),
+                stream=is_streaming,
             )
         except requests.RequestException as exc:
             raise HTTPException(status_code=502, detail={"message": str(exc)}) from exc
@@ -596,8 +607,15 @@ def create_internal_app(loop: "DispatcherLoop"):
                             if not line.startswith(b"data:"):
                                 continue
                             raw = line[5:].strip()
-                            if not raw or raw == b"[DONE]":
+                            if not raw:
                                 continue
+                            # OpenAI-compatible SSE streams are complete at
+                            # [DONE].  Some providers keep the HTTP socket
+                            # open afterwards; continuing to read would leak
+                            # an upstream concurrency slot after Pi has
+                            # already received the complete response.
+                            if raw == b"[DONE]":
+                                return
                             try:
                                 event = json.loads(raw)
                             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -605,6 +623,8 @@ def create_internal_app(loop: "DispatcherLoop"):
                             if isinstance(event, dict):
                                 if event.get("usage") or latest_payload is None:
                                     latest_payload = event
+                except requests.RequestException:
+                    LOG.warning("model proxy stream interrupted model=%s", model, exc_info=True)
                 finally:
                     upstream.close()
                     record_usage(latest_payload)

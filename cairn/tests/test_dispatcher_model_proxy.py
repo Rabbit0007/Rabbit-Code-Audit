@@ -3,9 +3,14 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import requests
 
 from cairn.dispatcher.config import WorkerConfig
-from cairn.dispatcher.internal_api import create_internal_app
+from cairn.dispatcher.internal_api import (
+    MODEL_PROXY_RESPONSE_TIMEOUT_SECONDS,
+    MODEL_PROXY_STREAM_IDLE_TIMEOUT_SECONDS,
+    create_internal_app,
+)
 
 
 class _UpstreamResponse:
@@ -93,6 +98,7 @@ def test_model_proxy_keeps_upstream_key_out_of_worker_request(monkeypatch):
     assert response.status_code == 200
     assert captured["url"] == "https://api.deepseek.com/v1/chat/completions"
     assert captured["headers"]["Authorization"] == "Bearer real-upstream-secret"
+    assert captured["timeout"] == (10, MODEL_PROXY_RESPONSE_TIMEOUT_SECONDS)
     assert "real-upstream-secret" not in response.text
     assert usage_records[0]["prompt_tokens"] == 100
     assert usage_records[0]["completion_tokens"] == 20
@@ -158,7 +164,106 @@ def test_streaming_model_proxy_requests_and_records_final_usage(monkeypatch):
     assert response.status_code == 200
     assert captured["json"]["stream_options"]["include_usage"] is True
     assert captured["stream"] is True
+    assert captured["timeout"] == (10, MODEL_PROXY_STREAM_IDLE_TIMEOUT_SECONDS)
     assert usage_records[0]["request_id"] == "req-stream"
     assert usage_records[0]["total_tokens"] == 90
     assert usage_records[0]["estimated"] is False
+    assert upstream.closed is True
+
+
+def test_streaming_model_proxy_closes_upstream_after_idle_read_timeout(monkeypatch):
+    monkeypatch.setenv("CAIRN_MODEL_PROXY_TOKEN", "scoped-worker-token")
+    worker = WorkerConfig(
+        name="reasoner",
+        type="pi",
+        enabled=True,
+        task_types=["reason"],
+        max_running=1,
+        priority=0,
+        env={
+            "PI_MODEL": "deepseek-v4-pro",
+            "PI_BASE_URL": "https://api.deepseek.com",
+            "PI_API_KEY": "secret",
+            "PI_PROVIDER_API": "openai-completions",
+        },
+    )
+
+    class IdleStream:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        def __init__(self):
+            self.closed = False
+
+        def iter_content(self, chunk_size):  # noqa: ARG002
+            raise requests.ReadTimeout("upstream sent no chunks")
+
+        def close(self):
+            self.closed = True
+
+    upstream = IdleStream()
+    loop = SimpleNamespace(
+        config=SimpleNamespace(workers=[worker]),
+        container_manager=SimpleNamespace(project_id_for_ip=lambda ip: "proj-stream"),
+        client=SimpleNamespace(record_model_usage=lambda payload: SimpleNamespace(ok=True, status_code=201)),
+    )
+    monkeypatch.setattr("cairn.dispatcher.internal_api.requests.post", lambda *args, **kwargs: upstream)
+
+    response = TestClient(create_internal_app(loop)).post(
+        "/internal/model-proxy/v1/chat/completions",
+        headers={"Authorization": "Bearer scoped-worker-token"},
+        json={"model": "deepseek-v4-pro", "messages": [], "stream": True},
+    )
+
+    assert response.status_code == 200
+    assert upstream.closed is True
+
+
+def test_streaming_model_proxy_stops_reading_at_done_marker(monkeypatch):
+    monkeypatch.setenv("CAIRN_MODEL_PROXY_TOKEN", "scoped-worker-token")
+    worker = WorkerConfig(
+        name="reasoner",
+        type="pi",
+        enabled=True,
+        task_types=["reason"],
+        max_running=1,
+        priority=0,
+        env={
+            "PI_MODEL": "deepseek-v4-pro",
+            "PI_BASE_URL": "https://api.deepseek.com",
+            "PI_API_KEY": "secret",
+            "PI_PROVIDER_API": "openai-completions",
+        },
+    )
+
+    class DoneButOpenStream:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        def __init__(self):
+            self.closed = False
+
+        def iter_content(self, chunk_size):  # noqa: ARG002
+            yield b'data: {"choices":[{"delta":{"content":"pong"}}]}\n\n'
+            yield b"data: [DONE]\n\n"
+            raise AssertionError("proxy must not read after the done marker")
+
+        def close(self):
+            self.closed = True
+
+    upstream = DoneButOpenStream()
+    loop = SimpleNamespace(
+        config=SimpleNamespace(workers=[worker]),
+        container_manager=SimpleNamespace(project_id_for_ip=lambda ip: "proj-stream"),
+        client=SimpleNamespace(record_model_usage=lambda payload: SimpleNamespace(ok=True, status_code=201)),
+    )
+    monkeypatch.setattr("cairn.dispatcher.internal_api.requests.post", lambda *args, **kwargs: upstream)
+
+    response = TestClient(create_internal_app(loop)).post(
+        "/internal/model-proxy/v1/chat/completions",
+        headers={"Authorization": "Bearer scoped-worker-token"},
+        json={"model": "deepseek-v4-pro", "messages": [], "stream": True},
+    )
+
+    assert response.status_code == 200
     assert upstream.closed is True
