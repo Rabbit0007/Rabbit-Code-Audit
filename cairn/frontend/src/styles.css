@@ -59,7 +59,8 @@ button {
   cursor: pointer;
 }
 
-button:disabled {
+/* Arco buttons have their own disabled look; don't fade them a second time. */
+button:not(:where([class*="arco-"])):disabled {
   cursor: not-allowed;
   opacity: 0.48;
 }
@@ -1011,16 +1012,29 @@ img {
   gap: 18px;
 }
 
-.stack-form label {
+/* Field wrappers only: Arco renders its own <label> for Checkbox/Radio, which
+   must keep Arco's inline layout instead of becoming a stacked grid. */
+.stack-form label:not(:where([class*="arco-"])) {
   display: grid;
+  /* Pack label/control/hint at the top so controls in the same row line up
+     even when one field's hint text wraps to more lines. */
+  align-content: start;
   gap: 8px;
   color: #4b5563;
   font-weight: 520;
 }
 
-input,
-textarea,
-select {
+/*
+ * Bare form-element styling for the app's own native controls.
+ * `:not(:where([class*="arco-"], [class*="arco-"] *))` excludes elements that
+ * Arco Design renders (and the native inputs inside Arco wrappers such as
+ * Select / DatePicker / InputNumber), so Arco owns their size, border, focus
+ * and dark-theme styling. `:where()` keeps each selector's specificity
+ * unchanged, so native controls still render exactly as before.
+ */
+input:not(:where([class*="arco-"], [class*="arco-"] *)),
+textarea:not(:where([class*="arco-"], [class*="arco-"] *)),
+select:not(:where([class*="arco-"], [class*="arco-"] *)) {
   width: 100%;
   border: 1px solid var(--line-strong);
   border-radius: 8px;
@@ -1037,9 +1051,9 @@ textarea {
   line-height: 1.55;
 }
 
-input:focus,
-textarea:focus,
-select:focus {
+input:not(:where([class*="arco-"], [class*="arco-"] *)):focus,
+textarea:not(:where([class*="arco-"], [class*="arco-"] *)):focus,
+select:not(:where([class*="arco-"], [class*="arco-"] *)):focus {
   border-color: rgba(0, 122, 255, 0.55);
   box-shadow: 0 0 0 4px rgba(0, 122, 255, 0.12);
   background: #fff;
@@ -1360,7 +1374,7 @@ select:focus {
   color: #b42318;
 }
 
-.stack-form label.has-error input {
+.stack-form label.has-error input:not(:where([class*="arco-"], [class*="arco-"] *)) {
   border-color: rgba(220, 38, 38, 0.58);
   background: rgba(255, 251, 251, 0.96);
   box-shadow: 0 0 0 4px rgba(220, 38, 38, 0.1);
@@ -4578,16 +4592,16 @@ select {
   -webkit-tap-highlight-color: transparent;
 }
 
-button:focus-visible,
+button:not(:where([class*="arco-"])):focus-visible,
 a:focus-visible,
-input:focus-visible,
-textarea:focus-visible,
-select:focus-visible {
+input:not(:where([class*="arco-"], [class*="arco-"] *)):focus-visible,
+textarea:not(:where([class*="arco-"], [class*="arco-"] *)):focus-visible,
+select:not(:where([class*="arco-"], [class*="arco-"] *)):focus-visible {
   outline: 3px solid rgba(21, 94, 239, 0.2);
   outline-offset: 2px;
 }
 
-button:disabled {
+button:not(:where([class*="arco-"])):disabled {
   opacity: 0.52;
   filter: saturate(0.6);
 }
@@ -4854,23 +4868,23 @@ button:disabled {
   font-weight: 620;
 }
 
-input,
-textarea,
-select {
+input:not(:where([class*="arco-"], [class*="arco-"] *)),
+textarea:not(:where([class*="arco-"], [class*="arco-"] *)),
+select:not(:where([class*="arco-"], [class*="arco-"] *)) {
   border-radius: 7px;
   background: #fff;
   border-color: #cfd6e1;
 }
 
-input:hover,
-textarea:hover,
-select:hover {
+input:not(:where([class*="arco-"], [class*="arco-"] *)):hover,
+textarea:not(:where([class*="arco-"], [class*="arco-"] *)):hover,
+select:not(:where([class*="arco-"], [class*="arco-"] *)):hover {
   border-color: #aeb8c7;
 }
 
-input:focus,
-textarea:focus,
-select:focus {
+input:not(:where([class*="arco-"], [class*="arco-"] *)):focus,
+textarea:not(:where([class*="arco-"], [class*="arco-"] *)):focus,
+select:not(:where([class*="arco-"], [class*="arco-"] *)):focus {
   border-color: #155eef;
   box-shadow: 0 0 0 3px rgba(21, 94, 239, 0.12);
 }
@@ -6568,9 +6582,9 @@ strong {
   background: rgba(255, 255, 255, 0.02);
 }
 
-[data-theme="dark"] input,
-[data-theme="dark"] textarea,
-[data-theme="dark"] select {
+[data-theme="dark"] input:not(:where([class*="arco-"], [class*="arco-"] *)),
+[data-theme="dark"] textarea:not(:where([class*="arco-"], [class*="arco-"] *)),
+[data-theme="dark"] select:not(:where([class*="arco-"], [class*="arco-"] *)) {
   background: #161b23;
   color: var(--text);
 }
@@ -6747,9 +6761,9 @@ strong {
   border-color: var(--line);
 }
 
-[data-theme="dark"] input,
-[data-theme="dark"] textarea,
-[data-theme="dark"] select,
+[data-theme="dark"] input:not(:where([class*="arco-"], [class*="arco-"] *)),
+[data-theme="dark"] textarea:not(:where([class*="arco-"], [class*="arco-"] *)),
+[data-theme="dark"] select:not(:where([class*="arco-"], [class*="arco-"] *)),
 [data-theme="dark"] .mini-stat,
 [data-theme="dark"] .global-search input,
 [data-theme="dark"] .top-utility .user-chip,
@@ -6900,10 +6914,10 @@ strong {
   background: var(--control-blue);
 }
 
-button:focus-visible,
-input:focus-visible,
-select:focus-visible,
-textarea:focus-visible {
+button:not(:where([class*="arco-"])):focus-visible,
+input:not(:where([class*="arco-"], [class*="arco-"] *)):focus-visible,
+select:not(:where([class*="arco-"], [class*="arco-"] *)):focus-visible,
+textarea:not(:where([class*="arco-"], [class*="arco-"] *)):focus-visible {
   outline: 3px solid rgba(21, 94, 239, 0.18);
   outline-offset: 2px;
 }

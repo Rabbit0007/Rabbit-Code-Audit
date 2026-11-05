@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Button, Card, Checkbox, DatePicker, Drawer, Empty, Input, InputNumber, Message, Modal as ArcoModal, Pagination, Radio, Select, Space, Spin, Switch, Tag, Tooltip, Typography } from "@arco-design/web-react";
 import cytoscape from "cytoscape";
 import dagre from "cytoscape-dagre";
 import {
@@ -76,6 +77,25 @@ try {
 const APP_NAME = "Rabbit Code Audit";
 const HUMAN_WORKER = "Human";
 const SECRET_MASK = "********";
+
+// Map the app's semantic "tone" vocabulary (used by STATUS_META / SEVERITY_META
+// and the bespoke Badge) onto Arco Design's Tag color names, so status chips are
+// consistent across the Arco migration without re-labelling every call site.
+const ARCO_TONE_COLOR = {
+  success: "green",
+  warning: "orange",
+  danger: "red",
+  info: "arcoblue",
+  muted: "gray",
+  critical: "red",
+  high: "orangered",
+  medium: "gold",
+  low: "cyan",
+};
+
+function arcoTagColor(tone) {
+  return ARCO_TONE_COLOR[tone] || "gray";
+}
 
 function formatFindingStatus(status) {
   return {
@@ -429,6 +449,12 @@ export default function App() {
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
+    // Keep Arco components in sync with the app's light/dark theme.
+    if (theme === "dark") {
+      document.body.setAttribute("arco-theme", "dark");
+    } else {
+      document.body.removeAttribute("arco-theme");
+    }
     window.localStorage.setItem("rabbit-theme", theme);
   }, [theme]);
 
@@ -812,24 +838,20 @@ function GlobalSearch({ setToast }) {
 
   return (
     <div className="global-search-wrap" ref={wrapRef}>
-      <label className="global-search">
-        <Search size={15} />
-        <input
-          value={term}
-          placeholder="搜索漏洞标题、编号、项目、标签..."
-          aria-label="全局搜索"
-          onChange={(event) => setTerm(event.target.value)}
-          onFocus={() => term.trim() && setOpen(true)}
-          onKeyDown={(event) => {
-            if (event.key === "Escape") reset();
-          }}
-        />
-        {term && (
-          <button type="button" className="global-search-clear" onClick={reset} aria-label="清空搜索">
-            <X size={14} />
-          </button>
-        )}
-      </label>
+      <Input
+        allowClear
+        prefix={<Search size={15} />}
+        value={term}
+        placeholder="搜索漏洞标题、编号、项目、标签..."
+        aria-label="全局搜索"
+        onChange={(value) => setTerm(value)}
+        onClear={reset}
+        onFocus={() => term.trim() && setOpen(true)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") reset();
+        }}
+        style={{ width: "100%" }}
+      />
       {open && term.trim() && (
         <div className="search-dropdown">
           {loading && !hasResults ? (
@@ -1055,17 +1077,17 @@ function ConfirmModal({ title = "确认操作", message, tone = "default", confi
           </div>
         </div>
         <div className="modal-footer">
-          <button className="ghost-button" type="button" onClick={onCancel} autoFocus={tone === "danger"}>
+          <Button onClick={onCancel} autoFocus={tone === "danger"}>
             {cancelLabel}
-          </button>
-          <button
-            className={cn("primary-button compact", tone === "danger" && "danger")}
-            type="button"
+          </Button>
+          <Button
+            type="primary"
+            status={tone === "danger" ? "danger" : undefined}
             onClick={onConfirm}
             autoFocus={tone !== "danger"}
           >
             {confirmLabel}
-          </button>
+          </Button>
         </div>
       </section>
     </div>
@@ -1112,10 +1134,9 @@ function AuditPage({ setToast }) {
         title="审计日志"
         subtitle="记录关键操作的时间、对象与详情"
         actions={
-          <button className="ghost-button" type="button" onClick={() => load()}>
-            <RefreshCw size={18} />
+          <Button icon={<RefreshCw size={16} />} loading={loading} onClick={() => load()}>
             刷新
-          </button>
+          </Button>
         }
       />
       <section className="content-wrap vulnerability-report-page">
@@ -1494,15 +1515,16 @@ function AuthPage({ onAuthed, setToast, notice = "" }) {
           <form className="stack-form auth-stack-form" onSubmit={submit}>
             <label className={cn(fieldErrors.username && "has-error")}>
               <span>用户名</span>
-              <input
+              <Input
                 ref={(node) => {
                   inputRefs.current.username = node;
                 }}
                 name="username"
                 autoComplete="username"
                 value={form.username}
-                onChange={(event) => setFieldValue("username", event.target.value)}
+                onChange={(value) => setFieldValue("username", value)}
                 placeholder="请输入用户名"
+                error={Boolean(fieldErrors.username)}
                 aria-invalid={Boolean(fieldErrors.username)}
                 aria-describedby={fieldErrors.username ? "auth-username-error" : undefined}
               />
@@ -1514,16 +1536,16 @@ function AuthPage({ onAuthed, setToast, notice = "" }) {
             </label>
             <label className={cn(fieldErrors.password && "has-error")}>
               <span>密码</span>
-              <input
+              <Input.Password
                 ref={(node) => {
                   inputRefs.current.password = node;
                 }}
                 name="password"
                 autoComplete={mode === "login" ? "current-password" : "new-password"}
-                type="password"
                 value={form.password}
-                onChange={(event) => setFieldValue("password", event.target.value)}
+                onChange={(value) => setFieldValue("password", value)}
                 placeholder={mode === "login" ? "请输入密码" : "请设置密码"}
+                error={Boolean(fieldErrors.password)}
                 aria-invalid={Boolean(fieldErrors.password)}
                 aria-describedby={fieldErrors.password ? "auth-password-error" : undefined}
               />
@@ -1536,16 +1558,16 @@ function AuthPage({ onAuthed, setToast, notice = "" }) {
             {mode === "register" && (
               <label className={cn(fieldErrors.confirm_password && "has-error")}>
                 <span>确认密码</span>
-                <input
+                <Input.Password
                   ref={(node) => {
                     inputRefs.current.confirm_password = node;
                   }}
                   name="confirm_password"
                   autoComplete="new-password"
-                  type="password"
                   value={form.confirm_password}
-                  onChange={(event) => setFieldValue("confirm_password", event.target.value)}
+                  onChange={(value) => setFieldValue("confirm_password", value)}
                   placeholder="请再次输入密码"
+                  error={Boolean(fieldErrors.confirm_password)}
                   aria-invalid={Boolean(fieldErrors.confirm_password)}
                   aria-describedby={fieldErrors.confirm_password ? "auth-confirm-password-error" : undefined}
                 />
@@ -1559,15 +1581,17 @@ function AuthPage({ onAuthed, setToast, notice = "" }) {
             <label className={cn(fieldErrors.captcha_answer && "has-error")}>
               <span>验证码</span>
               <div className="captcha-row">
-                <input
+                <Input
                   ref={(node) => {
                     inputRefs.current.captcha_answer = node;
                   }}
                   name="captcha_answer"
                   value={form.captcha_answer}
-                  onChange={(event) => setFieldValue("captcha_answer", event.target.value)}
+                  onChange={(value) => setFieldValue("captcha_answer", value)}
                   placeholder="请输入计算结果"
                   inputMode="numeric"
+                  error={Boolean(fieldErrors.captcha_answer)}
+                  style={{ flex: 1 }}
                   aria-invalid={Boolean(fieldErrors.captcha_answer)}
                   aria-describedby={fieldErrors.captcha_answer ? "auth-captcha-error" : undefined}
                 />
@@ -1588,10 +1612,9 @@ function AuthPage({ onAuthed, setToast, notice = "" }) {
                 </small>
               )}
             </label>
-            <button className="primary-button auth-submit" type="submit" disabled={loading}>
-              {loading ? <Loader2 className="spin" size={18} /> : <Lock size={18} />}
+            <Button className="auth-submit" type="primary" long htmlType="submit" loading={loading} icon={<Lock size={16} />}>
               {loading ? (mode === "login" ? "正在登录..." : "正在注册...") : mode === "login" ? "登录" : "注册账号"}
-            </button>
+            </Button>
           </form>
           <p className="auth-switch">
             {mode === "login" ? "还没有账号？" : "已有账号？"}
@@ -1708,10 +1731,7 @@ function PageErrorState({ title = "数据暂时不可用", message, onRetry }) {
         <h3>{title}</h3>
         <p>{message || "服务没有返回有效数据，请稍后重试。"}</p>
       </div>
-      <button className="ghost-button compact" type="button" onClick={onRetry}>
-        <RefreshCw size={15} />
-        重试
-      </button>
+      <Button size="small" type="outline" icon={<RefreshCw size={15} />} onClick={onRetry}>重试</Button>
     </div>
   );
 }
@@ -1734,7 +1754,10 @@ function LoadingGrid({ count = 3, className = "project-grid" }) {
 }
 
 function Badge({ tone = "muted", children }) {
-  return <span className={cn("badge", tone)}>{children}</span>;
+  // Migrated to Arco Tag so every remaining <Badge> call site across the app
+  // (project workspace, templates, audit log, etc.) picks up the Arco design
+  // language at once, mapping the app's tone vocabulary to Arco Tag colors.
+  return <Tag color={arcoTagColor(tone)}>{children}</Tag>;
 }
 
 function MiniStat({ label, value }) {
@@ -1832,10 +1855,9 @@ function DashboardPage({ runAction, setToast }) {
               <span className="dot success" />
               <span>{lastUpdated ? `更新于 ${lastUpdated.toLocaleTimeString("zh-CN")}` : "待更新"}</span>
             </div>
-            <button className="ghost-button" type="button" onClick={() => load()}>
-              <RefreshCw size={18} />
+            <Button icon={<RefreshCw size={16} />} loading={loading} onClick={() => load()}>
               刷新
-            </button>
+            </Button>
           </>
         }
       />
@@ -2019,14 +2041,12 @@ function ProjectsPage({ runAction, setToast, confirmAction }) {
               <span className="dot success" />
               <span>{counts.active} 个运行中</span>
             </div>
-            <button className="primary-outline" type="button" onClick={() => setNewOpen(true)}>
-              <Plus size={18} />
+            <Button type="primary" icon={<Plus size={16} />} onClick={() => setNewOpen(true)}>
               新建项目
-            </button>
-            <button className="ghost-button" type="button" onClick={() => load()} disabled={loading}>
-              <RefreshCw className={cn(loading && "spin")} size={18} />
+            </Button>
+            <Button icon={<RefreshCw size={16} />} loading={loading} onClick={() => load()}>
               刷新
-            </button>
+            </Button>
           </>
         }
       />
@@ -2039,16 +2059,12 @@ function ProjectsPage({ runAction, setToast, confirmAction }) {
         </div>
         {loadError && projects.length > 0 && <PageErrorState message={loadError} onRetry={() => load()} />}
         <div className="collection-toolbar">
-          <div className="collection-search">
-            <Search size={16} />
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索项目名称或编号" aria-label="搜索项目名称或编号" />
-            {query && <button type="button" onClick={() => setQuery("")} aria-label="清除搜索"><X size={14} /></button>}
-          </div>
-          <div className="segmented filter-segment" role="tablist" aria-label="项目状态筛选">
+          <Input allowClear prefix={<Search size={15} />} value={query} onChange={(value) => setQuery(value)} placeholder="搜索项目名称或编号" aria-label="搜索项目名称或编号" style={{ maxWidth: 320 }} />
+          <Radio.Group type="button" name="project-filter" value={statusFilter} onChange={setStatusFilter}>
             {[['all', '全部'], ['active', '运行中'], ['stopped', '已停止'], ['completed', '已完成']].map(([value, label]) => (
-              <button key={value} type="button" className={cn(statusFilter === value && "active")} onClick={() => setStatusFilter(value)}>{label}</button>
+              <Radio key={value} value={value}>{label}</Radio>
             ))}
-          </div>
+          </Radio.Group>
           <span className="collection-count"><SlidersHorizontal size={14} /> {filteredProjects.length} 个项目</span>
         </div>
         {loading ? (
@@ -2061,14 +2077,13 @@ function ProjectsPage({ runAction, setToast, confirmAction }) {
             title="还没有代码审计项目"
             subtitle="导入公共 Git 仓库或 ZIP 源码后，Rabbit Code Audit 会建立不可变源码快照。"
             action={
-              <button className="primary-button compact" type="button" onClick={() => setNewOpen(true)}>
-                <Plus size={18} />
+              <Button type="primary" icon={<Plus size={16} />} onClick={() => setNewOpen(true)}>
                 新建项目
-              </button>
+              </Button>
             }
           />
         ) : filteredProjects.length === 0 ? (
-          <EmptyState icon={Search} title="没有匹配的项目" subtitle="换一个关键词或清除当前筛选条件。" action={<button className="ghost-button compact" type="button" onClick={() => { setQuery(""); setStatusFilter("all"); }}><X size={15} /> 清除筛选</button>} />
+          <EmptyState icon={Search} title="没有匹配的项目" subtitle="换一个关键词或清除当前筛选条件。" action={<Button type="outline" size="small" icon={<X size={15} />} onClick={() => { setQuery(""); setStatusFilter("all"); }}>清除筛选</Button>} />
         ) : (
           <div className="project-grid">
             {filteredProjects.map((project) => (
@@ -2160,32 +2175,27 @@ function ProjectCard({ project, onDelete, onStop, onStart, onReopen }) {
         </div>
       )}
       <div className="card-actions">
-        <button className="ghost-button compact" type="button" onClick={() => go(`#/projects/${project.id}`)}>
-          <Eye size={16} />
+        <Button size="small" type="outline" icon={<Eye size={16} />} onClick={() => go(`#/projects/${project.id}`)}>
           打开
-        </button>
+        </Button>
         {project.status === "active" && (
-          <button className="ghost-button compact warning" type="button" onClick={onStop}>
-            <Square size={16} />
+          <Button size="small" type="outline" status="warning" icon={<Square size={16} />} onClick={onStop}>
             停止
-          </button>
+          </Button>
         )}
         {project.status === "stopped" && (
-          <button className="ghost-button compact" type="button" onClick={onStart}>
-            <Play size={16} />
+          <Button size="small" type="outline" icon={<Play size={16} />} onClick={onStart}>
             继续
-          </button>
+          </Button>
         )}
         {project.status === "completed" && (
-          <button className="ghost-button compact" type="button" onClick={onReopen}>
-            <RefreshCw size={16} />
+          <Button size="small" type="outline" icon={<RefreshCw size={16} />} onClick={onReopen}>
             重新打开
-          </button>
+          </Button>
         )}
-        <button className="ghost-button compact danger" type="button" onClick={onDelete}>
-          <Trash2 size={16} />
+        <Button size="small" type="outline" status="danger" icon={<Trash2 size={16} />} onClick={onDelete}>
           删除
-        </button>
+        </Button>
       </div>
     </article>
   );
@@ -2264,43 +2274,37 @@ function NewProjectModal({ onClose, onCreated, runAction, initial = null }) {
       <form className="stack-form modal-body" onSubmit={submit}>
         <label>
           <span>项目名称</span>
-          <input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} required />
+          <Input value={form.title} onChange={(value) => setForm({ ...form, title: value })} required />
         </label>
         <fieldset className="source-import-panel">
           <legend>源码来源</legend>
-          <div className="source-type-switch" role="tablist" aria-label="源码来源">
-            <button
-              className={cn(form.sourceType === "git" && "active")}
-              type="button"
-              onClick={() => setForm({ ...form, sourceType: "git" })}
-            >
-              Git 仓库
-            </button>
-            <button
-              className={cn(form.sourceType === "zip" && "active")}
-              type="button"
-              onClick={() => setForm({ ...form, sourceType: "zip" })}
-            >
-              ZIP 上传
-            </button>
-          </div>
+          <Radio.Group
+            type="button"
+            name="source-type"
+            value={form.sourceType}
+            onChange={(value) => setForm({ ...form, sourceType: value })}
+            style={{ marginBottom: 12 }}
+          >
+            <Radio value="git">Git 仓库</Radio>
+            <Radio value="zip">ZIP 上传</Radio>
+          </Radio.Group>
           {form.sourceType === "git" ? (
             <div className="two-col tight">
               <label>
                 <span>公共仓库 URL</span>
-                <input
+                <Input
                   type="url"
                   value={form.repositoryUrl}
-                  onChange={(event) => setForm({ ...form, repositoryUrl: event.target.value })}
+                  onChange={(value) => setForm({ ...form, repositoryUrl: value })}
                   placeholder="https://github.com/example/project.git"
                   required
                 />
               </label>
               <label>
                 <span>Branch、Tag 或 Commit（可选）</span>
-                <input
+                <Input
                   value={form.ref}
-                  onChange={(event) => setForm({ ...form, ref: event.target.value })}
+                  onChange={(value) => setForm({ ...form, ref: value })}
                   placeholder="main"
                 />
               </label>
@@ -2321,43 +2325,168 @@ function NewProjectModal({ onClose, onCreated, runAction, initial = null }) {
         <div className="two-col">
           <label>
             <span>起点</span>
-            <textarea
+            <Input.TextArea
               value={form.origin}
-              onChange={(event) => setForm({ ...form, origin: event.target.value })}
-              rows={6}
+              onChange={(value) => setForm({ ...form, origin: value })}
+              autoSize={{ minRows: 6, maxRows: 12 }}
               required
             />
           </label>
           <label>
             <span>目标</span>
-            <textarea
+            <Input.TextArea
               value={form.goal}
-              onChange={(event) => setForm({ ...form, goal: event.target.value })}
-              rows={6}
+              onChange={(value) => setForm({ ...form, goal: value })}
+              autoSize={{ minRows: 6, maxRows: 12 }}
               required
             />
           </label>
         </div>
         <label>
           <span>初始提示</span>
-          <textarea
+          <Input.TextArea
             value={form.hints}
-            onChange={(event) => setForm({ ...form, hints: event.target.value })}
-            rows={4}
+            onChange={(value) => setForm({ ...form, hints: value })}
+            autoSize={{ minRows: 4, maxRows: 8 }}
             placeholder="每行一条提示"
           />
         </label>
         <div className="modal-footer">
-          <button className="ghost-button" type="button" onClick={onClose}>
+          <Button onClick={onClose}>
             取消
-          </button>
-          <button className="primary-button compact" type="submit" disabled={saving}>
-            {saving ? <Loader2 className="spin" size={18} /> : <Plus size={18} />}
+          </Button>
+          <Button type="primary" htmlType="submit" loading={saving} icon={<Plus size={16} />}>
             创建并导入源码
-          </button>
+          </Button>
         </div>
       </form>
     </Modal>
+  );
+}
+
+function ValidationTargetPanel({ projectId, runAction, setToast }) {
+  const [loading, setLoading] = useState(true);
+  const [configured, setConfigured] = useState(false);
+  const [baseUrl, setBaseUrl] = useState("");
+  const [allowStateChanging, setAllowStateChanging] = useState(false);
+  const [profilesText, setProfilesText] = useState("");
+  const [callbackHost, setCallbackHost] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await apiRequest(`/api/projects/${projectId}/audit-validation-target`);
+      setConfigured(Boolean(data && data.configured));
+      const target = (data && data.target) || {};
+      setBaseUrl(target.base_url || "");
+      setAllowStateChanging(Boolean(target.allow_state_changing));
+      setProfilesText(
+        target.profiles && Object.keys(target.profiles).length
+          ? JSON.stringify(target.profiles, null, 2)
+          : ""
+      );
+      setCallbackHost((target.callback && target.callback.advertise_host) || "");
+    } catch (error) {
+      /* leave fields blank when unreadable */
+    } finally {
+      setLoading(false);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const save = async () => {
+    let profiles = {};
+    if (profilesText.trim()) {
+      try {
+        profiles = JSON.parse(profilesText);
+      } catch (error) {
+        Message.error("凭据档案必须是合法 JSON");
+        return;
+      }
+    }
+    const body = { base_url: baseUrl.trim(), allow_state_changing: allowStateChanging, profiles };
+    if (callbackHost.trim()) {
+      body.callback = { advertise_host: callbackHost.trim(), bind_host: "127.0.0.1", port: 0 };
+    }
+    setSaving(true);
+    try {
+      await runAction("验证靶机已保存", () =>
+        apiRequest(`/api/projects/${projectId}/audit-validation-target`, { method: "PUT", body })
+      );
+    } finally {
+      setSaving(false);
+    }
+    load();
+  };
+
+  const remove = async () => {
+    if (typeof window !== "undefined" && !window.confirm("删除验证靶机？高危发现将不再自动重放验证。")) {
+      return;
+    }
+    await runAction("验证靶机已删除", () =>
+      apiRequest(`/api/projects/${projectId}/audit-validation-target`, { method: "DELETE" })
+    );
+    load();
+  };
+
+  return (
+    <Card
+      title={
+        <Space>
+          <ShieldAlert size={16} />
+          <span>验证靶机</span>
+        </Space>
+      }
+      style={{ marginTop: 16 }}
+    >
+      <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+        配置后，带验证计划的高危发现会由服务端实际重放，并由程序判定（证据等级 L4）。凭据仅用于重放，读取时已脱敏为 ***。
+      </Typography.Paragraph>
+      {loading ? (
+        <Spin style={{ display: "block", textAlign: "center", padding: "24px 0" }} />
+      ) : (
+        <Space direction="vertical" size="medium" style={{ width: "100%" }}>
+          <div>
+            <Typography.Text>靶机地址（仅限你有授权的测试环境）</Typography.Text>
+            <Input value={baseUrl} onChange={setBaseUrl} placeholder="http://127.0.0.1:8080" allowClear />
+          </div>
+          <Space align="center">
+            <Switch checked={allowStateChanging} onChange={setAllowStateChanging} />
+            <Typography.Text>允许改状态请求（POST/PUT/PATCH/DELETE）</Typography.Text>
+          </Space>
+          <div>
+            <Typography.Text>凭据档案 JSON（可选，用于越权/IDOR 重放）</Typography.Text>
+            <Input.TextArea
+              value={profilesText}
+              onChange={setProfilesText}
+              autoSize={{ minRows: 4, maxRows: 10 }}
+              placeholder={'{"alice": {"headers": {"Cookie": "sid=alice"}}, "bob": {"headers": {"Cookie": "sid=bob"}}}'}
+            />
+          </div>
+          <div>
+            <Typography.Text>SSRF 回连地址（可选，服务端可达的本机地址）</Typography.Text>
+            <Input value={callbackHost} onChange={setCallbackHost} placeholder="127.0.0.1" allowClear />
+          </div>
+          <Space>
+            <Button type="primary" loading={saving} onClick={save}>
+              保存
+            </Button>
+            {configured && (
+              <Button status="danger" onClick={remove}>
+                删除
+              </Button>
+            )}
+          </Space>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            仅对你有授权测试权限的靶机使用；重放会从服务端真实发起 HTTP 请求。
+          </Typography.Text>
+        </Space>
+      )}
+    </Card>
   );
 }
 
@@ -2725,9 +2854,9 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
         icon={AlertTriangle}
         title="项目不可用"
         action={
-          <button className="primary-outline" type="button" onClick={() => go("#/projects")}>
+          <Button type="primary" onClick={() => go("#/projects")}>
             返回项目
-          </button>
+          </Button>
         }
       />
     );
@@ -2738,9 +2867,7 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
   return (
     <>
       <section className="workspace-header">
-        <button className="icon-button" type="button" onClick={() => go("#/projects")}>
-          <ArrowLeft size={20} />
-        </button>
+        <Button type="text" icon={<ArrowLeft size={20} />} onClick={() => go("#/projects")} aria-label="返回项目" />
         <div className="workspace-title">
           <span>{project.id}</span>
           <button type="button" onClick={updateTitle}>
@@ -2754,38 +2881,17 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
             <span>{intents.length} 个意图</span>
             <span>{semanticBusinessNodeCount} 个业务语义</span>
           </div>
-          <button className="ghost-button compact" type="button" onClick={() => exportProject("yaml")}>
-            <Download size={16} />
-            YAML
-          </button>
-          <button className="ghost-button compact" type="button" onClick={() => exportProject("timeline")}>
-            <Clock size={16} />
-            时间线
-          </button>
+          <Button size="small" type="outline" icon={<Download size={16} />} onClick={() => exportProject("yaml")}>YAML</Button>
+          <Button size="small" type="outline" icon={<Clock size={16} />} onClick={() => exportProject("timeline")}>时间线</Button>
           {project.status === "active" ? (
-            <button className="ghost-button compact warning" type="button" onClick={() => updateStatus("stopped")}>
-              <Square size={16} />
-              停止
-            </button>
+            <Button size="small" type="outline" status="warning" icon={<Square size={16} />} onClick={() => updateStatus("stopped")}>停止</Button>
           ) : project.status === "stopped" ? (
-            <button className="ghost-button compact" type="button" onClick={() => updateStatus("active")}>
-              <Play size={16} />
-              继续
-            </button>
+            <Button size="small" type="outline" icon={<Play size={16} />} onClick={() => updateStatus("active")}>继续</Button>
           ) : (
-            <button className="ghost-button compact" type="button" onClick={() => setModal("reopen")}>
-              <RefreshCw size={16} />
-              重新打开
-            </button>
+            <Button size="small" type="outline" icon={<RefreshCw size={16} />} onClick={() => setModal("reopen")}>重新打开</Button>
           )}
-          <button className="ghost-button compact danger" type="button" onClick={deleteProject}>
-            <Trash2 size={16} />
-            删除
-          </button>
-          <button className="ghost-button compact" type="button" onClick={load}>
-            <RefreshCw size={16} />
-            刷新
-          </button>
+          <Button size="small" type="outline" status="danger" icon={<Trash2 size={16} />} onClick={deleteProject}>删除</Button>
+          <Button size="small" type="outline" icon={<RefreshCw size={16} />} onClick={load}>刷新</Button>
         </div>
       </section>
       <section className="workspace-layout">
@@ -2819,35 +2925,18 @@ function ProjectWorkspace({ projectId, runAction, setToast, confirmAction }) {
             </div>
           )}
           <div className="graph-toolbar floating">
-            <select value={layout} onChange={(event) => setLayout(event.target.value)}>
-              <option value="dagre">Dagre</option>
-              <option value="breadthfirst">层级</option>
-              <option value="circle">环形</option>
-              <option value="grid">网格</option>
-            </select>
+            <Select value={layout} onChange={(value) => setLayout(value)} size="small" style={{ width: 120 }}>
+              <Select.Option value="dagre">Dagre</Select.Option>
+              <Select.Option value="breadthfirst">层级</Select.Option>
+              <Select.Option value="circle">环形</Select.Option>
+              <Select.Option value="grid">网格</Select.Option>
+            </Select>
           </div>
           <div className="graph-actions floating right">
-            <button className="primary-outline compact" type="button" onClick={() => setModal("intent")}>
-              <Plus size={16} />
-              意图
-            </button>
-            <button
-              className="primary-outline compact success"
-              type="button"
-              onClick={() => setModal("conclude")}
-              disabled={!selectedIntent || selectedIntent.to}
-            >
-              <CheckCircle2 size={16} />
-              完成
-            </button>
-            <button className="primary-outline compact warning" type="button" onClick={() => setModal("hint")}>
-              <Sparkles size={16} />
-              提示
-            </button>
-            <button className="primary-outline compact" type="button" onClick={() => setModal("complete")}>
-              <ShieldAlert size={16} />
-              总结
-            </button>
+            <Button size="small" type="outline" icon={<Plus size={16} />} onClick={() => setModal("intent")}>意图</Button>
+            <Button size="small" type="outline" status="success" icon={<CheckCircle2 size={16} />} onClick={() => setModal("conclude")} disabled={!selectedIntent || selectedIntent.to}>完成</Button>
+            <Button size="small" type="outline" status="warning" icon={<Sparkles size={16} />} onClick={() => setModal("hint")}>提示</Button>
+            <Button size="small" type="outline" icon={<ShieldAlert size={16} />} onClick={() => setModal("complete")}>总结</Button>
           </div>
           <GraphCanvas detail={detail} selected={selected} onSelect={setSelected} layout={layout} />
         </div>
@@ -3346,15 +3435,9 @@ function Inspector({
                 {!intent.to && (
                   <div className="button-row">
                     {!intent.worker ? (
-                      <button className="primary-outline compact" type="button" onClick={claimIntent}>
-                        <Activity size={16} />
-                        认领
-                      </button>
+                      <Button size="small" type="outline" icon={<Activity size={16} />} onClick={claimIntent}>认领</Button>
                     ) : (
-                      <button className="ghost-button compact" type="button" onClick={releaseIntent}>
-                        <Pause size={16} />
-                        释放
-                      </button>
+                      <Button size="small" type="outline" icon={<Pause size={16} />} onClick={releaseIntent}>释放</Button>
                     )}
                   </div>
                 )}
@@ -3427,19 +3510,22 @@ function Inspector({
           />
         )}
         {tab === "findings" && (
-          <FindingGovernancePanel
-            currentSource={currentSource}
-            auditFindings={auditFindings}
-            auditCandidates={auditCandidates}
-            reportEnrichmentTasks={reportEnrichmentTasks}
-            toolFindings={toolFindings}
-            businessGraph={businessGraph}
-            onCreateAuditFinding={onCreateAuditFinding}
-            onConcludeAuditCandidate={onConcludeAuditCandidate}
-            onCreateReportEnrichment={onCreateReportEnrichment}
-            onCancelReportEnrichment={onCancelReportEnrichment}
-            onRetryReportEnrichment={onRetryReportEnrichment}
-          />
+          <>
+            <FindingGovernancePanel
+              currentSource={currentSource}
+              auditFindings={auditFindings}
+              auditCandidates={auditCandidates}
+              reportEnrichmentTasks={reportEnrichmentTasks}
+              toolFindings={toolFindings}
+              businessGraph={businessGraph}
+              onCreateAuditFinding={onCreateAuditFinding}
+              onConcludeAuditCandidate={onConcludeAuditCandidate}
+              onCreateReportEnrichment={onCreateReportEnrichment}
+              onCancelReportEnrichment={onCancelReportEnrichment}
+              onRetryReportEnrichment={onRetryReportEnrichment}
+            />
+            <ValidationTargetPanel projectId={projectId} runAction={runAction} setToast={setToast} />
+          </>
         )}
         {tab === "logs" && (
           <div className="timeline-list">
@@ -3573,10 +3659,7 @@ function SourceSnapshotPanel({
   return (
     <div className="source-panel">
       <div className="panel-toolbar">
-        <button className="primary-outline compact" type="button" onClick={onImportSource}>
-          <Plus size={16} />
-          导入新快照
-        </button>
+        <Button size="small" type="outline" icon={<Plus size={16} />} onClick={onImportSource}>导入新快照</Button>
       </div>
       {currentSource && (
         <IndexQualityPanel
@@ -3612,15 +3695,9 @@ function SourceSnapshotPanel({
                 </div>
                 {source.error_message && <p className="source-error">{source.error_message}</p>}
                 <div className="button-row">
-                  <button className="ghost-button compact" type="button" onClick={() => onSelectSource(source.id)}>
-                    <Eye size={16} />
-                    使用此快照
-                  </button>
+                  <Button size="small" type="outline" icon={<Eye size={16} />} onClick={() => onSelectSource(source.id)}>使用此快照</Button>
                   {source.status === "failed" && (
-                    <button className="ghost-button compact warning" type="button" onClick={() => onRetrySource(source)}>
-                      <RefreshCw size={16} />
-                      重试
-                    </button>
+                    <Button size="small" type="outline" status="warning" icon={<RefreshCw size={16} />} onClick={() => onRetrySource(source)}>重试</Button>
                   )}
                 </div>
               </article>
@@ -3655,10 +3732,7 @@ function IndexQualityPanel({ currentSource, quality, onReindexSource }) {
             <span>索引质量</span>
             <strong>未生成</strong>
           </div>
-          <button className="ghost-button compact" type="button" onClick={onReindexSource}>
-            <RefreshCw size={16} />
-            重建索引
-          </button>
+          <Button size="small" type="outline" icon={<RefreshCw size={16} />} onClick={onReindexSource}>重建索引</Button>
         </header>
       </section>
     );
@@ -3686,10 +3760,7 @@ function IndexQualityPanel({ currentSource, quality, onReindexSource }) {
         </div>
         <div className="index-quality-actions">
           <Badge tone={indexQualityTone(quality.grade)}>{indexQualityGradeLabel(quality.grade)}</Badge>
-          <button className="ghost-button compact" type="button" onClick={onReindexSource}>
-            <RefreshCw size={16} />
-            重建索引
-          </button>
+          <Button size="small" type="outline" icon={<RefreshCw size={16} />} onClick={onReindexSource}>重建索引</Button>
         </div>
       </header>
       <div className="quality-score-row">
@@ -3850,10 +3921,7 @@ function FindingGovernancePanel({
   return (
     <div className="finding-governance-panel">
       <div className="finding-toolbar">
-        <button className="primary-outline compact" type="button" disabled={currentSource?.status !== "ready"} onClick={onCreateAuditFinding}>
-          <Plus size={16} />
-          录入发现
-        </button>
+        <Button size="small" type="outline" disabled={currentSource?.status !== "ready"} icon={<Plus size={16} />} onClick={onCreateAuditFinding}>录入发现</Button>
         <Badge tone={currentSource?.status === "ready" ? "success" : "warning"}>
           {currentSource?.status === "ready" ? currentSource.id : "等待源码 ready"}
         </Badge>
@@ -3898,10 +3966,7 @@ function FindingGovernancePanel({
                   </small>
                   {candidate.conclusion_summary && <p className="finding-note">{candidate.conclusion_summary}</p>}
                   <div className="button-row">
-                    <button className="ghost-button compact" type="button" disabled={!canConclude} onClick={() => onConcludeAuditCandidate(candidate)}>
-                      <CheckCircle2 size={16} />
-                      记录结论
-                    </button>
+                    <Button size="small" type="outline" disabled={!canConclude} icon={<CheckCircle2 size={16} />} onClick={() => onConcludeAuditCandidate(candidate)}>记录结论</Button>
                   </div>
                 </article>
               );
@@ -3957,22 +4022,15 @@ function FindingGovernancePanel({
                     {reportTask?.error_message && <p className="finding-note">{reportTask.error_message}</p>}
                     <div className="button-row">
                       {canRequestReport && (
-                        <button className="ghost-button compact" type="button" onClick={() => onCreateReportEnrichment(finding)}>
-                          <FileText size={16} />
+                        <Button size="small" type="outline" icon={<FileText size={16} />} onClick={() => onCreateReportEnrichment(finding)}>
                           {reportComplete ? "重新生成材料" : "生成材料"}
-                        </button>
+                        </Button>
                       )}
                       {reportActive && (
-                        <button className="ghost-button compact warning" type="button" onClick={() => onCancelReportEnrichment(reportTask)}>
-                          <Square size={16} />
-                          取消任务
-                        </button>
+                        <Button size="small" type="outline" status="warning" icon={<Square size={16} />} onClick={() => onCancelReportEnrichment(reportTask)}>取消任务</Button>
                       )}
                       {reportFailed && (
-                        <button className="ghost-button compact" type="button" onClick={() => onRetryReportEnrichment(reportTask)}>
-                          <RefreshCw size={16} />
-                          重试任务
-                        </button>
+                        <Button size="small" type="outline" icon={<RefreshCw size={16} />} onClick={() => onRetryReportEnrichment(reportTask)}>重试任务</Button>
                       )}
                       {activeReportTasks.length > 0 && reportTask?.status === "completed" && (
                         <Badge tone="info">{activeReportTasks.length} 个材料任务处理中</Badge>
@@ -4045,53 +4103,50 @@ function ToolExperiencePanel({
           <div className="tool-picker">
             <span>扫描工具</span>
             <div>
-              <button className="ghost-button compact" type="button" onClick={() => setSelectedTools([])}>
+              <Button size="small" type="outline" onClick={() => setSelectedTools([])}>
                 全部
-              </button>
+              </Button>
               {plannedToolNames.map((toolName) => (
-                <button
-                  className={cn("tool-chip", selectedTools.includes(toolName) && "active")}
-                  type="button"
+                <Tag
                   key={toolName}
-                  onClick={() => toggleTool(toolName)}
+                  checkable
+                  checked={selectedTools.includes(toolName)}
+                  onCheck={() => toggleTool(toolName)}
+                  color="arcoblue"
                 >
                   {toolName}
-                </button>
+                </Tag>
               ))}
             </div>
           </div>
         )}
-        <label className="inline-control">
+        <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--muted)", fontSize: 12, fontWeight: 620 }}>
           <span>单工具超时</span>
-          <input
-            type="number"
-            min="10"
-            max="1800"
+          <InputNumber
+            min={10}
+            max={1800}
+            precision={0}
             value={timeoutPerTool}
-            onChange={(event) => setTimeoutPerTool(Number(event.target.value) || 180)}
+            onChange={(value) => setTimeoutPerTool(Number(value) || 180)}
+            suffix="秒"
+            style={{ width: 140 }}
           />
-          <small>秒</small>
-        </label>
+        </div>
         <div className="tool-action-row">
-          <button
-            className="primary-outline compact"
-            type="button"
-            onClick={() => onCreateToolScan({ tools: selectedTools, timeout_per_tool: timeoutPerTool })}
+          <Button
+            size="small"
+            type="outline"
+            loading={runningScan}
             disabled={!canCreateScan}
+            icon={<Play size={16} />}
+            onClick={() => onCreateToolScan({ tools: selectedTools, timeout_per_tool: timeoutPerTool })}
           >
-            {runningScan ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
             {runningScan ? "已有任务" : "创建扫描任务"}
-          </button>
+          </Button>
           {runningScan && (
-            <button className="ghost-button compact warning" type="button" onClick={() => onCancelToolScan(runningScan)}>
-              <Square size={16} />
-              取消任务
-            </button>
+            <Button size="small" type="outline" status="warning" icon={<Square size={16} />} onClick={() => onCancelToolScan(runningScan)}>取消任务</Button>
           )}
-          <button className="ghost-button compact" type="button" onClick={onRefresh}>
-            <RefreshCw size={16} />
-            刷新状态
-          </button>
+          <Button size="small" type="outline" icon={<RefreshCw size={16} />} onClick={onRefresh}>刷新状态</Button>
         </div>
         {scanDisabledReason && <small className="control-note">{scanDisabledReason}</small>}
         {!currentSource && (
@@ -4118,16 +4173,10 @@ function ToolExperiencePanel({
                 {task.error_message && <p>{task.error_message}</p>}
                 <div className="tool-task-actions">
                   {task.status === "failed" && (
-                    <button className="ghost-button compact" type="button" onClick={() => onRetryToolScan(task)}>
-                      <RefreshCw size={15} />
-                      重试
-                    </button>
+                    <Button size="small" type="outline" icon={<RefreshCw size={15} />} onClick={() => onRetryToolScan(task)}>重试</Button>
                   )}
                   {(task.status === "pending" || task.status === "running") && (
-                    <button className="ghost-button compact warning" type="button" onClick={() => onCancelToolScan(task)}>
-                      <Square size={15} />
-                      取消
-                    </button>
+                    <Button size="small" type="outline" status="warning" icon={<Square size={15} />} onClick={() => onCancelToolScan(task)}>取消</Button>
                   )}
                 </div>
               </article>
@@ -4161,10 +4210,7 @@ function ToolExperiencePanel({
           这里仅识别后续沙箱验证的可行性，不会执行 install、build、start 或 compose up。
         </p>
         <div className="tool-action-row">
-          <button className="ghost-button compact" type="button" onClick={onPersistDynamicValidationPlan} disabled={!currentSource}>
-            <Save size={16} />
-            保存计划
-          </button>
+          <Button size="small" type="outline" disabled={!currentSource} icon={<Save size={16} />} onClick={onPersistDynamicValidationPlan}>保存计划</Button>
         </div>
         {validationDisabledReason && <small className="control-note">{validationDisabledReason}</small>}
         {dynamicValidationPlan?.summary && (
@@ -4325,14 +4371,8 @@ function BusinessGraphPanel({
   return (
     <div className="business-graph-panel">
       <div className="business-toolbar">
-        <button className="primary-outline compact" type="button" onClick={onAddNode}>
-          <Plus size={16} />
-          节点
-        </button>
-        <button className="ghost-button compact" type="button" onClick={onAddEdge} disabled={nodes.length < 2}>
-          <Network size={16} />
-          关系
-        </button>
+        <Button size="small" type="outline" icon={<Plus size={16} />} onClick={onAddNode}>节点</Button>
+        <Button size="small" type="outline" disabled={nodes.length < 2} icon={<Network size={16} />} onClick={onAddEdge}>关系</Button>
         <div className="business-layer-tabs" role="tablist" aria-label="业务图图层">
           {[
             ["all", "全部", nodes.length],
@@ -4515,41 +4555,41 @@ function IntentModal({ fromIds, facts, onClose, onSubmit }) {
       <form className="stack-form modal-body" onSubmit={submit}>
         <label>
           <span>来源事实</span>
-          <select
-            multiple
+          <Select
+            mode="multiple"
+            allowClear
+            showSearch
+            placeholder="选择一个或多个事实"
             value={form.from}
-            onChange={(event) =>
-              setForm({ ...form, from: Array.from(event.target.selectedOptions).map((option) => option.value) })
-            }
+            onChange={(values) => setForm({ ...form, from: values || [] })}
+            renderFormat={(option, value) => value}
+            style={{ width: "100%" }}
           >
             {facts.map((fact) => (
-              <option key={fact.id} value={fact.id}>
+              <Select.Option key={fact.id} value={fact.id}>
                 {fact.id} · {clampText(fact.description, 60)}
-              </option>
+              </Select.Option>
             ))}
-          </select>
+          </Select>
         </label>
         <label>
           <span>意图描述</span>
-          <textarea
-            rows={5}
+          <Input.TextArea
             value={form.description}
-            onChange={(event) => setForm({ ...form, description: event.target.value })}
+            onChange={(value) => setForm({ ...form, description: value })}
+            autoSize={{ minRows: 5, maxRows: 10 }}
             required
           />
         </label>
         <label>
           <span>直接认领给 Worker（可选）</span>
-          <input value={form.worker} onChange={(event) => setForm({ ...form, worker: event.target.value })} />
+          <Input value={form.worker} onChange={(value) => setForm({ ...form, worker: value })} />
         </label>
         <div className="modal-footer">
-          <button className="ghost-button" type="button" onClick={onClose}>
-            取消
-          </button>
-          <button className="primary-button compact" type="submit" disabled={saving || !form.from.length}>
-            {saving ? <Loader2 className="spin" size={18} /> : <Plus size={18} />}
+          <Button onClick={onClose}>取消</Button>
+          <Button type="primary" htmlType="submit" loading={saving} disabled={saving || !form.from.length} icon={<Plus size={16} />}>
             保存
-          </button>
+          </Button>
         </div>
       </form>
     </Modal>
@@ -4583,32 +4623,31 @@ function TextActionModal({
         <label>
           <span>{label}</span>
           {multiline ? (
-            <textarea
-              rows={6}
+            <Input.TextArea
               value={text}
               placeholder={placeholder}
-              onChange={(event) => setText(event.target.value)}
+              onChange={(value) => setText(value)}
+              autoSize={{ minRows: 6, maxRows: 12 }}
               autoFocus
               required
             />
           ) : (
-            <input
+            <Input
               value={text}
               placeholder={placeholder}
-              onChange={(event) => setText(event.target.value)}
+              onChange={(value) => setText(value)}
               autoFocus
               required
             />
           )}
         </label>
         <div className="modal-footer">
-          <button className="ghost-button" type="button" onClick={onClose}>
+          <Button onClick={onClose}>
             取消
-          </button>
-          <button className="primary-button compact" type="submit" disabled={saving}>
-            {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
+          </Button>
+          <Button type="primary" htmlType="submit" loading={saving} icon={<Save size={16} />}>
             {submitLabel}
-          </button>
+          </Button>
         </div>
       </form>
     </Modal>
@@ -4657,86 +4696,83 @@ function BusinessNodeModal({ onClose, onSubmit, initial = null, title = "新增�
         <div className="two-col">
           <label>
             <span>类型</span>
-            <select value={form.node_type} onChange={(event) => setForm({ ...form, node_type: event.target.value })}>
+            <Select value={form.node_type} onChange={(value) => setForm({ ...form, node_type: value })} style={{ width: "100%" }}>
               {Object.entries(BUSINESS_NODE_META).map(([key, meta]) => (
-                <option key={key} value={key}>
+                <Select.Option key={key} value={key}>
                   {meta.label}
-                </option>
+                </Select.Option>
               ))}
-            </select>
+            </Select>
           </label>
           <label>
             <span>标题</span>
-            <input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} required />
+            <Input value={form.title} onChange={(value) => setForm({ ...form, title: value })} required />
           </label>
         </div>
         <div className="two-col">
           <label>
             <span>风险等级</span>
-            <select value={form.risk_level} onChange={(event) => setForm({ ...form, risk_level: event.target.value })}>
+            <Select value={form.risk_level} onChange={(value) => setForm({ ...form, risk_level: value })} style={{ width: "100%" }}>
               {Object.entries(BUSINESS_RISK_META).map(([key, meta]) => (
-                <option key={key} value={key}>
+                <Select.Option key={key} value={key}>
                   {meta.label}
-                </option>
+                </Select.Option>
               ))}
-            </select>
+            </Select>
           </label>
           <label>
             <span>覆盖状态</span>
-            <select value={form.review_status} onChange={(event) => setForm({ ...form, review_status: event.target.value })}>
+            <Select value={form.review_status} onChange={(value) => setForm({ ...form, review_status: value })} style={{ width: "100%" }}>
               {Object.entries(BUSINESS_REVIEW_STATUS_META).map(([key, meta]) => (
-                <option key={key} value={key}>
+                <Select.Option key={key} value={key}>
                   {meta.label}
-                </option>
+                </Select.Option>
               ))}
-            </select>
+            </Select>
           </label>
         </div>
         <label>
           <span>说明</span>
-          <textarea
-            rows={4}
+          <Input.TextArea
             value={form.description}
-            onChange={(event) => setForm({ ...form, description: event.target.value })}
+            onChange={(value) => setForm({ ...form, description: value })}
+            autoSize={{ minRows: 4, maxRows: 10 }}
           />
         </label>
         <label>
           <span>覆盖说明</span>
-          <textarea
-            rows={3}
+          <Input.TextArea
             value={form.coverage_note}
             placeholder="已覆盖/阻塞时写明依据或剩余不确定性"
-            onChange={(event) => setForm({ ...form, coverage_note: event.target.value })}
+            onChange={(value) => setForm({ ...form, coverage_note: value })}
+            autoSize={{ minRows: 3, maxRows: 8 }}
           />
         </label>
         <div className="two-col">
           <label>
             <span>风险标签</span>
-            <textarea
-              rows={4}
+            <Input.TextArea
               value={form.risk_tags}
               placeholder="每行一个，例如：越权"
-              onChange={(event) => setForm({ ...form, risk_tags: event.target.value })}
+              onChange={(value) => setForm({ ...form, risk_tags: value })}
+              autoSize={{ minRows: 4, maxRows: 10 }}
             />
           </label>
           <label>
             <span>代码证据</span>
-            <textarea
-              rows={4}
+            <Input.TextArea
               value={form.evidence}
               placeholder="每行一个路径或符号"
-              onChange={(event) => setForm({ ...form, evidence: event.target.value })}
+              onChange={(value) => setForm({ ...form, evidence: value })}
+              autoSize={{ minRows: 4, maxRows: 10 }}
             />
           </label>
         </div>
         <div className="modal-footer">
-          <button className="ghost-button" type="button" onClick={onClose}>
-            取消
-          </button>
-          <button className="primary-button compact" type="submit" disabled={saving}>
-            {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
+          <Button onClick={onClose}>取消</Button>
+          <Button type="primary" htmlType="submit" loading={saving} icon={<Save size={16} />}>
             {submitLabel}
-          </button>
+          </Button>
         </div>
       </form>
     </Modal>
@@ -4774,51 +4810,48 @@ function BusinessEdgeModal({ nodes, onClose, onSubmit }) {
         <div className="two-col">
           <label>
             <span>起点</span>
-            <select value={form.from_node_id} onChange={(event) => setForm({ ...form, from_node_id: event.target.value })}>
+            <Select showSearch value={form.from_node_id} onChange={(value) => setForm({ ...form, from_node_id: value })} style={{ width: "100%" }}>
               {nodes.map((node) => (
-                <option key={node.id} value={node.id}>
+                <Select.Option key={node.id} value={node.id}>
                   {node.title}
-                </option>
+                </Select.Option>
               ))}
-            </select>
+            </Select>
           </label>
           <label>
             <span>终点</span>
-            <select value={form.to_node_id} onChange={(event) => setForm({ ...form, to_node_id: event.target.value })}>
+            <Select showSearch value={form.to_node_id} onChange={(value) => setForm({ ...form, to_node_id: value })} style={{ width: "100%" }}>
               {nodes.map((node) => (
-                <option key={node.id} value={node.id}>
+                <Select.Option key={node.id} value={node.id}>
                   {node.title}
-                </option>
+                </Select.Option>
               ))}
-            </select>
+            </Select>
           </label>
         </div>
         <label>
           <span>关系</span>
-          <select value={form.relation} onChange={(event) => setForm({ ...form, relation: event.target.value })}>
+          <Select value={form.relation} onChange={(value) => setForm({ ...form, relation: value })} style={{ width: "100%" }}>
             {Object.entries(BUSINESS_EDGE_META).map(([key, label]) => (
-              <option key={key} value={key}>
+              <Select.Option key={key} value={key}>
                 {label}
-              </option>
+              </Select.Option>
             ))}
-          </select>
+          </Select>
         </label>
         <label>
           <span>说明</span>
-          <textarea
-            rows={4}
+          <Input.TextArea
             value={form.description}
-            onChange={(event) => setForm({ ...form, description: event.target.value })}
+            onChange={(value) => setForm({ ...form, description: value })}
+            autoSize={{ minRows: 4, maxRows: 10 }}
           />
         </label>
         <div className="modal-footer">
-          <button className="ghost-button" type="button" onClick={onClose}>
-            取消
-          </button>
-          <button className="primary-button compact" type="submit" disabled={saving || !form.from_node_id || !form.to_node_id}>
-            {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
+          <Button onClick={onClose}>取消</Button>
+          <Button type="primary" htmlType="submit" loading={saving} disabled={saving || !form.from_node_id || !form.to_node_id} icon={<Save size={16} />}>
             保存关系
-          </button>
+          </Button>
         </div>
       </form>
     </Modal>
@@ -4862,32 +4895,33 @@ function BusinessConclusionModal({ node, findings, onClose, onSubmit }) {
         <div className="two-col">
           <label>
             <span>结论类型</span>
-            <select
+            <Select
               value={form.conclusion}
-              onChange={(event) => setForm({ ...form, conclusion: event.target.value, audit_finding_id: "" })}
+              onChange={(value) => setForm({ ...form, conclusion: value, audit_finding_id: "" })}
+              style={{ width: "100%" }}
             >
               {Object.entries(BUSINESS_CONCLUSION_META).map(([key, meta]) => (
-                <option key={key} value={key}>
+                <Select.Option key={key} value={key}>
                   {meta.label}
-                </option>
+                </Select.Option>
               ))}
-            </select>
+            </Select>
           </label>
           <label>
             <span>关联漏洞</span>
-            <select
+            <Select
               value={form.audit_finding_id}
-              onChange={(event) => setForm({ ...form, audit_finding_id: event.target.value })}
+              onChange={(value) => setForm({ ...form, audit_finding_id: value })}
               disabled={!requiresFinding}
-              required={requiresFinding}
+              style={{ width: "100%" }}
             >
-              <option value="">{requiresFinding ? "选择已确认漏洞" : "无需关联"}</option>
+              <Select.Option value="">{requiresFinding ? "选择已确认漏洞" : "无需关联"}</Select.Option>
               {confirmedFindings.map((finding) => (
-                <option key={finding.id} value={finding.id}>
+                <Select.Option key={finding.id} value={finding.id}>
                   {finding.id} · {finding.title}
-                </option>
+                </Select.Option>
               ))}
-            </select>
+            </Select>
           </label>
         </div>
         {requiresFinding && confirmedFindings.length === 0 && (
@@ -4895,32 +4929,29 @@ function BusinessConclusionModal({ node, findings, onClose, onSubmit }) {
         )}
         <label>
           <span>结论摘要</span>
-          <textarea
-            rows={4}
+          <Input.TextArea
             value={form.summary}
             placeholder="写清这条业务路径最终判断是什么"
-            onChange={(event) => setForm({ ...form, summary: event.target.value })}
+            onChange={(value) => setForm({ ...form, summary: value })}
+            autoSize={{ minRows: 4, maxRows: 10 }}
             required
           />
         </label>
         <label>
           <span>证据</span>
-          <textarea
-            rows={4}
+          <Input.TextArea
             value={form.evidence}
             placeholder="未发现漏洞或证据不足时必须写代码证据、阻塞原因或缺失证据"
-            onChange={(event) => setForm({ ...form, evidence: event.target.value })}
+            onChange={(value) => setForm({ ...form, evidence: value })}
+            autoSize={{ minRows: 4, maxRows: 10 }}
             required={!requiresFinding}
           />
         </label>
         <div className="modal-footer">
-          <button className="ghost-button" type="button" onClick={onClose}>
-            取消
-          </button>
-          <button className="primary-button compact" type="submit" disabled={saving || (requiresFinding && !form.audit_finding_id)}>
-            {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
+          <Button onClick={onClose}>取消</Button>
+          <Button type="primary" htmlType="submit" loading={saving} disabled={saving || (requiresFinding && !form.audit_finding_id)} icon={<Save size={16} />}>
             保存结论
-          </button>
+          </Button>
         </div>
       </form>
     </Modal>
@@ -4949,29 +4980,31 @@ function SourceImportModal({ onClose, onSubmit }) {
       <form className="stack-form modal-body" onSubmit={submit}>
         <fieldset className="source-import-panel">
           <legend>源码来源</legend>
-          <div className="source-type-switch" role="tablist" aria-label="源码来源">
-            <button className={cn(form.sourceType === "git" && "active")} type="button" onClick={() => setForm({ ...form, sourceType: "git" })}>
-              Git 仓库
-            </button>
-            <button className={cn(form.sourceType === "zip" && "active")} type="button" onClick={() => setForm({ ...form, sourceType: "zip" })}>
-              ZIP 上传
-            </button>
-          </div>
+          <Radio.Group
+            type="button"
+            name="snapshot-source-type"
+            value={form.sourceType}
+            onChange={(value) => setForm({ ...form, sourceType: value })}
+            style={{ marginBottom: 12 }}
+          >
+            <Radio value="git">Git 仓库</Radio>
+            <Radio value="zip">ZIP 上传</Radio>
+          </Radio.Group>
           {form.sourceType === "git" ? (
             <div className="two-col tight">
               <label>
                 <span>公共仓库 URL</span>
-                <input
+                <Input
                   type="url"
                   value={form.repositoryUrl}
-                  onChange={(event) => setForm({ ...form, repositoryUrl: event.target.value })}
+                  onChange={(value) => setForm({ ...form, repositoryUrl: value })}
                   placeholder="https://github.com/example/project.git"
                   required
                 />
               </label>
               <label>
                 <span>Branch、Tag 或 Commit</span>
-                <input value={form.ref} onChange={(event) => setForm({ ...form, ref: event.target.value })} placeholder="main" />
+                <Input value={form.ref} onChange={(value) => setForm({ ...form, ref: value })} placeholder="main" />
               </label>
             </div>
           ) : (
@@ -4988,13 +5021,10 @@ function SourceImportModal({ onClose, onSubmit }) {
           )}
         </fieldset>
         <div className="modal-footer">
-          <button className="ghost-button" type="button" onClick={onClose}>
-            取消
-          </button>
-          <button className="primary-button compact" type="submit" disabled={saving || (form.sourceType === "zip" && !form.archive)}>
-            {saving ? <Loader2 className="spin" size={18} /> : <Plus size={18} />}
+          <Button onClick={onClose}>取消</Button>
+          <Button type="primary" htmlType="submit" loading={saving} disabled={saving || (form.sourceType === "zip" && !form.archive)} icon={<Plus size={16} />}>
             导入快照
-          </button>
+          </Button>
         </div>
       </form>
     </Modal>
@@ -5095,144 +5125,155 @@ function AuditFindingModal({ businessNodes, toolFindings, onClose, onSubmit }) {
         {toolFindings.length > 0 && (
           <label>
             <span>从工具候选填充</span>
-            <select value={form.toolFindingId} onChange={(event) => applyToolFinding(event.target.value)}>
-              <option value="">不使用工具候选</option>
+            <Select showSearch value={form.toolFindingId} onChange={(value) => applyToolFinding(value)} style={{ width: "100%" }}>
+              <Select.Option value="">不使用工具候选</Select.Option>
               {toolFindings.map((finding) => (
-                <option key={finding.id} value={finding.id}>
+                <Select.Option key={finding.id} value={finding.id}>
                   {finding.tool_name} · {finding.title}
-                </option>
+                </Select.Option>
               ))}
-            </select>
+            </Select>
           </label>
         )}
         <div className="two-col">
           <label>
             <span>标题</span>
-            <input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} required />
+            <Input value={form.title} onChange={(value) => setForm({ ...form, title: value })} required />
           </label>
           <label>
             <span>类别</span>
-            <input value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })} required />
+            <Input value={form.category} onChange={(value) => setForm({ ...form, category: value })} required />
           </label>
         </div>
         <div className="three-col">
           <label>
             <span>严重程度</span>
-            <select value={form.severity} onChange={(event) => setForm({ ...form, severity: event.target.value })}>
+            <Select value={form.severity} onChange={(value) => setForm({ ...form, severity: value })} style={{ width: "100%" }}>
               {Object.entries(SEVERITY_META).map(([key, meta]) => (
-                <option key={key} value={key}>{meta.label}</option>
+                <Select.Option key={key} value={key}>{meta.label}</Select.Option>
               ))}
-            </select>
+            </Select>
           </label>
           <label>
             <span>CWE</span>
-            <input value={form.cwe} onChange={(event) => setForm({ ...form, cwe: event.target.value })} placeholder="CWE-639" />
+            <Input value={form.cwe} onChange={(value) => setForm({ ...form, cwe: value })} placeholder="CWE-639" />
           </label>
           <label>
             <span>业务节点</span>
-            <select value={form.business_node_id} onChange={(event) => setForm({ ...form, business_node_id: event.target.value })}>
-              <option value="">不关联</option>
+            <Select showSearch value={form.business_node_id} onChange={(value) => setForm({ ...form, business_node_id: value })} style={{ width: "100%" }}>
+              <Select.Option value="">不关联</Select.Option>
               {businessNodes.map((node) => (
-                <option key={node.id} value={node.id}>{node.title}</option>
+                <Select.Option key={node.id} value={node.id}>{node.title}</Select.Option>
               ))}
-            </select>
+            </Select>
           </label>
         </div>
         <div className="three-col">
           <label>
             <span>文件路径</span>
-            <input value={form.file_path} onChange={(event) => setForm({ ...form, file_path: event.target.value })} />
+            <Input value={form.file_path} onChange={(value) => setForm({ ...form, file_path: value })} />
           </label>
           <label>
             <span>起始行</span>
-            <input type="number" min="1" value={form.line_start} onChange={(event) => setForm({ ...form, line_start: event.target.value })} />
+            <InputNumber
+              min={1}
+              precision={0}
+              value={form.line_start === "" ? undefined : Number(form.line_start)}
+              onChange={(value) => setForm({ ...form, line_start: value ?? "" })}
+              style={{ width: "100%" }}
+            />
           </label>
           <label>
             <span>结束行</span>
-            <input type="number" min="1" value={form.line_end} onChange={(event) => setForm({ ...form, line_end: event.target.value })} />
+            <InputNumber
+              min={1}
+              precision={0}
+              value={form.line_end === "" ? undefined : Number(form.line_end)}
+              onChange={(value) => setForm({ ...form, line_end: value ?? "" })}
+              style={{ width: "100%" }}
+            />
           </label>
         </div>
         <div className="two-col">
           <label>
             <span>符号</span>
-            <input value={form.symbol} onChange={(event) => setForm({ ...form, symbol: event.target.value })} />
+            <Input value={form.symbol} onChange={(value) => setForm({ ...form, symbol: value })} />
           </label>
           <label>
             <span>入口点</span>
-            <input value={form.entry_point} onChange={(event) => setForm({ ...form, entry_point: event.target.value })} />
+            <Input value={form.entry_point} onChange={(value) => setForm({ ...form, entry_point: value })} />
           </label>
         </div>
         <label>
           <span>描述</span>
-          <textarea rows={5} value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} required />
+          <Input.TextArea value={form.description} onChange={(value) => setForm({ ...form, description: value })} autoSize={{ minRows: 5, maxRows: 12 }} required />
         </label>
         <div className="two-col">
           <label>
             <span>影响</span>
-            <textarea rows={4} value={form.impact} onChange={(event) => setForm({ ...form, impact: event.target.value })} />
+            <Input.TextArea value={form.impact} onChange={(value) => setForm({ ...form, impact: value })} autoSize={{ minRows: 4, maxRows: 10 }} />
           </label>
           <label>
             <span>代码证据</span>
-            <textarea rows={4} value={form.evidence} onChange={(event) => setForm({ ...form, evidence: event.target.value })} />
+            <Input.TextArea value={form.evidence} onChange={(value) => setForm({ ...form, evidence: value })} autoSize={{ minRows: 4, maxRows: 10 }} />
           </label>
         </div>
         <label>
           <span>修复建议</span>
-          <textarea rows={4} value={form.remediation} onChange={(event) => setForm({ ...form, remediation: event.target.value })} />
+          <Input.TextArea value={form.remediation} onChange={(value) => setForm({ ...form, remediation: value })} autoSize={{ minRows: 4, maxRows: 10 }} />
         </label>
         <details className="form-details">
           <summary>证明数据包 / 静态 PoC</summary>
           <div className="two-col">
             <label>
               <span>证明标题</span>
-              <input value={form.proof_title} onChange={(event) => setForm({ ...form, proof_title: event.target.value })} />
+              <Input value={form.proof_title} onChange={(value) => setForm({ ...form, proof_title: value })} />
             </label>
             <label>
               <span>Payload</span>
-              <input value={form.proof_payload} onChange={(event) => setForm({ ...form, proof_payload: event.target.value })} />
+              <Input value={form.proof_payload} onChange={(value) => setForm({ ...form, proof_payload: value })} />
             </label>
           </div>
           <div className="two-col">
             <label>
               <span>请求数据包</span>
-              <textarea rows={6} value={form.proof_request} onChange={(event) => setForm({ ...form, proof_request: event.target.value })} />
+              <Input.TextArea value={form.proof_request} onChange={(value) => setForm({ ...form, proof_request: value })} autoSize={{ minRows: 6, maxRows: 14 }} />
             </label>
             <label>
               <span>响应/回显</span>
-              <textarea rows={6} value={form.proof_response} onChange={(event) => setForm({ ...form, proof_response: event.target.value })} />
+              <Input.TextArea value={form.proof_response} onChange={(value) => setForm({ ...form, proof_response: value })} autoSize={{ minRows: 6, maxRows: 14 }} />
             </label>
           </div>
           <div className="two-col">
             <label>
               <span>PoC 请求/命令模板</span>
-              <textarea rows={4} value={form.poc_request_template} onChange={(event) => setForm({ ...form, poc_request_template: event.target.value })} />
+              <Input.TextArea value={form.poc_request_template} onChange={(value) => setForm({ ...form, poc_request_template: value })} autoSize={{ minRows: 4, maxRows: 10 }} />
             </label>
             <label>
               <span>PoC 预期结果</span>
-              <textarea rows={4} value={form.poc_expected_result} onChange={(event) => setForm({ ...form, poc_expected_result: event.target.value })} />
+              <Input.TextArea value={form.poc_expected_result} onChange={(value) => setForm({ ...form, poc_expected_result: value })} autoSize={{ minRows: 4, maxRows: 10 }} />
             </label>
           </div>
           <div className="two-col">
             <label>
               <span>PoC Payload</span>
-              <textarea rows={3} value={form.poc_payload} onChange={(event) => setForm({ ...form, poc_payload: event.target.value })} />
+              <Input.TextArea value={form.poc_payload} onChange={(value) => setForm({ ...form, poc_payload: value })} autoSize={{ minRows: 3, maxRows: 8 }} />
             </label>
             <label>
               <span>PoC 步骤</span>
-              <textarea rows={3} value={form.poc_steps} onChange={(event) => setForm({ ...form, poc_steps: event.target.value })} />
+              <Input.TextArea value={form.poc_steps} onChange={(value) => setForm({ ...form, poc_steps: value })} autoSize={{ minRows: 3, maxRows: 8 }} />
             </label>
           </div>
           <label>
             <span>PoC 判断标准</span>
-            <textarea rows={3} value={form.poc_verification} onChange={(event) => setForm({ ...form, poc_verification: event.target.value })} />
+            <Input.TextArea value={form.poc_verification} onChange={(value) => setForm({ ...form, poc_verification: value })} autoSize={{ minRows: 3, maxRows: 8 }} />
           </label>
         </details>
         <div className="modal-footer">
-          <button className="ghost-button" type="button" onClick={onClose}>取消</button>
-          <button className="primary-button compact" type="submit" disabled={saving}>
-            {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
+          <Button onClick={onClose}>取消</Button>
+          <Button type="primary" htmlType="submit" loading={saving} icon={<Save size={16} />}>
             保存发现
-          </button>
+          </Button>
         </div>
       </form>
     </Modal>
@@ -5269,41 +5310,41 @@ function AuditCandidateConclusionModal({ candidate, auditFindings, onClose, onSu
         <div className="two-col">
           <label>
             <span>结论</span>
-            <select value={form.decision} onChange={(event) => setForm({ ...form, decision: event.target.value, audit_finding_id: "" })}>
-              <option value="rejected">驳回候选</option>
-              <option value="needs_more_evidence">证据不足</option>
-              <option value="confirmed">确认并关联正式发现</option>
-            </select>
+            <Select value={form.decision} onChange={(value) => setForm({ ...form, decision: value, audit_finding_id: "" })} style={{ width: "100%" }}>
+              <Select.Option value="rejected">驳回候选</Select.Option>
+              <Select.Option value="needs_more_evidence">证据不足</Select.Option>
+              <Select.Option value="confirmed">确认并关联正式发现</Select.Option>
+            </Select>
           </label>
           <label>
             <span>关联正式发现</span>
-            <select
+            <Select
+              showSearch
               value={form.audit_finding_id}
-              onChange={(event) => setForm({ ...form, audit_finding_id: event.target.value })}
+              onChange={(value) => setForm({ ...form, audit_finding_id: value })}
               disabled={!requiresFinding}
-              required={requiresFinding}
+              style={{ width: "100%" }}
             >
-              <option value="">{requiresFinding ? "选择正式发现" : "无需关联"}</option>
+              <Select.Option value="">{requiresFinding ? "选择正式发现" : "无需关联"}</Select.Option>
               {auditFindings.map((finding) => (
-                <option key={finding.id} value={finding.id}>{finding.id} · {finding.title}</option>
+                <Select.Option key={finding.id} value={finding.id}>{finding.id} · {finding.title}</Select.Option>
               ))}
-            </select>
+            </Select>
           </label>
         </div>
         <label>
           <span>结论摘要</span>
-          <textarea rows={4} value={form.summary} onChange={(event) => setForm({ ...form, summary: event.target.value })} required />
+          <Input.TextArea value={form.summary} onChange={(value) => setForm({ ...form, summary: value })} autoSize={{ minRows: 4, maxRows: 10 }} required />
         </label>
         <label>
           <span>证据 / 阻塞原因</span>
-          <textarea rows={5} value={form.evidence} onChange={(event) => setForm({ ...form, evidence: event.target.value })} required={!requiresFinding} />
+          <Input.TextArea value={form.evidence} onChange={(value) => setForm({ ...form, evidence: value })} autoSize={{ minRows: 5, maxRows: 12 }} required={!requiresFinding} />
         </label>
         <div className="modal-footer">
-          <button className="ghost-button" type="button" onClick={onClose}>取消</button>
-          <button className="primary-button compact" type="submit" disabled={saving || (requiresFinding && !form.audit_finding_id)}>
-            {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
+          <Button onClick={onClose}>取消</Button>
+          <Button type="primary" htmlType="submit" loading={saving} disabled={saving || (requiresFinding && !form.audit_finding_id)} icon={<Save size={16} />}>
             保存结论
-          </button>
+          </Button>
         </div>
       </form>
     </Modal>
@@ -5515,14 +5556,9 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
         title={`审计报告 / ${viewTitle}`}
         subtitle="仅展示已确认的代码审计发现"
         actions={
-          <button
-            className="ghost-button report-export-button"
-            type="button"
-            onClick={() => setExportOpen(true)}
-          >
-            <Download size={18} />
+          <Button type="primary" icon={<Download size={16} />} onClick={() => setExportOpen(true)}>
             报告交付
-          </button>
+          </Button>
         }
       />
       <section className="content-wrap vulnerability-report-page">
@@ -5533,78 +5569,67 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
           <MetricCard label="已确认" value={statusDistribution.confirmed || 0} tone="success" />
         </div>
         <div className="report-filter-bar">
-          <label className="filter-search">
-            <Search size={15} />
-            <input
-              value={filters.search}
-              onChange={(event) => setFilters({ ...filters, search: event.target.value })}
-              placeholder="搜索漏洞标题、编号、组件、标签..."
-            />
-          </label>
+          <Input
+            allowClear
+            prefix={<Search size={15} />}
+            value={filters.search}
+            onChange={(value) => setFilters({ ...filters, search: value })}
+            placeholder="搜索漏洞标题、编号、组件、标签..."
+            style={{ flex: "1 1 240px", minWidth: 220, alignSelf: "flex-end" }}
+          />
           <label className="filter-field">
             <span>项目</span>
-            <select value={filters.project_id} onChange={(event) => setFilters({ ...filters, project_id: event.target.value })}>
-              <option value="">全部项目</option>
+            <Select value={filters.project_id || ""} onChange={(value) => setFilters({ ...filters, project_id: value })} style={{ width: 180 }}>
+              <Select.Option value="">全部项目</Select.Option>
               {projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.title}
-                </option>
+                <Select.Option key={project.id} value={project.id}>{project.title}</Select.Option>
               ))}
-            </select>
+            </Select>
           </label>
           <label className="filter-field">
             <span>严重程度</span>
-            <select
-              value={viewSeverity || filters.severity}
+            <Select
+              value={viewSeverity || filters.severity || ""}
               disabled={!!viewSeverity}
-              onChange={(event) => setFilters({ ...filters, severity: event.target.value })}
+              onChange={(value) => setFilters({ ...filters, severity: value })}
+              style={{ width: 120 }}
             >
-              <option value="">全部</option>
+              <Select.Option value="">全部</Select.Option>
               {Object.entries(SEVERITY_META).map(([key, meta]) => (
-                <option key={key} value={key}>
-                  {meta.label}
-                </option>
+                <Select.Option key={key} value={key}>{meta.label}</Select.Option>
               ))}
-            </select>
+            </Select>
           </label>
           <label className="filter-field">
             <span>状态</span>
-            <select
-              value={viewStatus || filters.status}
+            <Select
+              value={viewStatus || filters.status || ""}
               disabled={!!viewStatus}
-              onChange={(event) => setFilters({ ...filters, status: event.target.value })}
+              onChange={(value) => setFilters({ ...filters, status: value })}
+              style={{ width: 130 }}
             >
-              <option value="">全部状态</option>
-              <option value="confirmed">已确认</option>
-              <option value="ignored">已忽略</option>
-            </select>
+              <Select.Option value="">全部状态</Select.Option>
+              <Select.Option value="confirmed">已确认</Select.Option>
+              <Select.Option value="ignored">已忽略</Select.Option>
+            </Select>
           </label>
           <label className="filter-field date-field">
             <span>发现时间</span>
-            <div className="date-range-control">
-              <input
-                type="date"
-                value={filters.date_from}
-                max={filters.date_to || undefined}
-                onChange={(event) => setFilters({ ...filters, date_from: event.target.value })}
-              />
-              <span>→</span>
-              <input
-                type="date"
-                value={filters.date_to}
-                min={filters.date_from || undefined}
-                onChange={(event) => setFilters({ ...filters, date_to: event.target.value })}
-              />
-            </div>
+            <DatePicker.RangePicker
+              allowClear
+              value={filters.date_from || filters.date_to ? [filters.date_from, filters.date_to] : undefined}
+              onChange={(dateStrings) => setFilters({ ...filters, date_from: dateStrings?.[0] || "", date_to: dateStrings?.[1] || "" })}
+              style={{ width: 260 }}
+            />
           </label>
-          <button
-            className="ghost-button compact filter-reset"
-            type="button"
+          <Button
+            type="outline"
+            icon={<X size={15} />}
+            style={{ alignSelf: "flex-end" }}
             onClick={() => setFilters({ severity: "", project_id: "", status: "", search: "", date_from: "", date_to: "" })}
           >
-            <X size={15} />
             重置
-          </button>
+          </Button>
         </div>
         {loading ? (
           <EmptyState icon={Loader2} title="正在加载审计报告" />
@@ -5618,9 +5643,9 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
                   <h2>漏洞列表</h2>
                   <p>点击单条漏洞查看证据、过程和证明数据包</p>
                 </div>
-                <button className="ghost-button compact" type="button" disabled={!visibleIds.length} onClick={toggleVisibleSelected}>
+                <Button size="small" type="outline" disabled={!visibleIds.length} onClick={toggleVisibleSelected}>
                   {allVisibleSelected ? "取消全选" : "全选当前"}
-                </button>
+                </Button>
               </header>
               <div className="vuln-table-head">
                 <span />
@@ -5647,50 +5672,22 @@ function VulnerabilitiesPage({ route, runAction, setToast, confirmAction }) {
                 ))}
               </div>
               <footer className="vuln-table-footer">
-                <span>
-                  共 {filteredVulnCount} 条{filteredVulnCount > 0 ? ` · 第 ${pageStart}-${pageEnd} 条` : ""}
-                </span>
-                <label className="pagination-size">
-                  <select value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))}>
-                    {[10, 20, 50, 100].map((size) => (
-                      <option key={size} value={size}>
-                        {size} 条/页
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <div className="pagination">
-                  <button
-                    type="button"
-                    aria-label="上一页"
-                    disabled={currentPage <= 1}
-                    onClick={() => setPage((prev) => Math.max(1, prev - 1))}
-                  >
-                    <ChevronRight size={14} />
-                  </button>
-                  {pageNumbers.map((item, index) =>
-                    item === "..." ? (
-                      <span key={`gap-${index}`}>...</span>
-                    ) : (
-                      <button
-                        key={item}
-                        className={cn(item === currentPage && "active")}
-                        type="button"
-                        onClick={() => setPage(item)}
-                      >
-                        {item}
-                      </button>
-                    ),
-                  )}
-                  <button
-                    type="button"
-                    aria-label="下一页"
-                    disabled={currentPage >= totalPages}
-                    onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
-                  >
-                    <ChevronRight size={14} />
-                  </button>
-                </div>
+                <Pagination
+                  total={filteredVulnCount}
+                  current={currentPage}
+                  pageSize={pageSize}
+                  sizeCanChange
+                  showTotal
+                  sizeOptions={[10, 20, 50, 100]}
+                  onChange={(pageNum, size) => {
+                    setPage(pageNum);
+                    if (size && size !== pageSize) setPageSize(size);
+                  }}
+                  onPageSizeChange={(size) => {
+                    setPageSize(size);
+                    setPage(1);
+                  }}
+                />
               </footer>
             </article>
             <aside className="vuln-side-panels">
@@ -5828,39 +5825,39 @@ function ReportExportModal({
         </div>
         <label>
           <span>导出范围</span>
-          <select value={form.mode} onChange={(event) => setForm({ ...form, mode: event.target.value })}>
-            <option value="filtered">当前筛选范围（{visibleCount} 条）</option>
-            <option value="selected" disabled={!selectedCount}>已选漏洞（{selectedCount} 条）</option>
-          </select>
+          <Select value={form.mode} onChange={(value) => setForm({ ...form, mode: value })} style={{ width: "100%" }}>
+            <Select.Option value="filtered">当前筛选范围（{visibleCount} 条）</Select.Option>
+            <Select.Option value="selected" disabled={!selectedCount}>已选漏洞（{selectedCount} 条）</Select.Option>
+          </Select>
         </label>
         {form.mode === "filtered" && (
           <>
             <label>
               <span>项目</span>
-              <select value={form.project_id} onChange={(event) => setForm({ ...form, project_id: event.target.value })}>
-                <option value="">全部项目</option>
+              <Select value={form.project_id || ""} onChange={(value) => setForm({ ...form, project_id: value })} style={{ width: "100%" }}>
+                <Select.Option value="">全部项目</Select.Option>
                 {projects.map((project) => (
-                  <option key={project.id} value={project.id}>{project.title}</option>
+                  <Select.Option key={project.id} value={project.id}>{project.title}</Select.Option>
                 ))}
-              </select>
+              </Select>
             </label>
             <div className="two-col">
               <label>
                 <span>严重程度</span>
-                <select value={form.severity} onChange={(event) => setForm({ ...form, severity: event.target.value })}>
-                  <option value="">全部</option>
+                <Select value={form.severity || ""} onChange={(value) => setForm({ ...form, severity: value })} style={{ width: "100%" }}>
+                  <Select.Option value="">全部</Select.Option>
                   {["critical", "high", "medium", "low"].map((level) => (
-                    <option key={level} value={level}>{SEVERITY_META[level].label}</option>
+                    <Select.Option key={level} value={level}>{SEVERITY_META[level].label}</Select.Option>
                   ))}
-                </select>
+                </Select>
               </label>
               <label>
                 <span>状态</span>
-                <select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value })}>
-                  <option value="">全部状态</option>
-                  <option value="confirmed">已确认</option>
-                  <option value="ignored">已忽略</option>
-                </select>
+                <Select value={form.status || ""} onChange={(value) => setForm({ ...form, status: value })} style={{ width: "100%" }}>
+                  <Select.Option value="">全部状态</Select.Option>
+                  <Select.Option value="confirmed">已确认</Select.Option>
+                  <Select.Option value="ignored">已忽略</Select.Option>
+                </Select>
               </label>
             </div>
           </>
@@ -5871,19 +5868,17 @@ function ReportExportModal({
           导出不会自动触发扫描或动态验证。
           {missingReportMaterials.length > 0 && (
             <div className="button-row">
-              <button className="ghost-button compact" type="button" disabled={materialBusy} onClick={enqueueMaterials}>
-                {materialBusy ? <Loader2 className="spin" size={15} /> : <FileText size={15} />}
+              <Button size="small" type="outline" loading={materialBusy} icon={<FileText size={15} />} onClick={enqueueMaterials}>
                 提交写报告 Worker
-              </button>
+              </Button>
             </div>
           )}
         </div>
         <div className="modal-footer">
-          <button className="ghost-button" type="button" onClick={onClose}>取消</button>
-          <button className="primary-button compact" type="submit" disabled={saving || (form.mode === "selected" && !selectedCount)}>
-            {saving ? <Loader2 className="spin" size={18} /> : <Download size={18} />}
+          <Button onClick={onClose}>取消</Button>
+          <Button type="primary" htmlType="submit" loading={saving} disabled={form.mode === "selected" && !selectedCount} icon={<Download size={16} />}>
             {form.format === "bundle" ? "生成交付包" : `导出 ${form.format === "docx" ? "Word" : form.format.toUpperCase()}`}
-          </button>
+          </Button>
         </div>
       </form>
     </Modal>
@@ -5985,19 +5980,12 @@ function ExportRecordsView({ setToast, confirmAction }) {
               <p>每次导出审计报告都会在此留痕</p>
             </div>
             <div className="button-row">
-              <button
-                className="ghost-button compact danger"
-                type="button"
-                disabled={!records.length}
-                onClick={clearAll}
-              >
-                <Trash2 size={15} />
+              <Button size="small" type="outline" status="danger" disabled={!records.length} icon={<Trash2 size={15} />} onClick={clearAll}>
                 清空记录
-              </button>
-              <button className="ghost-button compact" type="button" onClick={() => load()}>
-                <RefreshCw size={15} />
+              </Button>
+              <Button size="small" icon={<RefreshCw size={15} />} onClick={() => load()}>
                 刷新
-              </button>
+              </Button>
             </div>
           </header>
           <div className="export-records-head">
@@ -6021,29 +6009,16 @@ function ExportRecordsView({ setToast, confirmAction }) {
                     <strong>{record.scope}</strong>
                     {record.project_name && <span>{record.project_name}</span>}
                   </div>
-                  <span><Badge tone="info">{formatLabels[record.format] || record.format.toUpperCase()}</Badge></span>
+                  <span><Tag color="arcoblue">{formatLabels[record.format] || record.format.toUpperCase()}</Tag></span>
                   <span className="export-count">{record.vulnerability_count}</span>
                   <code title={record.filename}>{record.filename}</code>
                   <div className="button-row export-record-actions">
-                    <button
-                      className="table-action"
-                      type="button"
-                      title="重新导出"
-                      aria-label="重新导出"
-                      disabled={busyId === record.id}
-                      onClick={() => redownload(record)}
-                    >
-                      {busyId === record.id ? <Loader2 className="spin" size={15} /> : <Download size={15} />}
-                    </button>
-                    <button
-                      className="table-action danger"
-                      type="button"
-                      title="删除记录"
-                      aria-label="删除记录"
-                      onClick={() => removeRecord(record)}
-                    >
-                      <Trash2 size={15} />
-                    </button>
+                    <Tooltip content="重新导出">
+                      <Button type="text" size="small" loading={busyId === record.id} icon={<Download size={15} />} aria-label="重新导出" onClick={() => redownload(record)} />
+                    </Tooltip>
+                    <Tooltip content="删除记录">
+                      <Button type="text" size="small" status="danger" icon={<Trash2 size={15} />} aria-label="删除记录" onClick={() => removeRecord(record)} />
+                    </Tooltip>
                   </div>
                 </div>
               ))
@@ -6360,7 +6335,7 @@ function VulnerabilityItem({ vuln, selected, setToast, onSelect, expanded, onTog
     <article className={cn("vuln-table-item", ignored && "ignored")}>
       <div className="vuln-table-row">
         <label className="vuln-select">
-          <input type="checkbox" checked={selected} onChange={onSelect} />
+          <Checkbox checked={selected} onChange={onSelect} />
         </label>
         <div className="vuln-name-cell">
           <div className="vuln-meta">
@@ -6380,54 +6355,41 @@ function VulnerabilityItem({ vuln, selected, setToast, onSelect, expanded, onTog
           <span>{vuln.project_id}</span>
         </div>
         <div>
-          <Badge tone={meta.tone}>{meta.label}</Badge>
+          <Tag color={arcoTagColor(meta.tone)}>{meta.label}</Tag>
         </div>
         <div>
-          <Badge tone={ignored ? "muted" : "success"}>{ignored ? "已忽略" : "已确认"}</Badge>
+          <Tag color={ignored ? "gray" : "green"}>{ignored ? "已忽略" : "已确认"}</Tag>
         </div>
         <time>{formatTime(vuln.discovered_at)}</time>
         <div className="button-row">
-          <button
-            className="table-action"
-            type="button"
-            title="复制漏洞摘要"
-            aria-label="复制漏洞摘要"
-            onClick={() => copyText(summaryText, setToast, "漏洞摘要已复制")}
-          >
-            <Copy size={16} />
-          </button>
-          <button
-            className={cn("table-action", ignored ? "success" : "warning")}
-            type="button"
-            title={ignored ? "恢复确认" : "设为忽略"}
-            aria-label={ignored ? "恢复确认" : "设为忽略"}
-            onClick={() => onStatusChange(ignored ? "confirmed" : "ignored")}
-          >
-            {ignored ? <CheckCircle2 size={16} /> : <X size={16} />}
-          </button>
-          <button className="table-action" type="button" onClick={onExport} title="导出当前漏洞" aria-label="导出当前漏洞">
-            <Download size={16} />
-          </button>
-          <button className="table-action" type="button" onClick={onToggle} title="查看详情" aria-label="查看详情">
-            {expanded ? <ChevronDown size={16} /> : <Eye size={16} />}
-          </button>
+          <Tooltip content="复制漏洞摘要">
+            <Button type="text" size="small" icon={<Copy size={16} />} aria-label="复制漏洞摘要" onClick={() => copyText(summaryText, setToast, "漏洞摘要已复制")} />
+          </Tooltip>
+          <Tooltip content={ignored ? "恢复确认" : "设为忽略"}>
+            <Button type="text" size="small" status={ignored ? "success" : "warning"} icon={ignored ? <CheckCircle2 size={16} /> : <X size={16} />} aria-label={ignored ? "恢复确认" : "设为忽略"} onClick={() => onStatusChange(ignored ? "confirmed" : "ignored")} />
+          </Tooltip>
+          <Tooltip content="导出当前漏洞">
+            <Button type="text" size="small" icon={<Download size={16} />} aria-label="导出当前漏洞" onClick={onExport} />
+          </Tooltip>
+          <Tooltip content="查看详情">
+            <Button type="text" size="small" icon={expanded ? <ChevronDown size={16} /> : <Eye size={16} />} aria-label="查看详情" onClick={onToggle} />
+          </Tooltip>
         </div>
       </div>
       {expanded && (
         <div className="vuln-detail">
           <div className="detail-toolbar">
             <div className="evidence-state">
-              <Badge tone={hasProofPackets ? "success" : "warning"}>
+              <Tag color={hasProofPackets ? "green" : "orange"}>
                 {hasProofPackets ? "已有证明数据包" : "缺少证明数据包"}
-              </Badge>
-              <Badge tone={hasStaticPoc ? "info" : "muted"}>
+              </Tag>
+              <Tag color={hasStaticPoc ? "arcoblue" : "gray"}>
                 {hasStaticPoc ? "已有静态 PoC" : "未记录静态 PoC"}
-              </Badge>
+              </Tag>
             </div>
-            <button className="ghost-button compact" type="button" onClick={() => copyText(summaryText, setToast, "漏洞摘要已复制")}>
-              <Copy size={15} />
+            <Button size="small" type="outline" icon={<Copy size={15} />} onClick={() => copyText(summaryText, setToast, "漏洞摘要已复制")}>
               复制摘要
-            </button>
+            </Button>
           </div>
           <div className="detail-grid cards">
             <InfoBox label="项目来源" value={`${vuln.project_name} (${vuln.project_id})`} />
@@ -6532,10 +6494,7 @@ function StaticPocSection({ poc, setToast }) {
     <section>
       <div className="section-heading-row">
         <h4>静态复现 PoC</h4>
-        <button className="ghost-button compact" type="button" onClick={() => copyText(fullText, setToast, "静态 PoC 已复制")}>
-          <Copy size={15} />
-          复制 PoC
-        </button>
+        <Button size="small" type="outline" icon={<Copy size={15} />} onClick={() => copyText(fullText, setToast, "静态 PoC 已复制")}>复制 PoC</Button>
       </div>
       <div className="static-poc-panel">
         {payload && <CopyableBlock label="Payload" value={payload} setToast={setToast} />}
@@ -6828,18 +6787,16 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
         subtitle="实时状态、模型配置、任务历史与健康检查"
         actions={
           <>
-            <button className="primary-outline" type="button" disabled={!config} onClick={() => setEditor(defaultWorkerDraft(config?.workers || []))}>
-              <Plus size={18} />
+            <Button type="primary" icon={<Plus size={16} />} disabled={!config} onClick={() => setEditor(defaultWorkerDraft(config?.workers || []))}>
               新增 Worker
-            </button>
+            </Button>
             <div className="status-pill">
               <span className={cn("dot", lastUpdated ? "success" : "warning")} />
               <span>{lastUpdated ? `更新于 ${lastUpdated.toLocaleTimeString("zh-CN")}` : "待更新"}</span>
             </div>
-            <button className="ghost-button" type="button" onClick={load} disabled={refreshing}>
-              <RefreshCw className={cn(refreshing && "spin")} size={18} />
+            <Button icon={<RefreshCw size={16} />} loading={refreshing} onClick={load}>
               刷新
-            </button>
+            </Button>
           </>
         }
       />
@@ -6854,10 +6811,9 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
             title="还没有配置工作节点"
             subtitle="新增 Worker 后，调度器会按优先级和并发配置分配任务。"
             action={
-              <button className="primary-button compact" type="button" disabled={!config} onClick={() => setEditor(defaultWorkerDraft([]))}>
-                <Plus size={18} />
+              <Button type="primary" disabled={!config} icon={<Plus size={16} />} onClick={() => setEditor(defaultWorkerDraft([]))}>
                 新增 Worker
-              </button>
+              </Button>
             }
           />
         ) : (
@@ -6875,27 +6831,31 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
                 <button type="button" onClick={load}>重新读取</button>
               </div>
             )}
-            <div className="workspace-switcher" role="tablist" aria-label="工作节点视图">
-              <button type="button" className={cn(workerView === "nodes" && "active")} onClick={() => setWorkerView("nodes")}><Server size={16} /> 节点概览 <span>{visibleWorkers.length}</span></button>
-              <button type="button" className={cn(workerView === "queues" && "active")} onClick={() => setWorkerView("queues")}><Timer size={16} /> 任务队列 <span>{queueCount}</span></button>
-            </div>
+            <Radio.Group type="button" name="worker-view" value={workerView} onChange={setWorkerView} style={{ marginBottom: 16 }}>
+              <Radio value="nodes"><span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><Server size={15} />节点概览 ({visibleWorkers.length})</span></Radio>
+              <Radio value="queues"><span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><Timer size={15} />任务队列 ({queueCount})</span></Radio>
+            </Radio.Group>
             {workerView === "nodes" ? (
               <>
                 <div className="collection-toolbar worker-toolbar">
-                  <div className="collection-search">
-                    <Search size={16} />
-                    <input value={workerQuery} onChange={(event) => setWorkerQuery(event.target.value)} placeholder="搜索节点、类型或模型" aria-label="搜索工作节点" />
-                    {workerQuery && <button type="button" onClick={() => setWorkerQuery("")} aria-label="清除搜索"><X size={14} /></button>}
-                  </div>
-                  <div className="segmented filter-segment" role="tablist" aria-label="工作节点筛选">
+                  <Input
+                    allowClear
+                    prefix={<Search size={15} />}
+                    value={workerQuery}
+                    onChange={setWorkerQuery}
+                    placeholder="搜索节点、类型或模型"
+                    aria-label="搜索工作节点"
+                    style={{ maxWidth: 320 }}
+                  />
+                  <Radio.Group type="button" name="worker-filter" value={workerFilter} onChange={setWorkerFilter}>
                     {[['all', '全部'], ['online', '在线'], ['busy', '运行中'], ['offline', '离线'], ['disabled', '已关闭']].map(([value, label]) => (
-                      <button key={value} type="button" className={cn(workerFilter === value && "active")} onClick={() => setWorkerFilter(value)}>{label}</button>
+                      <Radio key={value} value={value}>{label}</Radio>
                     ))}
-                  </div>
+                  </Radio.Group>
                   <span className="collection-count"><SlidersHorizontal size={14} /> {visibleFilteredWorkers.length} 个节点</span>
                 </div>
                 {visibleFilteredWorkers.length === 0 ? (
-                  <EmptyState icon={Search} title="没有匹配的工作节点" subtitle="尝试清除搜索或切换状态筛选。" action={<button className="ghost-button compact" type="button" onClick={() => { setWorkerQuery(""); setWorkerFilter("all"); }}><X size={15} /> 清除筛选</button>} />
+                  <EmptyState icon={Search} title="没有匹配的工作节点" subtitle="尝试清除搜索或切换状态筛选。" action={<Button type="outline" size="small" icon={<X size={15} />} onClick={() => { setWorkerQuery(""); setWorkerFilter("all"); }}>清除筛选</Button>} />
                 ) : (
                   <div className="worker-grid">
                     {visibleFilteredWorkers.map((worker) => {
@@ -6907,11 +6867,11 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
                           <header className="worker-card-header">
                             <span className={cn("worker-status-orb", statusMeta.tone)}><span /></span>
                             <div className="worker-heading">
-                              <div className="worker-name-line"><h3>{worker.name}</h3><Badge tone={statusMeta.tone}>{statusMeta.label}</Badge></div>
+                              <div className="worker-name-line"><h3>{worker.name}</h3><Tag color={arcoTagColor(statusMeta.tone)} size="small">{statusMeta.label}</Tag></div>
                               <p>{worker.type} <span>·</span> {workerModelLabel(worker)}</p>
                             </div>
                           </header>
-                          {taskTypes.length > 0 && <div className="worker-task-chips">{taskTypes.slice(0, 4).map((type) => <span key={type}>{type}</span>)}{taskTypes.length > 4 && <span>+{taskTypes.length - 4}</span>}</div>}
+                          {taskTypes.length > 0 && <div className="worker-task-chips">{taskTypes.slice(0, 4).map((type) => <Tag key={type} size="small" bordered>{type}</Tag>)}{taskTypes.length > 4 && <Tag size="small" bordered>+{taskTypes.length - 4}</Tag>}</div>}
                           {status.current_task ? <div className="worker-current-task"><Activity size={15} /><span>{status.current_task}</span></div> : <div className="worker-current-task quiet"><Circle size={12} /><span>当前没有运行中的任务</span></div>}
                           <div className="project-stats worker-stats">
                             <MiniStat label="任务数" value={status.tasks_completed ?? 0} />
@@ -6919,11 +6879,11 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
                             <MiniStat label="最近心跳" value={relativeHeartbeat(status.last_heartbeat_seconds_ago)} />
                           </div>
                           <div className="card-actions worker-actions">
-                            <button className={cn("ghost-button compact", worker.enabled === false ? "success" : "warning")} type="button" disabled={!config} onClick={() => setEnabled(worker, worker.enabled === false)}>{worker.enabled === false ? <Play size={16} /> : <Pause size={16} />}{worker.enabled === false ? "启用" : "关闭"}</button>
-                            <button className="ghost-button compact" type="button" disabled={!config} onClick={() => testWorker(worker)}><Activity size={16} /> 测试</button>
-                            <button className="ghost-button compact" type="button" disabled={!config} onClick={() => setEditor(worker)}><Settings size={16} /> 编辑</button>
+                            <Button size="small" type="outline" status={worker.enabled === false ? "success" : "warning"} disabled={!config} style={{ flex: 1 }} icon={worker.enabled === false ? <Play size={15} /> : <Pause size={15} />} onClick={() => setEnabled(worker, worker.enabled === false)}>{worker.enabled === false ? "启用" : "关闭"}</Button>
+                            <Button size="small" type="outline" disabled={!config} style={{ flex: 1 }} icon={<Activity size={15} />} onClick={() => testWorker(worker)}>测试</Button>
+                            <Button size="small" type="outline" disabled={!config} style={{ flex: 1 }} icon={<Settings size={15} />} onClick={() => setEditor(worker)}>编辑</Button>
                           </div>
-                          <button className="history-toggle" type="button" onClick={() => openHistory(worker.name)}><History size={17} /> 查看任务历史 <ArrowUpRight size={15} /></button>
+                          <Button type="text" long style={{ marginTop: 4 }} icon={<History size={15} />} onClick={() => openHistory(worker.name)}>查看任务历史</Button>
                         </article>
                       );
                     })}
@@ -6963,33 +6923,42 @@ function WorkersPage({ runAction, setToast, confirmAction }) {
 
 function WorkerHistoryDrawer({ worker, rows, loading, error, onClose, onRefresh }) {
   const [filter, setFilter] = useState("all");
-  useModalLifecycle(onClose);
   const visibleRows = rows.filter((row) => filter === "all" || (filter === "success" ? row.outcome === "success" : row.outcome !== "success"));
   const failedCount = rows.filter((row) => row.outcome !== "success").length;
   const successCount = rows.length - failedCount;
   return (
-    <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <aside className="worker-history-drawer" role="dialog" aria-modal="true" aria-label="任务历史">
-        <header className="drawer-header">
-          <div>
-            <span className="eyebrow">执行记录</span>
-            <h2>{worker?.name || "工作节点"}</h2>
-            <p>{worker?.type || "-"} · {worker ? workerModelLabel(worker) : ""}</p>
-          </div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label="关闭任务历史" title="关闭"><X size={18} /></button>
-        </header>
-        <div className="drawer-summary"><div><strong>{rows.length}</strong><span>最近记录</span></div><div><strong>{successCount}</strong><span>成功</span></div><div><strong className={failedCount ? "danger-text" : ""}>{failedCount}</strong><span>需关注</span></div></div>
-        <div className="drawer-toolbar"><div className="segmented filter-segment"><button type="button" className={cn(filter === "all" && "active")} onClick={() => setFilter("all")}>全部</button><button type="button" className={cn(filter === "success" && "active")} onClick={() => setFilter("success")}>成功</button><button type="button" className={cn(filter === "failed" && "active")} onClick={() => setFilter("failed")}>失败/中断</button></div><button className="ghost-button compact" type="button" onClick={onRefresh} disabled={loading}><RefreshCw className={cn(loading && "spin")} size={15} /> 刷新</button></div>
-        <div className="drawer-body">
-          {error ? <PageErrorState title="历史记录加载失败" message={error} onRetry={onRefresh} /> : loading && rows.length === 0 ? <div className="drawer-loading"><Loader2 className="spin" size={22} />正在读取记录</div> : visibleRows.length === 0 ? <EmptyState icon={History} title="暂无任务历史" subtitle="节点执行任务后，最近记录会显示在这里。" /> : visibleRows.map((row, index) => (
-            <article className={cn("history-timeline-row", row.outcome !== "success" && "attention")} key={`${row.started_at}-${row.task_type}-${index}`}>
-              <span className="history-timeline-dot" />
-              <div className="history-timeline-content"><div className="history-row-header"><strong>{row.task_type}</strong><Badge tone={workerHistoryOutcomeTone(row)}>{workerHistoryOutcomeLabel(row)}</Badge></div><p>{row.description}</p><div className="history-meta"><span>{row.project_name}</span><span>{formatTime(row.started_at)}</span>{row.duration_seconds != null && <span><Timer size={13} /> {row.duration_seconds}s</span>}</div>{workerHistoryErrorText(row) && <details><summary>查看错误详情</summary><pre>{workerHistoryErrorText(row)}</pre></details>}</div>
-            </article>
-          ))}
+    <Drawer
+      visible
+      width={540}
+      onCancel={onClose}
+      onOk={onClose}
+      footer={null}
+      maskClosable
+      title={
+        <div className="drawer-title">
+          <strong style={{ display: "block", fontSize: 16, lineHeight: 1.3 }}>{worker?.name || "工作节点"}</strong>
+          <span style={{ color: "var(--muted)", fontSize: 12, fontWeight: 400 }}>{worker?.type || "-"} · {worker ? workerModelLabel(worker) : ""}</span>
         </div>
-      </aside>
-    </div>
+      }
+    >
+      <div className="drawer-summary"><div><strong>{rows.length}</strong><span>最近记录</span></div><div><strong>{successCount}</strong><span>成功</span></div><div><strong className={failedCount ? "danger-text" : ""}>{failedCount}</strong><span>需关注</span></div></div>
+      <div className="drawer-toolbar">
+        <Radio.Group type="button" name="history-filter" value={filter} onChange={setFilter}>
+          <Radio value="all">全部</Radio>
+          <Radio value="success">成功</Radio>
+          <Radio value="failed">失败/中断</Radio>
+        </Radio.Group>
+        <Button size="small" icon={<RefreshCw size={15} />} loading={loading} onClick={onRefresh}>刷新</Button>
+      </div>
+      <div className="drawer-body">
+        {error ? <PageErrorState title="历史记录加载失败" message={error} onRetry={onRefresh} /> : loading && rows.length === 0 ? <div className="drawer-loading"><Spin /> 正在读取记录</div> : visibleRows.length === 0 ? <EmptyState icon={History} title="暂无任务历史" subtitle="节点执行任务后，最近记录会显示在这里。" /> : visibleRows.map((row, index) => (
+          <article className={cn("history-timeline-row", row.outcome !== "success" && "attention")} key={`${row.started_at}-${row.task_type}-${index}`}>
+            <span className="history-timeline-dot" />
+            <div className="history-timeline-content"><div className="history-row-header"><strong>{row.task_type}</strong><Tag color={arcoTagColor(workerHistoryOutcomeTone(row))} size="small">{workerHistoryOutcomeLabel(row)}</Tag></div><p>{row.description}</p><div className="history-meta"><span>{row.project_name}</span><span>{formatTime(row.started_at)}</span>{row.duration_seconds != null && <span><Timer size={13} /> {row.duration_seconds}s</span>}</div>{workerHistoryErrorText(row) && <details><summary>查看错误详情</summary><pre>{workerHistoryErrorText(row)}</pre></details>}</div>
+          </article>
+        ))}
+      </div>
+    </Drawer>
   );
 }
 
@@ -7016,13 +6985,10 @@ function TaskOperationsPanel({ title, emptyText, kind = "tool", tasks, busyId, o
           <h2>{title}</h2>
         </div>
         <div className="button-row">
-          <Badge tone="info">{counts.running} 运行中</Badge>
-          <Badge tone="warning">{counts.pending} 等待中</Badge>
-          <Badge tone="danger">{counts.failed} 失败</Badge>
-          <button className="ghost-button compact" type="button" onClick={onRefresh}>
-            <RefreshCw size={15} />
-            刷新
-          </button>
+          <Tag color="arcoblue">{counts.running} 运行中</Tag>
+          <Tag color="orange">{counts.pending} 等待中</Tag>
+          <Tag color="red">{counts.failed} 失败</Tag>
+          <Button size="small" icon={<RefreshCw size={15} />} onClick={onRefresh}>刷新</Button>
         </div>
       </header>
       {tasks.length === 0 ? (
@@ -7042,19 +7008,13 @@ function TaskOperationsPanel({ title, emptyText, kind = "tool", tasks, busyId, o
                 {kind === "report" && task.status === "completed" && <small>{reportTaskMaterialSummary(task)}</small>}
                 {task.error_message && <p>{task.error_message}</p>}
               </div>
-              <Badge tone={statusTone(task.status)}>{formatStatus(task.status)}</Badge>
+              <Tag color={arcoTagColor(statusTone(task.status))}>{formatStatus(task.status)}</Tag>
               <div className="button-row">
                 {(task.status === "pending" || task.status === "running") && (
-                  <button className="ghost-button compact warning" type="button" disabled={busyId === task.id} onClick={() => onCancel(task)}>
-                    {busyId === task.id ? <Loader2 className="spin" size={15} /> : <Square size={15} />}
-                    取消
-                  </button>
+                  <Button size="small" type="outline" status="warning" loading={busyId === task.id} icon={<Square size={15} />} onClick={() => onCancel(task)}>取消</Button>
                 )}
                 {task.status === "failed" && (
-                  <button className="ghost-button compact" type="button" disabled={busyId === task.id} onClick={() => onRetry(task)}>
-                    {busyId === task.id ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
-                    重试
-                  </button>
+                  <Button size="small" type="outline" loading={busyId === task.id} icon={<RefreshCw size={15} />} onClick={() => onRetry(task)}>重试</Button>
                 )}
               </div>
             </article>
@@ -7187,109 +7147,82 @@ function WorkerEditor({ worker, onClose, onSave, onDelete }) {
         <div className="two-col tight">
           <label>
             <span>快速模板</span>
-            <select defaultValue="" onChange={(event) => applyPreset(event.target.value)}>
-              <option value="" disabled>
-                选择模型模板
-              </option>
+            <Select placeholder="选择模型模板" style={{ width: "100%" }} onChange={(value) => applyPreset(value)}>
               {WORKER_PRESETS.map((preset) => (
-                <option key={preset.id} value={preset.id}>
+                <Select.Option key={preset.id} value={preset.id}>
                   {preset.label}
-                </option>
+                </Select.Option>
               ))}
-            </select>
+            </Select>
           </label>
           <label className="switch-line">
             <span>启用状态</span>
-            <button
-              className={cn("switch", draft.enabled !== false && "on")}
-              type="button"
-              onClick={() => setDraft({ ...draft, enabled: draft.enabled === false })}
-            >
-              <span />
-            </button>
+            <Switch checked={draft.enabled !== false} onChange={(checked) => setDraft({ ...draft, enabled: checked })} />
           </label>
         </div>
         <div className="two-col tight">
           <label>
             <span>名称</span>
-            <input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required />
+            <Input value={draft.name} onChange={(value) => setDraft({ ...draft, name: value })} required />
           </label>
           <label>
             <span>类型</span>
-            <select
+            <Select
               value={draft.type}
-              onChange={(event) => {
-                const type = event.target.value;
+              style={{ width: "100%" }}
+              onChange={(type) => {
                 setDraft({ ...draft, type, env: defaultEnvForType(type), secret_env_keys: workerEnvKeys(type).filter((key) => /KEY|TOKEN|SECRET/i.test(key)) });
               }}
             >
-              <option value="pi">pi</option>
-              <option value="claudecode">claudecode</option>
-              <option value="codex">codex</option>
-              <option value="mock">mock</option>
-            </select>
+              <Select.Option value="pi">pi</Select.Option>
+              <Select.Option value="claudecode">claudecode</Select.Option>
+              <Select.Option value="codex">codex</Select.Option>
+              <Select.Option value="mock">mock</Select.Option>
+            </Select>
           </label>
         </div>
         <div className="three-col">
-          <label>
+          <label style={{ alignSelf: "start" }}>
             <span>最大并发</span>
-            <input
-              type="number"
-              min="1"
-              value={draft.max_running}
-              onChange={(event) => setDraft({ ...draft, max_running: event.target.value })}
-            />
+            <InputNumber min={1} value={Number(draft.max_running) || 1} onChange={(value) => setDraft({ ...draft, max_running: value })} style={{ width: "100%" }} />
           </label>
-          <label>
+          <label style={{ alignSelf: "start" }}>
             <span>优先级</span>
-            <input
-              type="number"
-              min="0"
-              value={draft.priority}
-              onChange={(event) => setDraft({ ...draft, priority: event.target.value })}
-            />
+            <InputNumber min={0} value={Number(draft.priority) || 0} onChange={(value) => setDraft({ ...draft, priority: value })} style={{ width: "100%" }} />
           </label>
           <label>
             <span>任务类型</span>
-            <div className="checkbox-row">
+            <Checkbox.Group
+              value={draft.task_types || []}
+              onChange={(values) => setDraft({ ...draft, task_types: values })}
+              style={{ display: "flex", flexWrap: "wrap", gap: "4px 12px" }}
+            >
               {TASK_TYPES.map((type) => (
-                <label key={type}>
-                  <input
-                    type="checkbox"
-                    checked={draft.task_types?.includes(type)}
-                    onChange={(event) => {
-                      const next = event.target.checked
-                        ? [...(draft.task_types || []), type]
-                        : (draft.task_types || []).filter((item) => item !== type);
-                      setDraft({ ...draft, task_types: next });
-                    }}
-                  />
-                  {type}
-                </label>
+                <Checkbox key={type} value={type}>{type}</Checkbox>
               ))}
-            </div>
+            </Checkbox.Group>
           </label>
         </div>
         <div className="env-grid">
           {envKeys.map((key) => {
             const secret = /KEY|TOKEN|SECRET/i.test(key);
+            const InputComp = secret ? Input.Password : Input;
             return (
               <label key={key}>
                 <span>{key}</span>
-                <input
-                  type={secret ? "password" : "text"}
+                <InputComp
                   value={draft.env?.[key] ?? ""}
                   placeholder={secret ? SECRET_MASK : ""}
-                  onChange={(event) =>
+                  required={draft.type !== "mock"}
+                  onChange={(value) =>
                     setDraft({
                       ...draft,
-                      env: { ...(draft.env || {}), [key]: event.target.value },
+                      env: { ...(draft.env || {}), [key]: value },
                       secret_env_keys: secret
                         ? Array.from(new Set([...(draft.secret_env_keys || []), key]))
                         : draft.secret_env_keys || [],
                     })
                   }
-                  required={draft.type !== "mock"}
                 />
               </label>
             );
@@ -7298,20 +7231,16 @@ function WorkerEditor({ worker, onClose, onSave, onDelete }) {
         <div className="modal-footer split">
           <div>
             {onDelete && (
-              <button className="ghost-button danger" type="button" onClick={onDelete}>
-                <Trash2 size={16} />
+              <Button type="outline" status="danger" icon={<Trash2 size={16} />} onClick={onDelete}>
                 删除 Worker
-              </button>
+              </Button>
             )}
           </div>
           <div className="button-row">
-            <button className="ghost-button" type="button" onClick={onClose}>
-              取消
-            </button>
-            <button className="primary-button compact" type="submit" disabled={saving}>
-              {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
+            <Button onClick={onClose}>取消</Button>
+            <Button type="primary" htmlType="submit" loading={saving} icon={<Save size={16} />}>
               保存配置
-            </button>
+            </Button>
           </div>
         </div>
       </form>
@@ -7387,36 +7316,26 @@ function TemplatesPage({ runAction, setToast, confirmAction }) {
         subtitle="把常用目标、起点和提示保存成可复用项目模板"
         actions={
           <>
-            <button className="primary-outline" type="button" onClick={() => setNewTemplate(true)}>
-              <Plus size={18} />
+            <Button type="primary" icon={<Plus size={16} />} onClick={() => setNewTemplate(true)}>
               新建模板
-            </button>
-            <button className="ghost-button" type="button" onClick={load}>
-              <RefreshCw size={18} />
+            </Button>
+            <Button icon={<RefreshCw size={16} />} loading={loading} onClick={load}>
               刷新
-            </button>
+            </Button>
           </>
         }
       />
       <section className="content-wrap">
-        <div className="template-tabs" role="tablist" aria-label="模板分类">
+        <Radio.Group type="button" name="template-category" value={category} onChange={setCategory} style={{ marginBottom: 16 }}>
           {TEMPLATE_CATEGORIES.map((tab) => {
             const count = tab.key === "all" ? templates.length : categoryCounts[tab.key] || 0;
             return (
-              <button
-                key={tab.key}
-                type="button"
-                role="tab"
-                aria-selected={category === tab.key}
-                className={cn("template-tab", category === tab.key && "active")}
-                onClick={() => setCategory(tab.key)}
-              >
-                {tab.label}
-                <span className="template-tab-count">{count}</span>
-              </button>
+              <Radio key={tab.key} value={tab.key}>
+                {tab.label} ({count})
+              </Radio>
             );
           })}
-        </div>
+        </Radio.Group>
         {loading ? (
           <EmptyState icon={Loader2} title="正在加载模板" />
         ) : visibleTemplates.length === 0 ? (
@@ -7425,10 +7344,9 @@ function TemplatesPage({ runAction, setToast, confirmAction }) {
             title="该分类下暂无模板"
             subtitle="切换分类查看其他模板，或新建一个自定义模板。"
             action={
-              <button className="primary-button compact" type="button" onClick={() => setNewTemplate(true)}>
-                <Plus size={16} />
+              <Button type="primary" icon={<Plus size={16} />} onClick={() => setNewTemplate(true)}>
                 新建模板
-              </button>
+              </Button>
             }
           />
         ) : (
@@ -7464,15 +7382,13 @@ function TemplatesPage({ runAction, setToast, confirmAction }) {
                       {hintCount ? `${hintCount} 条提示` : "无初始提示"}
                     </span>
                     <div className="card-actions">
-                      <button className="primary-outline compact" type="button" onClick={() => setProjectTemplate(template)}>
-                        <Plus size={16} />
+                      <Button size="small" type="outline" icon={<Plus size={16} />} onClick={() => setProjectTemplate(template)}>
                         使用模板
-                      </button>
+                      </Button>
                       {!template.is_builtin && (
-                        <button className="ghost-button compact danger" type="button" onClick={() => deleteTemplate(template)}>
-                          <Trash2 size={16} />
+                        <Button size="small" type="outline" status="danger" icon={<Trash2 size={16} />} onClick={() => deleteTemplate(template)}>
                           删除
-                        </button>
+                        </Button>
                       )}
                     </div>
                   </div>
@@ -7559,30 +7475,29 @@ function TemplateEditor({ onClose, onSave }) {
       <form className="stack-form modal-body" onSubmit={submit}>
         <label>
           <span>模板名称</span>
-          <input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} required />
+          <Input value={form.title} onChange={(value) => setForm({ ...form, title: value })} required />
         </label>
         <div className="two-col">
           <label>
             <span>起点</span>
-            <textarea rows={6} value={form.origin} onChange={(event) => setForm({ ...form, origin: event.target.value })} required />
+            <Input.TextArea value={form.origin} onChange={(value) => setForm({ ...form, origin: value })} autoSize={{ minRows: 6, maxRows: 12 }} required />
           </label>
           <label>
             <span>目标</span>
-            <textarea rows={6} value={form.goal} onChange={(event) => setForm({ ...form, goal: event.target.value })} required />
+            <Input.TextArea value={form.goal} onChange={(value) => setForm({ ...form, goal: value })} autoSize={{ minRows: 6, maxRows: 12 }} required />
           </label>
         </div>
         <label>
           <span>提示</span>
-          <textarea rows={4} value={form.hints} onChange={(event) => setForm({ ...form, hints: event.target.value })} />
+          <Input.TextArea value={form.hints} onChange={(value) => setForm({ ...form, hints: value })} autoSize={{ minRows: 4, maxRows: 8 }} />
         </label>
         <div className="modal-footer">
-          <button className="ghost-button" type="button" onClick={onClose}>
+          <Button onClick={onClose}>
             取消
-          </button>
-          <button className="primary-button compact" type="submit" disabled={saving}>
-            {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
+          </Button>
+          <Button type="primary" htmlType="submit" loading={saving} icon={<Save size={16} />}>
             保存模板
-          </button>
+          </Button>
         </div>
       </form>
     </Modal>
@@ -7629,51 +7544,33 @@ function PasswordModal({ onClose, runAction }) {
       <form className="stack-form modal-body password-form" onSubmit={submit}>
         <label>
           <span>当前密码</span>
-          <div className="input-affix">
-            <KeyRound size={16} className="affix-icon" />
-            <input
-              type={show.current ? "text" : "password"}
-              value={form.current_password}
-              onChange={(event) => setForm({ ...form, current_password: event.target.value })}
-              placeholder="请输入当前密码"
-              autoComplete="current-password"
-              required
-            />
-            <button type="button" className="affix-toggle" onClick={() => setShow({ ...show, current: !show.current })} aria-label="显示/隐藏密码">
-              {show.current ? <EyeOff size={16} /> : <Eye size={16} />}
-            </button>
-          </div>
+          <Input.Password
+            prefix={<KeyRound size={16} />}
+            value={form.current_password}
+            onChange={(value) => setForm({ ...form, current_password: value })}
+            placeholder="请输入当前密码"
+            autoComplete="current-password"
+          />
         </label>
         <label>
           <span>新密码</span>
-          <div className="input-affix">
-            <Lock size={16} className="affix-icon" />
-            <input
-              type={show.next ? "text" : "password"}
-              value={form.new_password}
-              onChange={(event) => setForm({ ...form, new_password: event.target.value })}
-              placeholder="请输入新密码"
-              autoComplete="new-password"
-              required
-            />
-            <button type="button" className="affix-toggle" onClick={() => setShow({ ...show, next: !show.next })} aria-label="显示/隐藏密码">
-              {show.next ? <EyeOff size={16} /> : <Eye size={16} />}
-            </button>
-          </div>
+          <Input.Password
+            prefix={<Lock size={16} />}
+            value={form.new_password}
+            onChange={(value) => setForm({ ...form, new_password: value })}
+            placeholder="请输入新密码"
+            autoComplete="new-password"
+          />
         </label>
         <label>
           <span>确认新密码</span>
-          <div className="input-affix">
-            <Lock size={16} className="affix-icon" />
-            <input
-              type={show.next ? "text" : "password"}
-              value={form.confirm_password}
-              onChange={(event) => setForm({ ...form, confirm_password: event.target.value })}
-              placeholder="请再次输入新密码"
-              autoComplete="new-password"
-              required
-            />
-          </div>
+          <Input.Password
+            prefix={<Lock size={16} />}
+            value={form.confirm_password}
+            onChange={(value) => setForm({ ...form, confirm_password: value })}
+            placeholder="请再次输入新密码"
+            autoComplete="new-password"
+          />
           {form.confirm_password.length > 0 && !matched && <small className="field-hint danger">两次输入的密码不一致</small>}
         </label>
         <ul className="password-rules">
@@ -7685,13 +7582,12 @@ function PasswordModal({ onClose, runAction }) {
           ))}
         </ul>
         <div className="modal-footer">
-          <button className="ghost-button" type="button" onClick={onClose}>
+          <Button onClick={onClose}>
             取消
-          </button>
-          <button className="primary-button compact" type="submit" disabled={!canSubmit}>
-            {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
+          </Button>
+          <Button type="primary" htmlType="submit" loading={saving} disabled={!canSubmit} icon={<Save size={16} />}>
             保存
-          </button>
+          </Button>
         </div>
       </form>
     </Modal>
@@ -7824,7 +7720,9 @@ function SettingsModal({ onClose, runAction, confirmAction }) {
   };
 
   const setNumber = (key, value) => {
-    setSettings((current) => ({ ...current, [key]: Number(value) }));
+    // Arco InputNumber reports a cleared field as undefined/null; keep the old
+    // native behaviour where an empty field meant 0 instead of storing NaN.
+    setSettings((current) => ({ ...current, [key]: Number(value ?? 0) }));
   };
 
   const healthTone = (status) => (status === "error" ? "danger" : status === "warning" ? "high" : "success");
@@ -7852,21 +7750,23 @@ function SettingsModal({ onClose, runAction, confirmAction }) {
             <div className="two-col">
               <label>
                 <span>意图超时（秒）</span>
-                <input
-                  type="number"
-                  min="5"
+                <InputNumber
+                  min={5}
+                  precision={0}
+                  style={{ width: "100%" }}
                   value={settings.intent_timeout}
-                  onChange={(event) => setNumber("intent_timeout", event.target.value)}
+                  onChange={(value) => setNumber("intent_timeout", value)}
                 />
                 <small className="field-hint">意图在被回收前允许等待的最长时间。</small>
               </label>
               <label>
                 <span>Reason 超时（秒）</span>
-                <input
-                  type="number"
-                  min="5"
+                <InputNumber
+                  min={5}
+                  precision={0}
+                  style={{ width: "100%" }}
                   value={settings.reason_timeout}
-                  onChange={(event) => setNumber("reason_timeout", event.target.value)}
+                  onChange={(value) => setNumber("reason_timeout", value)}
                 />
                 <small className="field-hint">Reason 阶段在判定超时前的最长执行时间。</small>
               </label>
@@ -7874,21 +7774,23 @@ function SettingsModal({ onClose, runAction, confirmAction }) {
             <div className="two-col">
               <label>
                 <span>Worker 不健康冷却（秒）</span>
-                <input
-                  type="number"
-                  min="1"
+                <InputNumber
+                  min={1}
+                  precision={0}
+                  style={{ width: "100%" }}
                   value={settings.worker_unhealthy_retry_after_seconds}
-                  onChange={(event) => setNumber("worker_unhealthy_retry_after_seconds", event.target.value)}
+                  onChange={(value) => setNumber("worker_unhealthy_retry_after_seconds", value)}
                 />
                 <small className="field-hint">Worker 健康检查失败后，重新参与调度前的冷却时间。</small>
               </label>
               <label>
                 <span>拒绝任务重试间隔（秒）</span>
-                <input
-                  type="number"
-                  min="1"
+                <InputNumber
+                  min={1}
+                  precision={0}
+                  style={{ width: "100%" }}
                   value={settings.worker_rejected_retry_after_seconds}
-                  onChange={(event) => setNumber("worker_rejected_retry_after_seconds", event.target.value)}
+                  onChange={(value) => setNumber("worker_rejected_retry_after_seconds", value)}
                 />
                 <small className="field-hint">同一 Worker 暂时拒绝任务后，再次尝试分配的等待时间。</small>
               </label>
@@ -7901,10 +7803,9 @@ function SettingsModal({ onClose, runAction, confirmAction }) {
                 <h3>备份与恢复</h3>
                 <p>创建 SQLite 一致性备份并校验 SHA-256；恢复前会自动保留当前数据库。</p>
               </div>
-              <button className="primary-outline compact" type="button" onClick={createBackup} disabled={Boolean(backupBusy)}>
-                {backupBusy === "create" ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
+              <Button type="outline" size="small" loading={backupBusy === "create"} disabled={Boolean(backupBusy)} icon={<Save size={16} />} onClick={createBackup}>
                 创建备份
-              </button>
+              </Button>
             </div>
             {backups.length === 0 ? (
               <div className="soft-box">尚无数据库备份。建议在导入大型项目和系统升级前创建备份。</div>
@@ -7921,20 +7822,21 @@ function SettingsModal({ onClose, runAction, confirmAction }) {
                       {backup.integrity_status === "ok" ? "校验通过" : "校验失败"}
                     </Badge>
                     <div className="button-row">
-                      <button className="ghost-button compact" type="button" onClick={() => verifyBackup(backup)} disabled={Boolean(backupBusy)}>
-                        {backupBusy === backup.id ? <Loader2 className="spin" size={15} /> : <ShieldCheck size={15} />}
+                      <Button size="small" type="outline" loading={backupBusy === backup.id} disabled={Boolean(backupBusy)} icon={<ShieldCheck size={15} />} onClick={() => verifyBackup(backup)}>
                         校验
-                      </button>
-                      <button
-                        className="ghost-button compact danger"
-                        type="button"
-                        onClick={() => restoreBackup(backup)}
+                      </Button>
+                      <Button
+                        size="small"
+                        type="outline"
+                        status="danger"
+                        loading={backupBusy === `restore:${backup.id}`}
                         disabled={Boolean(backupBusy) || Number(health?.summary?.active_projects || 0) > 0 || backup.integrity_status !== "ok"}
                         title={Number(health?.summary?.active_projects || 0) > 0 ? "请先停止所有活动项目" : "恢复此备份"}
+                        icon={<History size={15} />}
+                        onClick={() => restoreBackup(backup)}
                       >
-                        {backupBusy === `restore:${backup.id}` ? <Loader2 className="spin" size={15} /> : <History size={15} />}
                         恢复
-                      </button>
+                      </Button>
                     </div>
                   </article>
                 ))}
@@ -7953,31 +7855,34 @@ function SettingsModal({ onClose, runAction, confirmAction }) {
             <div className="three-col">
               <label>
                 <span>失败锁定阈值</span>
-                <input
-                  type="number"
-                  min="1"
+                <InputNumber
+                  min={1}
+                  precision={0}
+                  style={{ width: "100%" }}
                   value={settings.max_failed_login_attempts}
-                  onChange={(event) => setNumber("max_failed_login_attempts", event.target.value)}
+                  onChange={(value) => setNumber("max_failed_login_attempts", value)}
                 />
                 <small className="field-hint">同一账号在窗口期内允许的最大失败次数。</small>
               </label>
               <label>
                 <span>限流窗口（分钟）</span>
-                <input
-                  type="number"
-                  min="1"
+                <InputNumber
+                  min={1}
+                  precision={0}
+                  style={{ width: "100%" }}
                   value={settings.rate_limit_window_minutes}
-                  onChange={(event) => setNumber("rate_limit_window_minutes", event.target.value)}
+                  onChange={(value) => setNumber("rate_limit_window_minutes", value)}
                 />
                 <small className="field-hint">超过失败阈值后，窗口期内继续登录会被直接拦截。</small>
               </label>
               <label>
                 <span>Session 时长（小时）</span>
-                <input
-                  type="number"
-                  min="1"
+                <InputNumber
+                  min={1}
+                  precision={0}
+                  style={{ width: "100%" }}
                   value={settings.session_duration_hours}
-                  onChange={(event) => setNumber("session_duration_hours", event.target.value)}
+                  onChange={(value) => setNumber("session_duration_hours", value)}
                 />
                 <small className="field-hint">有效会话的滑动过期时间。</small>
               </label>
@@ -7995,31 +7900,34 @@ function SettingsModal({ onClose, runAction, confirmAction }) {
             <div className="three-col">
               <label>
                 <span>日志保留（天）</span>
-                <input
-                  type="number"
-                  min="1"
+                <InputNumber
+                  min={1}
+                  precision={0}
+                  style={{ width: "100%" }}
                   value={settings.log_retention_days}
-                  onChange={(event) => setNumber("log_retention_days", event.target.value)}
+                  onChange={(value) => setNumber("log_retention_days", value)}
                 />
                 <small className="field-hint">用于审计日志、Worker 历史和登录尝试记录。</small>
               </label>
               <label>
                 <span>导出记录保留（天）</span>
-                <input
-                  type="number"
-                  min="1"
+                <InputNumber
+                  min={1}
+                  precision={0}
+                  style={{ width: "100%" }}
                   value={settings.export_retention_days}
-                  onChange={(event) => setNumber("export_retention_days", event.target.value)}
+                  onChange={(value) => setNumber("export_retention_days", value)}
                 />
                 <small className="field-hint">只清理导出历史记录，不影响实时导出功能。</small>
               </label>
               <label>
                 <span>通知保留（天）</span>
-                <input
-                  type="number"
-                  min="1"
+                <InputNumber
+                  min={1}
+                  precision={0}
+                  style={{ width: "100%" }}
                   value={settings.notification_retention_days}
-                  onChange={(event) => setNumber("notification_retention_days", event.target.value)}
+                  onChange={(value) => setNumber("notification_retention_days", value)}
                 />
                 <small className="field-hint">仅清理已读通知，未读通知会保留。</small>
               </label>
@@ -8027,11 +7935,12 @@ function SettingsModal({ onClose, runAction, confirmAction }) {
             <div className="two-col">
               <label>
                 <span>项目无进展告警（小时）</span>
-                <input
-                  type="number"
-                  min="1"
+                <InputNumber
+                  min={1}
+                  precision={0}
+                  style={{ width: "100%" }}
                   value={settings.project_idle_alert_hours}
-                  onChange={(event) => setNumber("project_idle_alert_hours", event.target.value)}
+                  onChange={(value) => setNumber("project_idle_alert_hours", value)}
                 />
                 <small className="field-hint">活动项目最近无新增提示、意图或 Reason 心跳时触发告警。</small>
               </label>
@@ -8040,10 +7949,9 @@ function SettingsModal({ onClose, runAction, confirmAction }) {
                   <strong>立即清理历史数据</strong>
                   <p>按当前保留策略删除过期日志、已读通知、导出记录和失效会话。</p>
                 </div>
-                <button className="ghost-button compact" type="button" onClick={runCleanup} disabled={cleaning}>
-                  {cleaning ? <Loader2 className="spin" size={16} /> : <Trash2 size={16} />}
+                <Button size="small" type="outline" loading={cleaning} icon={<Trash2 size={16} />} onClick={runCleanup}>
                   立即清理
-                </button>
+                </Button>
               </div>
             </div>
           </section>
@@ -8054,10 +7962,9 @@ function SettingsModal({ onClose, runAction, confirmAction }) {
                 <h3>系统健康</h3>
                 <p>查看当前 API、数据库、调度器和 Worker 的整体状态。</p>
               </div>
-              <button className="ghost-button compact" type="button" onClick={loadHealth} disabled={healthLoading}>
-                {healthLoading ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}
+              <Button size="small" type="outline" loading={healthLoading} icon={<RefreshCw size={16} />} onClick={loadHealth}>
                 刷新状态
-              </button>
+              </Button>
             </div>
 
             {health ? (
@@ -8126,13 +8033,12 @@ function SettingsModal({ onClose, runAction, confirmAction }) {
           </section>
 
           <div className="modal-footer">
-            <button className="ghost-button" type="button" onClick={onClose}>
+            <Button onClick={onClose}>
               关闭
-            </button>
-            <button className="primary-button compact" type="submit" disabled={saving}>
-              {saving ? <Loader2 className="spin" size={18} /> : <Save size={18} />}
+            </Button>
+            <Button type="primary" htmlType="submit" loading={saving} icon={<Save size={16} />}>
               保存
-            </button>
+            </Button>
           </div>
         </form>
       )}

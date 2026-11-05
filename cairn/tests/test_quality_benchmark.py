@@ -109,3 +109,70 @@ def test_quality_benchmark_calculates_and_persists_metrics(temp_db):
     assert len(history) == 1
     assert history[0]["id"] == result["id"]
 
+
+def test_quality_benchmark_defaults_to_latest_ready_snapshot(temp_db):
+    with db.get_conn() as conn:
+        conn.execute(
+            "INSERT INTO projects (id, title, status, created_at) VALUES ('proj-latest', 'Latest', 'stopped', '2026-01-01T00:00:00Z')"
+        )
+        conn.executemany(
+            """
+            INSERT INTO source_snapshots (
+                id, project_id, source_type, original_name, status,
+                snapshot_sha256, created_at
+            ) VALUES (?, 'proj-latest', 'zip', ?, 'ready', ?, ?)
+            """,
+            [
+                ("snap-old", "old.zip", "a" * 64, "2026-01-01T00:00:01Z"),
+                ("snap-new", "new.zip", "b" * 64, "2026-01-02T00:00:01Z"),
+            ],
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_findings (
+                id, project_id, snapshot_id, title, category, severity, status,
+                evidence_level, file_path, entry_point, description,
+                discovered_by, created_at
+            ) VALUES (
+                'finding-old', 'proj-latest', 'snap-old', '旧版本 SQL 注入',
+                'sql_injection', 'high', 'confirmed', 'L3', 'old.py',
+                'GET /old', '仅存在于旧快照', 'worker-a', '2026-01-01T00:00:02Z'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_findings (
+                id, project_id, snapshot_id, title, category, severity, status,
+                evidence_level, file_path, entry_point, description,
+                discovered_by, created_at
+            ) VALUES (
+                'finding-new', 'proj-latest', 'snap-new', '新版本命令注入',
+                'command_injection', 'high', 'confirmed', 'L3', 'new.py',
+                'POST /new', '仅存在于新快照', 'worker-b', '2026-01-02T00:00:02Z'
+            )
+            """
+        )
+
+    app = FastAPI()
+    app.include_router(quality.router)
+    result = TestClient(app).post(
+        "/api/projects/proj-latest/quality/benchmarks",
+        json={
+            "suite_name": "latest-only",
+            "expectations": [
+                {
+                    "id": "gt-new",
+                    "title": "新版本命令注入",
+                    "category": "command_injection",
+                    "file_path": "new.py",
+                    "entry_point": "POST /new",
+                }
+            ],
+        },
+    ).json()
+
+    assert result["snapshot_id"] == "snap-new"
+    assert result["true_positive"] == 1
+    assert result["false_positive"] == 0
+    assert result["unexpected_finding_ids"] == []

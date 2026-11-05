@@ -1,13 +1,15 @@
 server: http://rabbit-audit-server:8000
 runtime:
-  max_workers: 5
+  max_workers: 10
   max_running_projects: 3
   max_project_workers: 4
   interval: 3
   healthcheck_timeout: 45
-  # All five Pi roles use the same LuminAI endpoint/model.  Keep their combined
-  # in-flight calls within the three requests that the endpoint handles reliably.
   shared_model_max_running: 3
+  # When true, a finding may not be reviewed by any worker backed by the SAME
+  # model as the discoverer. The active workers below are all GLM-5.3, so
+  # turning this on would block review until a different review model is added.
+  require_distinct_review_model: false
   prompt_group: default
 tasks:
   bootstrap:
@@ -31,7 +33,10 @@ tasks:
     max_running: 1
 container:
   image: rabbit-code-audit-worker:audit
-  network_mode: rabbit-audit-worker-net
+  # Workers call the GLM Anthropic endpoint (open.bigmodel.cn) directly, so they
+  # need outbound internet. rabbit-audit-worker-net is internal (no internet);
+  # use the default project network instead.
+  network_mode: rabbit-audit-net
   completed_action: stop
   name_prefix: rabbit-audit-dispatch-
   startup_name_prefix: rabbit-audit-startup-healthcheck-
@@ -40,13 +45,12 @@ container:
   artifact_host_path: null
   artifact_mount_path: /audit-data
 common_env:
-  PI_MODEL: gpt-5.6-sol
-  PI_BASE_URL: https://vip.luminai.cc/v1
-  PI_API_KEY: ${LUMINAI_API_KEY}
-  PI_PROVIDER_API: openai-completions
+  ANTHROPIC_BASE_URL: https://open.bigmodel.cn/api/anthropic
+  ANTHROPIC_MODEL: glm-5.3
+  ANTHROPIC_AUTH_TOKEN: ${GLM_API_KEY}
 workers:
-- name: gpt-5-6-sol-audit-1
-  type: pi
+- name: glm-audit-1
+  type: claudecode
   enabled: true
   task_types:
   - bootstrap
@@ -54,8 +58,8 @@ workers:
   - explore
   max_running: 1
   priority: 0
-- name: gpt-5-6-sol-audit-2
-  type: pi
+- name: glm-audit-2
+  type: claudecode
   enabled: true
   task_types:
   - bootstrap
@@ -63,8 +67,8 @@ workers:
   - explore
   max_running: 1
   priority: 0
-- name: gpt-5-6-sol-audit-3
-  type: pi
+- name: glm-audit-3
+  type: claudecode
   enabled: true
   task_types:
   - bootstrap
@@ -72,15 +76,18 @@ workers:
   - explore
   max_running: 1
   priority: 0
-- name: gpt-5-6-sol-report-1
-  type: pi
+- name: glm-report-1
+  type: claudecode
   enabled: true
   task_types:
   - report_enrichment
   max_running: 1
   priority: 0
-- name: gpt-5-6-sol-retest-1
-  type: pi
+# Reviewer shares the same GLM-5.3 model (independent by worker name only).
+# For stronger review, point this at a different model and set
+# runtime.require_distinct_review_model: true.
+- name: glm-review-1
+  type: claudecode
   enabled: true
   task_types:
   - review

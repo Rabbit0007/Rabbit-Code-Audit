@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -101,6 +102,23 @@ def _ready_snapshot(project_id: str, snapshot_id: str | None):
     return get_snapshot(project_id, row["id"])
 
 
+# These scanners read a configuration file that lives inside the code being
+# audited and execute it: ESLint loads ``eslint.config.js``, Psalm loads plugins
+# named in ``psalm.xml``, and PHPStan includes ``phpstan.neon`` and the project's
+# autoloader.  Source snapshots are untrusted, so running them inside the server
+# process would let an audited repository run code on the server host.  They
+# stay available to agents inside the isolated worker containers; this guard
+# only affects the in-process runner.
+PROJECT_CONFIG_EXECUTING_TOOLS = frozenset({"eslint-security", "psalm", "phpstan"})
+ALLOW_PROJECT_CONFIG_TOOLS_ENV = "CAIRN_ALLOW_PROJECT_CONFIG_TOOLS"
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _project_config_tools_allowed() -> bool:
+    value = os.environ.get(ALLOW_PROJECT_CONFIG_TOOLS_ENV)
+    return value is not None and value.strip().lower() in _TRUTHY
+
+
 def _run_one_tool(
     project_id: str,
     snapshot_id: str,
@@ -110,6 +128,16 @@ def _run_one_tool(
     timeout_per_tool: int,
 ) -> ToolRunSummary:
     executable = plan.command[0]
+    if plan.name in PROJECT_CONFIG_EXECUTING_TOOLS and not _project_config_tools_allowed():
+        return ToolRunSummary(
+            plan.name,
+            "skipped",
+            detail=(
+                f"{plan.name} executes configuration from the audited repository and is not run "
+                f"in the server process; run it in a worker container, or set "
+                f"{ALLOW_PROJECT_CONFIG_TOOLS_ENV}=1 for repositories you trust"
+            ),
+        )
     if shutil.which(executable) is None:
         return ToolRunSummary(plan.name, "skipped", detail=f"{executable} is not installed")
     started = time.strftime("%Y%m%d%H%M%S")

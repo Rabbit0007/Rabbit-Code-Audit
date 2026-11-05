@@ -465,6 +465,40 @@ def _validate_tool_findings(value: Any) -> list[dict[str, Any]]:
     return value
 
 
+# Oracles the server-side replay engine understands.  A finding may carry a
+# verification_plan naming one of these; anything else is dropped so a malformed
+# plan never fails the whole finding write.
+_VERIFICATION_ORACLES = frozenset(
+    {
+        "sql_error",
+        "boolean_diff",
+        "reflected_raw",
+        "computed_marker",
+        "file_signature",
+        "redirect_host",
+        "access_control",
+        "ssrf_callback",
+    }
+)
+
+
+def _sanitize_verification_plan(value: Any) -> dict[str, Any]:
+    """Keep a verification plan only when it is well-formed, else drop it.
+
+    The plan is an optional upgrade path (server-side replay); a bad one must
+    never cost the finding.  Results are never accepted from the model, so only
+    the shape is checked here.
+    """
+    if not isinstance(value, dict) or not value:
+        return {}
+    if value.get("oracle") not in _VERIFICATION_ORACLES:
+        return {}
+    requests = value.get("requests")
+    if not isinstance(requests, dict) or not requests:
+        return {}
+    return value
+
+
 def _validate_one_finding(item: Any, index: int | None = None) -> dict[str, Any]:
     label = "finding" if index is None else f"finding at index {index}"
     if not isinstance(item, dict):
@@ -476,7 +510,12 @@ def _validate_one_finding(item: Any, index: int | None = None) -> dict[str, Any]
         raise ValueError(f"{label} severity is invalid")
     proof_packets = _validate_proof_packets(item.get("proof_packets"), label)
     reproduction_poc = _validate_reproduction_poc(item.get("reproduction_poc"), label)
-    item = {**item, "proof_packets": proof_packets, "reproduction_poc": reproduction_poc}
+    item = {
+        **item,
+        "proof_packets": proof_packets,
+        "reproduction_poc": reproduction_poc,
+        "verification_plan": _sanitize_verification_plan(item.get("verification_plan")),
+    }
     if item["severity"] in ("critical", "high"):
         if not isinstance(item.get("file_path"), str) or not item["file_path"].strip():
             raise ValueError(f"high or critical {label} requires file_path")

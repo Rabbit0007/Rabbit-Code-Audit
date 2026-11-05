@@ -48,6 +48,14 @@ If existing open intents already cover the valuable directions:
 - Propose at most {max_intents} intents.
 - All user-facing JSON string fields must be written in Simplified Chinese.
 
+# Web Audit Priorities
+When the project is a web application, prioritize intents in this order and keep each intent scoped to one reviewable unit:
+- Unauthenticated and privilege-crossing entry points first, then authenticated state-changing operations, then read-only paths.
+- Dangerous sinks reachable from user input that have no conclusion yet: SQL/NoSQL, command/code/template execution, file read/write/upload and inclusion, server-side HTTP clients (SSRF), XML parsing (XXE), native deserialization, and object access by id (IDOR / authorization).
+- After one confirmed finding, schedule a variant-analysis intent that sweeps the same sink family across sibling routes and modules before moving to an unrelated category.
+- Batch candidates by shared entry-point family, shared sink family, or shared missing control so one explore task can read the relevant source and close the whole batch.
+Do not complete the project while any unauthenticated or privilege-crossing web entry point, or any dangerous sink reachable from user input, still lacks an evidence-backed conclusion.
+
 # Context
 ## Graph
 ```

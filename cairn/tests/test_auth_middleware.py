@@ -281,10 +281,15 @@ def test_healthy_session_validation_does_not_write_or_refresh_cookie(
 
     response = app_client.get(PROTECTED_PATH)
     assert response.status_code == 200
-    assert _session_cookie_header(response) is None
+    # Cookie Max-Age is always refreshed on a valid session so the browser
+    # does not drop the cookie while the server-side session is alive.
+    set_cookie = _session_cookie_header(response)
+    assert set_cookie is not None
+    assert "Max-Age=86400" in set_cookie
 
     with db.get_conn() as conn:
         expires_after = conn.execute(
             "SELECT expires_at FROM sessions WHERE token = ?", (token,)
         ).fetchone()["expires_at"]
+    # DB expiry is unchanged when session is still in the healthy range.
     assert expires_after == expires_before

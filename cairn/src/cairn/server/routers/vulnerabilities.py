@@ -1690,9 +1690,11 @@ def _source_inventory(vulnerabilities: list[Vulnerability]) -> list[dict[str, ob
             FROM source_snapshots s
             JOIN projects p ON p.id = s.project_id
             WHERE s.project_id IN ({placeholders}) AND s.status = 'ready'
-              AND s.created_at = (
-                  SELECT MAX(s2.created_at) FROM source_snapshots s2
+              AND s.id = (
+                  SELECT s2.id FROM source_snapshots s2
                   WHERE s2.project_id = s.project_id AND s2.status = 'ready'
+                  ORDER BY s2.created_at DESC, s2.id DESC
+                  LIMIT 1
               )
             ORDER BY s.project_id
             """,
@@ -1780,13 +1782,19 @@ def _load_delivery_coverage(
         open_candidates = conn.execute(
             f"""
             SELECT COUNT(*) AS count
-            FROM audit_candidates
-            WHERE project_id IN ({placeholders})
-              AND severity IN ('critical', 'high', 'unknown')
-              AND status IN ('candidate', 'investigating', 'needs_more_evidence')
+            FROM audit_candidates ac
+            WHERE ac.project_id IN ({placeholders})
+              AND ac.snapshot_id = (
+                  SELECT s.id FROM source_snapshots s
+                  WHERE s.project_id = ac.project_id AND s.status = 'ready'
+                  ORDER BY s.created_at DESC, s.id DESC
+                  LIMIT 1
+              )
+              AND ac.severity IN ('critical', 'high', 'unknown')
+              AND ac.status IN ('candidate', 'investigating', 'needs_more_evidence')
               AND NOT (
-                  source = 'index'
-                  AND candidate_type IN ('entrypoint', 'web_entrypoint')
+                  ac.source = 'index'
+                  AND ac.candidate_type IN ('entrypoint', 'web_entrypoint')
               )
             """,
             project_ids,
@@ -1794,29 +1802,52 @@ def _load_delivery_coverage(
         open_nodes = conn.execute(
             f"""
             SELECT COUNT(*) AS count
-            FROM business_nodes
-            WHERE project_id IN ({placeholders})
-              AND graph_layer != 'evidence'
-              AND risk_level IN ('critical', 'high', 'unknown')
-              AND review_status != 'covered'
+            FROM business_nodes bn
+            WHERE bn.project_id IN ({placeholders})
+              AND (
+                  bn.source_snapshot_id IS NULL
+                  OR bn.source_snapshot_id = (
+                      SELECT s.id FROM source_snapshots s
+                      WHERE s.project_id = bn.project_id AND s.status = 'ready'
+                      ORDER BY s.created_at DESC, s.id DESC
+                      LIMIT 1
+                  )
+              )
+              AND bn.graph_layer != 'evidence'
+              AND bn.risk_level IN ('critical', 'high', 'unknown')
+              AND bn.review_status != 'covered'
             """,
             project_ids,
         ).fetchone()["count"]
         pending_findings = conn.execute(
             f"""
             SELECT COUNT(*) AS count
-            FROM audit_findings
-            WHERE project_id IN ({placeholders})
-              AND status = 'pending_review'
+            FROM audit_findings af
+            WHERE af.project_id IN ({placeholders})
+              AND af.snapshot_id = (
+                  SELECT s.id FROM source_snapshots s
+                  WHERE s.project_id = af.project_id AND s.status = 'ready'
+                  ORDER BY s.created_at DESC, s.id DESC
+                  LIMIT 1
+              )
+              AND af.status = 'pending_review'
             """,
             project_ids,
         ).fetchone()["count"]
         pending_reports = conn.execute(
             f"""
             SELECT COUNT(*) AS count
-            FROM report_enrichment_tasks
-            WHERE project_id IN ({placeholders})
-              AND status IN ('pending', 'running')
+            FROM report_enrichment_tasks rt
+            JOIN audit_findings af
+              ON af.id = rt.finding_id AND af.project_id = rt.project_id
+            WHERE rt.project_id IN ({placeholders})
+              AND af.snapshot_id = (
+                  SELECT s.id FROM source_snapshots s
+                  WHERE s.project_id = rt.project_id AND s.status = 'ready'
+                  ORDER BY s.created_at DESC, s.id DESC
+                  LIMIT 1
+              )
+              AND rt.status IN ('pending', 'running')
             """,
             project_ids,
         ).fetchone()["count"]

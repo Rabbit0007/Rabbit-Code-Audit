@@ -1,2 +1,0 @@
-IMPORT_OK
-['/api/templates', '/api/templates', '/api/templates/{template_id}']

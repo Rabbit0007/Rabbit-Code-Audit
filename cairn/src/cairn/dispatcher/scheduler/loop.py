@@ -15,7 +15,7 @@ from typing import Any
 
 import requests
 
-from cairn.dispatcher.config import DispatchConfig, WorkerConfig, shared_model_key
+from cairn.dispatcher.config import DispatchConfig, WorkerConfig, shared_model_key, workers_sharing_model
 from cairn.dispatcher.contracts import MAX_REASON_INTENT_SOURCE_FILES, REASON_SOURCE_FILE_RE
 from cairn.dispatcher.models import ReasonCheckpoint, RunningTask, TaskOutcome
 from cairn.dispatcher.protocol.client import CairnClient
@@ -1200,6 +1200,7 @@ class DispatcherLoop:
         } if isinstance(raw_excluded_workers, list) else set()
         if discovered_by:
             excluded_workers.add(discovered_by)
+        excluded_workers = self._expand_excluded_review_models(excluded_workers)
         selection = self._select_worker(project.project.id, "review", excluded_workers=excluded_workers)
         worker = selection.worker
         if worker is None:
@@ -1556,6 +1557,23 @@ class DispatcherLoop:
             if task.project_id == project_id and task.task_type == "review" and task.intent_id is not None
         }
 
+    def _expand_excluded_review_models(self, names: set[str]) -> set[str]:
+        """Grow an exclusion set to every worker sharing a model with it.
+
+        A no-op unless ``runtime.require_distinct_review_model`` is set, so the
+        single-model configurations that ship today keep working until the
+        operator configures a separate review model.
+        """
+        with self._config_lock:
+            workers = list(self.config.workers)
+            runtime = getattr(self.config, "runtime", None)
+        if not getattr(runtime, "require_distinct_review_model", False):
+            return set(names)
+        expanded = set(names)
+        for name in names:
+            expanded |= workers_sharing_model(workers, name)
+        return expanded
+
     def _has_configured_independent_review_worker(self, excluded_workers: set[str]) -> bool:
         with self._config_lock:
             workers = list(self.config.workers)
@@ -1606,6 +1624,7 @@ class DispatcherLoop:
             and isinstance(finding.get("discovered_by"), str)
             and str(finding.get("discovered_by")).strip()
         }
+        excluded = self._expand_excluded_review_models(excluded)
         if excluded:
             LOG.debug(
                 "excluding finding discoverers for confirmation project=%s intent=%s findings=%s excluded_workers=%s",

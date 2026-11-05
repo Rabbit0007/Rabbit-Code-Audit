@@ -630,11 +630,40 @@ def _finding_packet(row) -> dict[str, object]:
         "description": row["description"],
         "impact": row["impact"],
         "evidence": row["evidence"],
+        "evidence_level": row["evidence_level"],
         "proof_packets": _decode_json_list(row["proof_packets_json"]),
         "reproduction_poc": _decode_json_dict(row["reproduction_poc_json"]),
+        "verification_plan": _decode_json_dict(row["verification_plan_json"]),
+        "replay_verdict": row["replay_verdict"],
+        "replay_summary": _replay_summary(row["replay_result_json"]),
         "remediation": row["remediation"],
         "discovered_by": row["discovered_by"],
         "reviewed_by": row["reviewed_by"],
+    }
+
+
+def _replay_summary(raw: str | None) -> dict:
+    """Compact, bounded view of a server replay result for the reviewer.
+
+    Carries the program's verdict, oracle, reason and per-check results — not
+    the full response bodies — so the reviewer can weigh machine-verified
+    evidence without re-reading everything.
+    """
+    data = _decode_json_dict(raw)
+    if not data:
+        return {}
+    checks = data.get("checks")
+    compact_checks: list[dict] = []
+    if isinstance(checks, list):
+        for check in checks[:12]:
+            if isinstance(check, dict):
+                compact_checks.append({"name": check.get("name"), "passed": bool(check.get("passed"))})
+    return {
+        "verdict": data.get("verdict"),
+        "oracle": data.get("oracle"),
+        "reason": data.get("reason"),
+        "ran_at": data.get("ran_at"),
+        "checks": compact_checks,
     }
 
 

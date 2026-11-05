@@ -25,13 +25,30 @@ USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 USERNAME_MIN_LENGTH = 3
 USERNAME_MAX_LENGTH = 32
 
-# Registration password: 8-72 characters (72 is the bcrypt input byte limit).
+# bcrypt only accepts up to 72 *bytes* of input.  bcrypt >= 5.0 raises
+# ``ValueError`` for longer input instead of silently truncating it, and a
+# character count is not a byte count for non-ASCII passwords (a Chinese
+# character is 3 bytes in UTF-8).  Every length check below therefore also
+# enforces the byte limit, so over-long passwords fail validation with a 422
+# rather than crashing the handler with a 500.
+BCRYPT_MAX_PASSWORD_BYTES = 72
+
+# Registration password: 8-72 characters (and at most 72 UTF-8 bytes).
 REGISTER_PASSWORD_MIN_LENGTH = 8
 REGISTER_PASSWORD_MAX_LENGTH = 72
 
-# Password-change policy: 8-128 characters with complexity requirements.
+# Password-change policy: 8-128 characters with complexity requirements, and at
+# most 72 UTF-8 bytes because that is all bcrypt can hash.
 NEW_PASSWORD_MIN_LENGTH = 8
 NEW_PASSWORD_MAX_LENGTH = 128
+
+
+def _check_bcrypt_byte_limit(value: str, field_name: str) -> None:
+    if len(value.encode("utf-8")) > BCRYPT_MAX_PASSWORD_BYTES:
+        raise ValueError(
+            f"{field_name} must be at most {BCRYPT_MAX_PASSWORD_BYTES} bytes "
+            "when encoded as UTF-8 (non-ASCII characters use more than one byte)"
+        )
 
 # Special character = anything that is not a letter or a digit.
 _SPECIAL_CHARACTER_PATTERN = re.compile(r"[^A-Za-z0-9]")
@@ -65,6 +82,7 @@ def _validate_register_password(value: str) -> str:
             f"password must be between {REGISTER_PASSWORD_MIN_LENGTH} and "
             f"{REGISTER_PASSWORD_MAX_LENGTH} characters"
         )
+    _check_bcrypt_byte_limit(value, "password")
     return value
 
 
@@ -80,6 +98,7 @@ def _validate_new_password(value: str) -> str:
             f"new_password must be between {NEW_PASSWORD_MIN_LENGTH} and "
             f"{NEW_PASSWORD_MAX_LENGTH} characters"
         )
+    _check_bcrypt_byte_limit(value, "new_password")
     if not re.search(r"[A-Z]", value):
         raise ValueError("new_password must contain at least one uppercase letter")
     if not re.search(r"[a-z]", value):

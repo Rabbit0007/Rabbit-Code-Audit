@@ -263,6 +263,13 @@ class RuntimeConfig(BaseModel):
     interval: int = Field(gt=0)
     healthcheck_timeout: int = Field(gt=0)
     shared_model_max_running: int | None = Field(default=None, gt=0)
+    # When true, independent review of a finding may not be performed by any
+    # worker backed by the same model as the discoverer, not merely a worker
+    # with a different name.  Reviewing a model's output with the same model
+    # gives correlated errors, so distinct-model review is the stronger control.
+    # Default false preserves the single-model setups that ship today; turn it
+    # on once a second review model is configured (see dispatch.yaml).
+    require_distinct_review_model: bool = False
     prompt_group: str = Field(min_length=1)
 
 
@@ -300,6 +307,35 @@ class WorkerConfig(BaseModel):
         if self.type == "mock":
             resolve_mock_behavior(self.name, self.env)
         return self
+
+
+def model_identity(worker: WorkerConfig) -> tuple:
+    """Return a value identifying the *model* a worker is backed by.
+
+    Two workers with the same identity are the same underlying model even when
+    they have different role names, so one cannot independently review the
+    other.  Credentials are excluded so the identity never carries a secret.
+    Mock workers are keyed by name so they always count as independent (tests
+    and local scaffolding rely on that).
+    """
+    env = getattr(worker, "env", {}) or {}
+    worker_type = getattr(worker, "type", None)
+    if worker_type == "pi":
+        return ("pi", env.get("PI_BASE_URL", "").rstrip("/"), env.get("PI_PROVIDER_API", ""), env.get("PI_MODEL", ""))
+    if worker_type == "claudecode":
+        return ("claudecode", env.get("ANTHROPIC_BASE_URL", "").rstrip("/"), env.get("ANTHROPIC_MODEL", ""))
+    if worker_type == "codex":
+        return ("codex", env.get("CODEX_BASE_URL", "").rstrip("/"), env.get("CODEX_MODEL", ""))
+    return (str(worker_type), getattr(worker, "name", ""))
+
+
+def workers_sharing_model(workers: list[WorkerConfig], name: str) -> set[str]:
+    """Names of every worker backed by the same model as ``name`` (including it)."""
+    target = next((worker for worker in workers if worker.name == name), None)
+    if target is None:
+        return {name} if name else set()
+    identity = model_identity(target)
+    return {worker.name for worker in workers if model_identity(worker) == identity}
 
 
 def shared_model_key(worker: WorkerConfig) -> tuple[str, str, str, str] | None:

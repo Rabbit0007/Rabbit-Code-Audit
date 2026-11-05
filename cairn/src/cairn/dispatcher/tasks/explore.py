@@ -657,6 +657,7 @@ def _write_explore_result(
         except Exception:
             LOG.warning("failed to load audit candidate business links project=%s worker=%s", project_id, worker_name)
 
+    replay_targets: list[str] = []
     for finding in findings:
         candidate_id = _resolve_candidate_ref(finding, candidate_ref_to_id)
         finding = _strip_internal_refs(_resolve_business_node_ref(finding, ref_to_id))
@@ -706,6 +707,16 @@ def _write_explore_result(
                 evidence=finding.get("evidence"),
                 audit_finding_id=finding_id,
             )
+        if (
+            finding_id
+            and finding.get("severity") in ("high", "critical")
+            and isinstance(finding.get("verification_plan"), dict)
+            and finding.get("verification_plan")
+        ):
+            replay_targets.append(finding_id)
+
+    if replay_targets:
+        _trigger_replay_verifications(client, project_id, worker_name, replay_targets)
 
     for review in reviews:
         response = client.review_audit_finding(
@@ -780,6 +791,50 @@ def _write_explore_result(
             used_fallback=used_fallback,
         )
     return task_outcome(status, used_fallback=used_fallback)
+
+
+def _trigger_replay_verifications(
+    client: CairnClient,
+    project_id: str,
+    worker_name: str,
+    finding_ids: list[str],
+) -> None:
+    """Ask the server to replay each eligible finding's verification plan.
+
+    Best-effort and strictly non-fatal: replay is extra evidence, so nothing
+    here may fail the explore task.  A 409 means the project has no validation
+    target configured, in which case there is no point trying the rest.
+    """
+    for finding_id in finding_ids:
+        try:
+            response = client.replay_finding(project_id, finding_id)
+        except Exception:
+            LOG.warning(
+                "replay trigger crashed project=%s finding=%s worker=%s",
+                project_id,
+                finding_id,
+                worker_name,
+                exc_info=True,
+            )
+            return
+        if response.status_code == 409:
+            LOG.info("replay skipped, no validation target project=%s", project_id)
+            return
+        if not response.ok:
+            LOG.info(
+                "replay trigger returned non-ok project=%s finding=%s status=%s",
+                project_id,
+                finding_id,
+                response.status_code,
+            )
+            continue
+        verdict = response.data.get("verdict") if isinstance(response.data, dict) else None
+        LOG.info(
+            "replay verdict project=%s finding=%s verdict=%s",
+            project_id,
+            finding_id,
+            verdict,
+        )
 
 
 def _sanitize_conclude_fallback_result(result_data: dict, worker_name: str) -> dict:

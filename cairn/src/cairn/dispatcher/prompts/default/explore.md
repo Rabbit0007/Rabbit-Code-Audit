@@ -103,6 +103,55 @@ If a candidate is proven vulnerable, prefer adding a `findings` item with that
 - Return only the latest incremental findings and avoid repeating facts already present in the graph.
 - All user-facing JSON string fields must be written in Simplified Chinese. Keep exact paths, identifiers, commands, package names, CWE IDs, and technical terms unchanged.
 
+# Web Vulnerability Playbook
+Apply this when the Current Intent touches an HTTP entry point, a request handler, or a dangerous sink. It refines, never overrides, the Rules above (candidate vs. confirmed, mandatory proof material, Simplified-Chinese output).
+
+## Reason from source to sink
+A web vulnerability exists only when an untrusted source reaches a dangerous sink along a reachable path with no adequate control in between. For every candidate, make these three explicit in `evidence`:
+1. Source — the exact untrusted input and how the attacker controls it.
+2. Sink — the exact dangerous operation and its `file:line`.
+3. Path and controls — the call path from source to sink, and why the controls on that path (validation, encoding, parameterization, authorization) are missing or bypassable. If a control fully neutralizes the input, reject the candidate and record that control as the reason.
+
+Untrusted sources include: query string, route/path parameters, request body (form, JSON, XML, multipart), headers (including Host, Referer, X-Forwarded-*), cookies, uploaded file names and content, and any value re-read from the database, cache, or filesystem that originally came from a user (second-order / stored flows).
+
+## Per-category source→sink map
+Use this to locate sinks and judge whether a control is adequate. Confirm every claim by reading the source.
+- SQL / NoSQL injection: sink = query built by string concatenation or interpolation (raw SQL, `.raw`/`.extra`, `text()`, Mongo `$where` or a query object from user input). Safe = parameterized query / bound placeholders / validated enum. CWE-89 / CWE-943.
+- Command / code injection: sink = shell exec, `eval`, dynamic import, `ProcessBuilder`, compiling a template from a string. Safe = no shell, fixed binary with an argument vector, strict allow-list. CWE-78 / CWE-94.
+- SSTI / expression injection: sink = user input concatenated into a template or expression engine (Jinja2, Freemarker, Thymeleaf, Velocity, Twig, OGNL, SpEL, EL). Safe = render with a data context only, never compile user-supplied strings. CWE-1336 / CWE-917.
+- Path traversal / arbitrary file read-write: sink = file open/read/write/delete/include with a path derived from input. Safe = canonicalize, then confirm the resolved path stays under an allowed base; reject `..`, absolute paths, and symlinks. CWE-22 / CWE-98.
+- Unrestricted upload: sink = saving an uploaded file whose name, extension, or content type is attacker-controlled into a web-reachable or executable location. Safe = server-fixed name, allow-list by content inspection, non-executable storage. CWE-434.
+- SSRF: sink = server-side HTTP/URL client (fetch, requests, curl, HttpClient, URL.openConnection) whose destination derives from input. Safe = host/scheme allow-list, block private/link-local/metadata ranges after DNS resolution. CWE-918.
+- XXE / XML injection: sink = XML parser with DOCTYPE or external entities enabled on user XML. Safe = disable DOCTYPE and external entities. CWE-611 / CWE-91.
+- Deserialization: sink = native deserialization of user bytes (pickle, Java `readObject`, PHP `unserialize`, unsafe YAML). Safe = data-only formats, signed or allow-listed types. CWE-502.
+- Authorization / IDOR: sink = read/update/delete of an object selected by an id from input with no ownership/tenant/role check on that path. Safe = scoped query or explicit object-level permission check. CWE-639 / CWE-862 / CWE-863.
+- Missing authentication: a state-changing or sensitive route reachable with no authenticated session. CWE-306.
+- XSS: sink = user input rendered into HTML/JS/attribute/URL context without context-correct encoding, or a framework escape explicitly disabled (`raw`, `|safe`, `dangerouslySetInnerHTML`). CWE-79.
+- Open redirect / CRLF / host-header: sink = redirect target, response header, or absolute URL built from input. CWE-601 / CWE-93 / CWE-644.
+
+## Reachability and privilege
+Before confirming, establish how the entry point is reached (route, HTTP method) and the privilege required (unauthenticated, any user, specific role, admin). An unauthenticated or privilege-crossing path raises severity; an admin-only path usually lowers it. Record the auth context in `evidence` and link the finding to the relevant `business_node_id`.
+
+## Variant analysis
+A real bug is rarely unique. After confirming or rejecting one issue, sweep the repository for the same sink family (same dangerous call, same unsafe helper, same missing decorator or middleware) across sibling routes and modules, and emit one `audit_candidates` item per additional location worth checking. Prefer finishing one sink family completely over scattering across unrelated categories.
+
+## Server-side replay verification
+When a high or critical finding targets a reachable HTTP endpoint, you may attach a `verification_plan`. If the project has a lab target configured, the server itself will send the requests and a program (not a model) will judge the responses; a server-confirmed replay is the strongest evidence a finding can carry and raises it to evidence level L4. You still must provide a source-backed `reproduction_poc` or `proof_packets` as usual — the plan is an upgrade path, not a replacement, and a finding is never confirmed on a plan alone.
+
+A plan names one `oracle` and a set of `requests` built from relative paths on the target. The server injects random nonces you cannot predict — `__A__` and `__B__` (integers), `__M__` (a unique marker), and `__CALLBACK__` (a one-time URL) — and the oracle checks that the response reflects the correct function of them. Because the values are server-chosen, you cannot fake a pass: only a genuinely vulnerable target can produce them. Never invent replay results; only the server may produce them.
+
+Available oracles and the request names they need:
+- `sql_error`: `attack` (injects a quote) and `baseline`; confirmed when a database error appears only in the attack response.
+- `boolean_diff`: `baseline`, `true` (always-true condition), `false` (always-false); confirmed when true matches baseline and false differs.
+- `reflected_raw`: `attack`, `baseline` plus `reflected` set to the exact markup string containing `__M__`; confirmed when it returns unencoded.
+- `computed_marker`: `attack` whose payload uses `__A__` and `__B__` (e.g. a template or expression); confirmed when the response contains A*B (or A+B with `expect`).
+- `file_signature`: `attack`, `baseline` plus `signature` (`passwd`, `win_ini`, `proc_version`, `hosts`); confirmed when the file signature appears only in the attack.
+- `redirect_host`: `attack` plus `redirect_host` set to `__M__.cairn-test.invalid`; confirmed when the Location header points at that host.
+- `access_control`: one `target` request plus `victim` and `attacker` profile names and an optional `marker`; confirmed when the attacker identity retrieves the victim's resource.
+- `ssrf_callback`: `attack` whose payload is `__CALLBACK__`; confirmed when the target calls back to the server.
+
+Example shape (JSON): `"verification_plan": {"oracle": "sql_error", "requests": {"attack": {"path": "/item?id=1%27"}, "baseline": {"path": "/item?id=1"}}}`. Use only safe methods unless the target opts in to state-changing requests; credentials come only from the project's configured profiles (reference them by name via a request's `auth`), never inline.
+
 # Context
 ## Immutable Source Root
 ```

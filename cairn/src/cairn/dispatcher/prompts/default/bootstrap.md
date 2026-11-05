@@ -47,6 +47,14 @@ Only when Goal is definitively satisfied:
 - Do not claim a vulnerability without concrete evidence.
 - All user-facing JSON string fields must be written in Simplified Chinese. Keep exact paths, identifiers, commands, package names, and technical terms unchanged.
 
+# Web Attack-Surface Map
+If the repository is a web application or service, spend part of the bootstrap budget mapping its attack surface, within the existing limits (at most 20 files, at most 20 business nodes). This map is what later investigation intents will burn down.
+- Framework and routing: identify the web framework(s) and how requests reach handlers (route tables, controllers, decorators, annotations, filename routing). Name the template engine, ORM/DB layer, and HTTP-client library in use — these are the sink families.
+- Entry-point families: group externally reachable endpoints into families (for example auth, user, admin, file, API). For each family note whether it is reachable unauthenticated, by any authenticated user, or only by privileged roles. Do not enumerate every route; create one semantic `endpoint` or `feature` node per family with representative `path:line` evidence.
+- Authentication and authorization model: locate where identity and permissions are enforced (middleware, decorators, base controllers, filters). Capture this as `role` and `control` nodes and `guards` edges. A missing or inconsistent guard is a high-value lead.
+- Trust boundaries and sinks present: record which dangerous sink families exist in the code (SQL, command/code execution, file read/write/upload, template render, server-side HTTP client, XML parsing, native deserialization) as `risk` nodes in the audit layer, marked `unreviewed` for follow-up. Do not assert a vulnerability here.
+- Keep unauthenticated, state-changing, and privilege-crossing entry points at `risk_level: high` so the planner prioritizes them.
+
 # Context
 ## Source Path
 ```

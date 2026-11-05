@@ -58,6 +58,46 @@ def _zip_bytes(files: dict[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
+def test_risk_signal_propagates_input_through_python_and_typed_assignments():
+    python_signals = source_service._extract_risk_signals(
+        """
+def download(request):
+    requested = request.args.get("path")
+    joined = os.path.join(DATA_ROOT, requested)
+    normalized = os.path.normpath(joined)
+    return open(normalized, "rb").read()
+"""
+    )
+    assert any(signal.category == "文件读写/加载能力" for signal in python_signals)
+    assert any(signal.symbol == "normalized" for signal in python_signals)
+
+    java_signals = source_service._extract_risk_signals(
+        """
+void download(HttpServletRequest request) {
+    String requested = request.getParameter("path");
+    Path joined = Paths.get(ROOT, requested);
+    Path normalized = joined.normalize();
+    FileInputStream stream = new FileInputStream(normalized.toFile());
+}
+"""
+    )
+    assert any(signal.category == "文件读写/加载能力" for signal in java_signals)
+    assert any(signal.symbol == "normalized" for signal in java_signals)
+
+    go_signals = source_service._extract_risk_signals(
+        """
+func download(c *gin.Context) {
+    requested := c.Query("path")
+    joined := filepath.Join(dataRoot, requested)
+    normalized := filepath.Clean(joined)
+    data, err := os.ReadFile(normalized)
+}
+"""
+    )
+    assert any(signal.category == "文件读写/加载能力" for signal in go_signals)
+    assert any(signal.symbol == "normalized" for signal in go_signals)
+
+
 def _proof_packet(
     path: str = "/app.php?x=%3Cscript%3Ealert(1)%3C/script%3E",
     payload: str = "<script>alert(1)</script>",

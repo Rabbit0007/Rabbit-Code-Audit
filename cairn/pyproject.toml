@@ -16,6 +16,10 @@ dependencies = [
     "bcrypt>=4.1",
     "python-multipart>=0.0.20",
     "reportlab>=4.4,<5",
+    # Optional-at-runtime (code degrades gracefully if missing), but bundled so
+    # rebuilt images get the multi-language AST call-graph / reachability layer.
+    "tree-sitter>=0.23",
+    "tree-sitter-language-pack>=0.7",
 ]
 
 [project.scripts]

@@ -19,9 +19,10 @@ import uuid
 import zipfile
 
 from cairn.server.code_index import extract_code_index, is_likely_generic_web_script
+from cairn.server import ast_index
 from cairn.server import db
 from cairn.server.business_graph_service import reconcile_project_business_graph
-from cairn.server.services import get_project_or_404, utcnow
+from cairn.server.services import get_project_or_404, next_hint_id, utcnow
 from cairn.server.source_models import (
     CodeCapability,
     CodeEntrypoint,
@@ -74,6 +75,11 @@ LANGUAGE_BY_SUFFIX: dict[str, str] = {
     ".vue": "Vue",
 }
 WEB_SCRIPT_SUFFIXES = {".php", ".jsp", ".jspx", ".asp", ".aspx", ".ashx"}
+# Path segments that are almost always third-party dependencies, build output
+# or generated code rather than hand-written source. They are excluded from
+# audit-candidate generation (NOT from the raw file index) so that a large
+# monorepo's vendored/generated trees do not drown the real attack surface.
+# Dependency CVEs are covered separately by osv-scanner / trivy.
 WEB_SCRIPT_EXCLUDED_PARTS = {
     ".git",
     ".hg",
@@ -89,8 +95,95 @@ WEB_SCRIPT_EXCLUDED_PARTS = {
     "tests",
     "vendor",
     "venv",
+    # dependency / package-manager trees
+    ".venv",
+    "site-packages",
+    ".yarn",
+    "bower_components",
+    "jspm_packages",
+    ".pnp",
+    "third_party",
+    "Pods",
+    "Carthage",
+    "elm-stuff",
+    ".dart_tool",
+    "Godeps",
+    # build / tooling / generated output
+    ".gradle",
+    ".idea",
+    ".vscode",
+    ".terraform",
+    ".serverless",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".cache",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    "obj",
+    "__generated__",
 }
+
+# File basenames (suffixes) that are minified/bundled/generated artifacts and
+# carry no reviewable source-level logic.
+CANDIDATE_EXCLUDED_SUFFIXES = (
+    ".min.js",
+    ".min.mjs",
+    ".min.css",
+    ".bundle.js",
+    ".bundle.css",
+    "-min.js",
+    ".map",
+    ".lock",
+)
+
 MAX_SOURCE_INDEX_CANDIDATES = 2000
+
+# Candidate types that represent an actual vulnerability signal and that gate
+# project completion (see services.validate_project_ready_to_complete). The
+# entrypoint / web_entrypoint candidates are "where to look" hints and never
+# gate completion on their own.
+COVERAGE_GATING_CANDIDATE_TYPES = {"data_flow", "capability_chain"}
+
+# When the index produces more candidates than MAX_SOURCE_INDEX_CANDIDATES, keep
+# the highest-priority ones (lower number sorts first). Bug-signal candidates
+# outrank bare route listings so a route-heavy repo cannot starve the real
+# findings; within a type, higher severity is kept first.
+_CANDIDATE_TYPE_PRIORITY = {
+    "coverage_gap": 0,
+    "data_flow": 1,
+    "capability_chain": 1,
+    "web_entrypoint": 2,
+    "entrypoint": 3,
+}
+_CANDIDATE_SEVERITY_PRIORITY = {
+    "critical": 0,
+    "high": 1,
+    "unknown": 2,
+    "medium": 3,
+    "low": 4,
+    "info": 5,
+}
+
+
+def _candidate_priority(candidate_type: str, severity: str, entry_point: str | None) -> tuple[int, int, int]:
+    """Ranking key used before truncating index candidates (lower kept first).
+
+    Dimensions, in order:
+      1. type      — bug signals (data_flow / capability_chain) over route lists;
+      2. severity  — critical before high before unknown ...;
+      3. reachable — a candidate tied to an HTTP entry point (same file, or via
+         the AST cross-file call graph) is attacker-triggerable and is kept over
+         an otherwise-equal candidate with no reaching entry point.
+    Entry-point listings always carry a route, so the reachability dimension
+    only reorders within data_flow / capability_chain.
+    """
+    return (
+        _CANDIDATE_TYPE_PRIORITY.get(candidate_type, 2),
+        _CANDIDATE_SEVERITY_PRIORITY.get(severity, 2),
+        0 if entry_point else 1,
+    )
 MAX_DATA_FLOW_CANDIDATES_PER_FILE = 8
 MAX_INPUT_TO_SINK_LINE_DISTANCE = 80
 MAX_SIGNAL_FRAGMENT_CHARS = 140
@@ -118,8 +211,10 @@ HIGH_IMPACT_RISK_SIGNAL_CATEGORIES = {
     "文件读写/加载能力",
     "系统进程能力",
     "对象反序列化能力",
+    "XML 外部实体解析能力",
+    "模板/表达式渲染能力",
 }
-MEDIUM_IMPACT_RISK_SIGNAL_CATEGORIES = {"响应输出/渲染能力"}
+MEDIUM_IMPACT_RISK_SIGNAL_CATEGORIES = {"响应输出/渲染能力", "重定向跳转能力"}
 HIGH_IMPACT_CAPABILITY_CATEGORIES = {
     "archive_extract",
     "file_upload",
@@ -234,7 +329,11 @@ INPUT_SOURCE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("SatRDA 请求对象", re.compile(r"\br\.(?:jsonBody|body|formValue|url\.query\.get|url\.rawQuery)\b|\bUrlUtils\.queryParams\s*\(\s*r\.url\.rawQuery\s*\)")),
     ("Python Web 请求", re.compile(r"\brequest\.(?:args|form|json|data|cookies|headers|GET|POST|FILES|files|query_params)\b")),
     ("Java Web 参数", re.compile(r"\b(?:getParameter|getHeader|getCookies|getPart|getParts|getInputStream)\s*\(|@(RequestParam|PathVariable|RequestBody|RequestPart)\b|\bMultipartFile\b")),
-    ("Go Web 参数", re.compile(r"\b(?:URL\.Query|FormValue|PostFormValue|Param|Query|PostForm|FormFile|MultipartReader)\s*\(")),
+    # Require a request/context receiver (net/http r, gin/echo/fiber c|ctx, etc.)
+    # so a bare `db.Query(`, ORM `.Query(` or Java `@Query(` is NOT mistaken for
+    # external input. Matches r.URL.Query / r.FormValue / c.Query / c.Param /
+    # c.QueryParam / c.DefaultQuery / c.PostForm / c.FormFile and similar.
+    ("Go Web 参数", re.compile(r"\b(?:r|req|request|c|ctx|gc|ec|fc)\.(?:URL\.Query|Query|QueryParam|QueryArray|DefaultQuery|GetQuery|FormValue|PostFormValue|PostForm|Form|FormFile|MultipartReader|Param|Params|PathParam)\b")),
 )
 CONTROL_SIGNAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
@@ -266,6 +365,16 @@ INPUT_VARIABLE_PATTERNS: tuple[re.Pattern[str], ...] = (
 JS_DESTRUCTURING_PATTERN = re.compile(r"\b(?:const|let|var)\s*\{([^}]+)\}\s*=\s*([A-Za-z_$][\w$]*)")
 JS_DERIVED_VARIABLE_PATTERN = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(.+)")
 PHP_DERIVED_VARIABLE_PATTERN = re.compile(r"\$([A-Za-z_][\w]*)\s*=\s*(.+)")
+# Keep lightweight intra-file taint propagation useful outside JavaScript and
+# PHP as well.  These patterns intentionally cover only direct assignments;
+# they create navigation candidates, never confirmed vulnerabilities.
+SIMPLE_DERIVED_VARIABLE_PATTERN = re.compile(
+    r"^\s*([A-Za-z_][\w$]*)\s*(?::=|=(?!=))\s*(.+?);?\s*$"
+)
+TYPED_DERIVED_VARIABLE_PATTERN = re.compile(
+    r"^\s*(?:(?:final|const|let|var)\s+)?"
+    r"[A-Za-z_][\w.$<>\[\],? ]*\s+([A-Za-z_][\w$]*)\s*=\s*(.+?);?\s*$"
+)
 SINK_PATTERNS: tuple[SinkPattern, ...] = (
     SinkPattern(
         "数据库执行能力",
@@ -288,7 +397,9 @@ SINK_PATTERNS: tuple[SinkPattern, ...] = (
             r"|\bsubprocess\.(?:Popen|run|call|check_output)\s*\("
             r"|\bos\.system\s*\("
             r"|\bRuntime\.getRuntime\(\)\.exec\s*\("
-            r"|\bProcessBuilder\s*\(",
+            r"|\bProcessBuilder\s*\("
+            r"|\bexec\.Command(?:Context)?\s*\("
+            r"|\bCommand::new\s*\(",
             re.IGNORECASE,
         ),
     ),
@@ -302,8 +413,10 @@ SINK_PATTERNS: tuple[SinkPattern, ...] = (
             r"|\b(?:satrda\.(?:writeFile|fileOpen)|ctx\.(?:serveContent|saveMultipartFile))\s*\("
             r"|\b(?:default_storage|FileSystemStorage\([^)]*\)|storage)\.save\s*\("
             r"|\b(?:shutil\.copyfileobj|Files\.(?:copy|write|move)|FileOutputStream|FileInputStream)\b"
+            r"|\b(?:os|ioutil)\.(?:ReadFile|WriteFile)\s*\("
+            r"|\bstd::fs::(?:read|read_to_string|write|remove_file)\s*\("
             r"|\b(?:transferTo|SaveUploadedFile|io\.Copy)\s*\("
-            r"|\bopen\s*\([^;\n]*(?:request\.|req\.|\$_)",
+            r"|\bopen\s*\(",
             re.IGNORECASE,
         ),
     ),
@@ -336,6 +449,37 @@ SINK_PATTERNS: tuple[SinkPattern, ...] = (
         "响应渲染输出能力",
         "响应输出/渲染能力",
         re.compile(r"\b(?:echo|print|printf)\b|\bres\.(?:send|write|end)\s*\(|\.innerHTML\s*=", re.IGNORECASE),
+    ),
+    SinkPattern(
+        "XML 外部实体解析能力",
+        "XML 解析/外部实体能力",
+        re.compile(
+            r"\b(?:DocumentBuilderFactory|SAXParserFactory|XMLInputFactory|SAXReader|SAXBuilder)\b"
+            r"|\b(?:lxml\.etree|etree)\.(?:parse|fromstring)\s*\("
+            r"|\b(?:simplexml_load_string|simplexml_load_file)\s*\(|\bnew\s+DOMDocument\b|->loadXML\s*\("
+            r"|\bxml\.Unmarshal\s*\(",
+            re.IGNORECASE,
+        ),
+    ),
+    SinkPattern(
+        "模板/表达式渲染能力",
+        "模板/表达式渲染能力",
+        re.compile(
+            r"\b(?:render_template_string|env\.from_string)\s*\("
+            r"|\bTemplate\s*\(|\bnew\s+Template\b|->createTemplate\s*\(|\.renderString\s*\("
+            r"|\b(?:Twig|Freemarker|Velocity|Smarty|Thymeleaf)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    SinkPattern(
+        "重定向跳转能力",
+        "重定向/跳转能力",
+        re.compile(
+            r"\b(?:sendRedirect|HttpResponseRedirect|RedirectResponse)\s*\("
+            r"|\b(?:res\.redirect|redirect|redirectTo)\s*\("
+            r"|\blocation\.href\s*=|\bheader\s*\(\s*['\"]Location",
+            re.IGNORECASE,
+        ),
     ),
 )
 CAPABILITY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -520,6 +664,7 @@ def delete_snapshot_artifacts(snapshot_ids: list[str]) -> None:
 
 def import_git_source(project_id: str, repository_url: str, requested_ref: str | None) -> SourceSnapshot:
     _validate_public_git_url(repository_url)
+    _validate_git_ref(requested_ref)
     snapshot_id = _new_snapshot_id()
     created_at = utcnow()
     _insert_importing_snapshot(
@@ -539,13 +684,19 @@ def import_git_source(project_id: str, repository_url: str, requested_ref: str |
             checkout = Path(temp_dir) / "source"
             _run_git(["clone", "--no-local", "--no-hardlinks", repository_url, str(checkout)])
             if requested_ref:
-                _run_git(["-C", str(checkout), "checkout", "--detach", requested_ref])
+                _run_git(["-C", str(checkout), "checkout", "--detach", "--end-of-options", requested_ref])
             else:
                 _run_git(["-C", str(checkout), "checkout", "--detach"])
             resolved_commit = _run_git(["-C", str(checkout), "rev-parse", "HEAD"]).strip()
+            # Read security-relevant history *before* the .git directory is
+            # stripped from the immutable snapshot.  A fix in the log points at
+            # a sink worth checking for unpatched siblings (variant analysis).
+            commit_subjects = _collect_security_commit_subjects(checkout)
             shutil.rmtree(checkout / ".git", ignore_errors=True)
             _move_snapshot(checkout, destination)
-        return _finalize_snapshot(snapshot_id, resolved_commit=resolved_commit)
+        snapshot = _finalize_snapshot(snapshot_id, resolved_commit=resolved_commit)
+        _record_security_commit_hints(project_id, commit_subjects)
+        return snapshot
     except Exception as exc:
         _mark_snapshot_failed(snapshot_id, str(exc))
         shutil.rmtree(destination.parent, ignore_errors=True)
@@ -2167,15 +2318,129 @@ def _validate_public_git_url(repository_url: str) -> None:
         raise ValueError("repository_url must resolve only to public network addresses")
 
 
+# Branch names, tags, and commit ids: letters, digits and . _ - / @ ^ ~ + only,
+# and never a leading "-".  A ref is passed to ``git checkout`` as a positional
+# argument, so anything that git could read as an option (for example
+# ``--pathspec-from-file=...``) must be rejected before it reaches the command.
+_SAFE_GIT_REF_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/@^~+-]*$")
+MAX_GIT_REF_LENGTH = 255
+
+
+def _validate_git_ref(requested_ref: str | None) -> None:
+    if requested_ref is None:
+        return
+    if len(requested_ref) > MAX_GIT_REF_LENGTH or not _SAFE_GIT_REF_RE.fullmatch(requested_ref):
+        raise ValueError(
+            "ref must be a branch, tag or commit id made of letters, digits and . _ - / @ ^ ~ + "
+            "and must not start with '-'"
+        )
+
+
+# Terms that mark a commit subject as security-relevant.  English matches are
+# case-insensitive; the Chinese terms are matched as-is.  "fix" alone is left
+# out on purpose: it is too noisy to be a useful variant-analysis lead.
+_SECURITY_COMMIT_TERMS_EN = (
+    "security", "vulnerab", "cve-", "exploit", "overflow", "injection", "sqli",
+    "xss", "csrf", "ssrf", "rce", "sanitiz", "escape", "bypass", "traversal",
+    "deserial", "unsafe", "auth bypass", "privilege", "disclosure", "hardcoded",
+    "untrusted", "arbitrary file", "path traversal", "command injection",
+)
+_SECURITY_COMMIT_TERMS_CN = (
+    "安全", "漏洞", "越权", "注入", "鉴权", "未授权", "绕过", "提权", "敏感信息",
+    "反序列化", "任意文件", "路径穿越", "命令执行", "信息泄露",
+)
+MAX_SECURITY_COMMIT_HINTS = 12
+_GIT_LOG_FIELD_SEP = "\x1f"
+
+
+def extract_security_relevant_commits(log_text: str, limit: int = MAX_SECURITY_COMMIT_HINTS) -> list[tuple[str, str]]:
+    """Filter ``git log`` output down to security-relevant commits.
+
+    ``log_text`` is expected to be ``<sha>\\x1f<subject>`` per line.  Returns a
+    de-duplicated list of ``(short_sha, subject)`` for subjects that mention a
+    security term, newest first, capped at ``limit``.  Pure and git-free so the
+    filtering logic is unit-testable.
+    """
+    results: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in log_text.splitlines():
+        sha, sep, subject = line.partition(_GIT_LOG_FIELD_SEP)
+        if not sep:
+            continue
+        subject = subject.strip()
+        if not subject:
+            continue
+        lowered = subject.lower()
+        is_security = any(term in lowered for term in _SECURITY_COMMIT_TERMS_EN) or any(
+            term in subject for term in _SECURITY_COMMIT_TERMS_CN
+        )
+        if not is_security:
+            continue
+        key = lowered
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append((sha.strip()[:12], subject[:200]))
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _collect_security_commit_subjects(checkout: Path) -> list[tuple[str, str]]:
+    """Best-effort read of security-relevant commit subjects from a checkout."""
+    try:
+        log_text = _run_git(
+            ["-C", str(checkout), "log", "--no-merges", f"--format=%H{_GIT_LOG_FIELD_SEP}%s", "-n", "500"]
+        )
+    except Exception:
+        LOG.warning("could not read git history for security commit hints", exc_info=True)
+        return []
+    return extract_security_relevant_commits(log_text)
+
+
+def _record_security_commit_hints(project_id: str, subjects: list[tuple[str, str]]) -> None:
+    """Persist security-relevant commits as focus hints for later variant analysis.
+
+    Non-fatal: a failure here must never fail an otherwise successful import.
+    """
+    if not subjects:
+        return
+    try:
+        now = utcnow()
+        with db.get_conn() as conn:
+            for short_sha, subject in subjects:
+                content = (
+                    f"历史安全相关提交 {short_sha}：{subject}。"
+                    "请在当前快照中定位该提交涉及的函数或 sink，并检索同类调用点，"
+                    "确认是否存在未修复的同类问题（变体分析）。"
+                )
+                hint_id = next_hint_id(conn, project_id)
+                conn.execute(
+                    """
+                    INSERT INTO hints (
+                        id, project_id, content, creator, created_at,
+                        hint_type, target, priority, expires_at, max_uses
+                    )
+                    VALUES (?, ?, ?, ?, ?, 'focus', NULL, 1, NULL, NULL)
+                    """,
+                    (hint_id, project_id, content, "git_history", now),
+                )
+    except Exception:
+        LOG.warning("could not record security commit hints project=%s", project_id, exc_info=True)
+
+
 def _run_git(args: list[str]) -> str:
-    result = subprocess.run(
-        ["git", *args],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=900,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-    )
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("git timed out after 900 seconds") from exc
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"git exited with {result.returncode}"
         raise RuntimeError(detail)
@@ -2564,7 +2829,9 @@ def _insert_audit_candidates_from_index(
     project_id = row["project_id"]
     project_completed = row["project_status"] == "completed"
     created_at = utcnow()
-    candidates: list[tuple[object, ...]] = []
+    # (priority, insertion_seq, row_tuple, candidate_type); ranked/truncated below
+    # instead of dropping silently at the cap in insertion order.
+    scored_candidates: list[tuple[tuple[int, int], int, tuple[object, ...], str]] = []
     seen: set[tuple[str, str | None, int | None, str | None]] = set()
     existing_candidate_ids = _load_existing_index_candidate_ids(conn, snapshot_id)
 
@@ -2580,10 +2847,9 @@ def _insert_audit_candidates_from_index(
         entry_point: str | None = None,
         symbol: str | None = None,
         severity: str = "unknown",
+        evidence: str | None = None,
         dedupe_key: tuple[object, ...] | None = None,
     ) -> None:
-        if len(candidates) >= MAX_SOURCE_INDEX_CANDIDATES:
-            return
         key = dedupe_key or (candidate_type, file_path, line_start, entry_point)
         if key in seen:
             return
@@ -2593,7 +2859,6 @@ def _insert_audit_candidates_from_index(
         ) or _stable_candidate_id(snapshot_id, source, candidate_type, file_path, line_start, entry_point)
         status = "needs_more_evidence" if project_completed else "candidate"
         conclusion_summary = None
-        evidence = None
         concluded_by = None
         concluded_at = None
         if project_completed:
@@ -2604,31 +2869,31 @@ def _insert_audit_candidates_from_index(
             evidence = _candidate_backfill_evidence(file_path, line_start, description)
             concluded_by = "source_index_backfill"
             concluded_at = created_at
-        candidates.append(
-            (
-                candidate_id,
-                project_id,
-                snapshot_id,
-                source,
-                candidate_type,
-                severity,
-                title,
-                description,
-                file_path,
-                line_start,
-                line_end,
-                entry_point,
-                symbol,
-                status,
-                conclusion_summary,
-                evidence,
-                "source_index",
-                created_at,
-                created_at,
-                concluded_by,
-                concluded_at,
-            )
+        row_tuple = (
+            candidate_id,
+            project_id,
+            snapshot_id,
+            source,
+            candidate_type,
+            severity,
+            title,
+            description,
+            file_path,
+            line_start,
+            line_end,
+            entry_point,
+            symbol,
+            status,
+            conclusion_summary,
+            evidence,
+            "source_index",
+            created_at,
+            created_at,
+            concluded_by,
+            concluded_at,
         )
+        priority = _candidate_priority(candidate_type, severity, entry_point)
+        scored_candidates.append((priority, len(scored_candidates), row_tuple, candidate_type))
 
     source_root = root or snapshot_path(snapshot_id)
     indexed_entrypoint_paths: set[str] = set()
@@ -2673,6 +2938,14 @@ def _insert_audit_candidates_from_index(
             entry_point=route,
         )
 
+    # Optional tree-sitter pass: map every entry-point-reachable file to a
+    # reaching route AND the cross-file call chain that connects them. Lets a
+    # sink in a Service / DAO layer (no HTTP input in its own file) be tied back
+    # to the Controller entry point that reaches it, with the chain attached as
+    # evidence. Empty when tree-sitter is unavailable, so the behaviour is
+    # unchanged on a server image that lacks the dependency.
+    ast_entry_reach = _ast_entry_reach(files, source_root, entrypoint_by_path)
+
     for file in files:
         if file.is_binary or not _is_candidate_source_path(file.path):
             continue
@@ -2680,8 +2953,13 @@ def _insert_audit_candidates_from_index(
         if text is None:
             continue
         entry_point = entrypoint_by_path.get(file.path)
+        cross_file_reach: ast_index.RouteReach | None = None
         if entry_point is None and _is_web_script_candidate_path(file.path, text):
             entry_point = f"/{file.path}"
+        if entry_point is None:
+            cross_file_reach = ast_entry_reach.get(file.path)
+            if cross_file_reach is not None:
+                entry_point = cross_file_reach.route
         for signal in _extract_risk_signals(text):
             severity = _risk_signal_candidate_severity(signal)
             add_candidate(
@@ -2695,6 +2973,9 @@ def _insert_audit_candidates_from_index(
                 entry_point=entry_point,
                 symbol=signal.symbol,
                 severity=severity,
+                evidence=_ast_call_chain_evidence(
+                    cross_file_reach, file.path, signal.line_start, signal.category
+                ),
                 dedupe_key=_risk_signal_candidate_key(file.path, entry_point, signal),
             )
 
@@ -2708,6 +2989,11 @@ def _insert_audit_candidates_from_index(
         tags = _decode_json_list(capability["risk_tags_json"])
         entrypoints = reachable_entrypoints.get(capability["path"], [])
         entry_point = entrypoints[0] if entrypoints else None
+        cross_file_reach: ast_index.RouteReach | None = None
+        if entry_point is None:
+            cross_file_reach = ast_entry_reach.get(capability["path"])
+            if cross_file_reach is not None:
+                entry_point = cross_file_reach.route
         add_candidate(
             source="index",
             candidate_type="capability_chain",
@@ -2722,7 +3008,94 @@ def _insert_audit_candidates_from_index(
             entry_point=entry_point,
             symbol=capability["symbol"],
             severity=capability["risk_level"],
+            evidence=_ast_call_chain_evidence(
+                cross_file_reach, capability["path"], capability["line_start"], capability["title"]
+            ),
             dedupe_key=_capability_candidate_key(capability, entry_point),
+        )
+
+    # Rank, then truncate — bug-signal candidates (data_flow / capability_chain)
+    # are kept ahead of bare entrypoint listings so a route-heavy repo cannot
+    # starve the real findings. What overflows the cap is counted, not dropped
+    # silently.
+    scored_candidates.sort(key=lambda item: (item[0], item[1]))
+    kept = scored_candidates[:MAX_SOURCE_INDEX_CANDIDATES]
+    overflow = scored_candidates[MAX_SOURCE_INDEX_CANDIDATES:]
+    dropped_bug_signals = sum(
+        1 for item in overflow if item[3] in COVERAGE_GATING_CANDIDATE_TYPES
+    )
+    candidates: list[tuple[object, ...]] = [item[2] for item in kept]
+
+    coverage_gap_id = existing_candidate_ids.get(
+        ("index", "coverage_gap", None, None, None)
+    ) or _stable_candidate_id(snapshot_id, "index", "coverage_gap", None, None, None)
+    if dropped_bug_signals:
+        # Reserve a slot for the honesty marker without exceeding the cap, and
+        # never evict another bug-signal candidate to make room.
+        if len(candidates) >= MAX_SOURCE_INDEX_CANDIDATES:
+            for drop_index in range(len(kept) - 1, -1, -1):
+                if kept[drop_index][3] not in COVERAGE_GATING_CANDIDATE_TYPES:
+                    del candidates[drop_index]
+                    break
+            else:
+                candidates.pop()
+        gap_status = "needs_more_evidence" if project_completed else "candidate"
+        gap_title = (
+            f"覆盖缺口: 源码索引候选超过上限,{dropped_bug_signals} 个高风险数据流/能力链候选被丢弃"
+        )
+        gap_description = (
+            f"本次源码索引生成的候选超过上限 {MAX_SOURCE_INDEX_CANDIDATES} 条,"
+            f"其中 {dropped_bug_signals} 个数据流/能力链候选未能入库,代码覆盖不完整。"
+            "建议按服务/模块把项目拆小,或人工复核后再判定本缺口;"
+            "在本缺口被处理前,项目不应被标记为完成。"
+        )
+        gap_conclusion = None
+        gap_evidence = None
+        gap_concluded_by = None
+        gap_concluded_at = None
+        if project_completed:
+            gap_conclusion = "项目完成后由源码索引回填覆盖缺口标记,仅作为覆盖线索保留。"
+            gap_evidence = gap_description
+            gap_concluded_by = "source_index_backfill"
+            gap_concluded_at = created_at
+        candidates.append(
+            (
+                coverage_gap_id,
+                project_id,
+                snapshot_id,
+                "index",
+                "coverage_gap",
+                "high",
+                gap_title,
+                gap_description,
+                None,
+                None,
+                None,
+                None,
+                None,
+                gap_status,
+                gap_conclusion,
+                gap_evidence,
+                "source_index",
+                created_at,
+                created_at,
+                gap_concluded_by,
+                gap_concluded_at,
+            )
+        )
+        LOG.warning(
+            "source index candidate cap hit for snapshot %s: dropped %d bug-signal "
+            "candidates (total overflow %d)",
+            snapshot_id,
+            dropped_bug_signals,
+            len(overflow),
+        )
+    else:
+        # No current coverage gap: clear any stale marker from a previous index.
+        conn.execute(
+            "DELETE FROM audit_candidates WHERE snapshot_id = ? AND source = 'index' "
+            "AND candidate_type = 'coverage_gap'",
+            (snapshot_id,),
         )
 
     if not candidates:
@@ -4078,8 +4451,11 @@ def _entrypoint_label(method: str | None, route: str) -> str:
 
 
 def _is_candidate_source_path(path: str) -> bool:
-    parts = PurePosixPath(path).parts
-    return not any(part in WEB_SCRIPT_EXCLUDED_PARTS for part in parts)
+    pure = PurePosixPath(path)
+    if any(part in WEB_SCRIPT_EXCLUDED_PARTS for part in pure.parts):
+        return False
+    name = pure.name.lower()
+    return not any(name.endswith(suffix) for suffix in CANDIDATE_EXCLUDED_SUFFIXES)
 
 
 def _is_web_script_candidate_path(path: str, text: str | None = None) -> bool:
@@ -4097,6 +4473,81 @@ def _read_candidate_text(path: Path) -> str | None:
         return path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
+
+
+def _ast_entry_routes(
+    files: list[CodeFile],
+    source_root: Path,
+    entrypoint_by_path: dict[str, str],
+) -> dict[str, str]:
+    """Reachable-file -> reaching-route map from the optional AST call graph.
+
+    Returns an empty dict when tree-sitter is unavailable (so the server image
+    that has not been rebuilt behaves exactly as before) or when there are no
+    entry points to seed reachability from.
+    """
+    return {
+        path: reach.route
+        for path, reach in _ast_entry_reach(files, source_root, entrypoint_by_path).items()
+    }
+
+
+def _ast_entry_reach(
+    files: list[CodeFile],
+    source_root: Path,
+    entrypoint_by_path: dict[str, str],
+) -> dict[str, ast_index.RouteReach]:
+    """Reachable-file -> RouteReach map from the optional AST call graph.
+
+    Like :func:`_ast_entry_routes` but keeps the reaching entry file and the
+    file-level call chain, so a cross-file sink can be annotated with the
+    Controller->Service->DAO path that connects it to the HTTP entry point.
+    Returns an empty dict when tree-sitter is unavailable or there are no entry
+    points, so a server image without the dependency behaves exactly as before.
+    """
+    if not ast_index.TREE_SITTER_AVAILABLE or not entrypoint_by_path:
+        return {}
+    file_tuples: list[tuple[str, str, str | None]] = []
+    for file in files:
+        if file.is_binary or not _is_candidate_source_path(file.path):
+            continue
+        text = _read_candidate_text(source_root / file.path)
+        if text is None:
+            continue
+        file_tuples.append((file.path, text, file.language))
+    graph = ast_index.build_call_graph(file_tuples)
+    if graph is None:
+        return {}
+    try:
+        return graph.route_reach_from(entrypoint_by_path)
+    except Exception as exc:  # noqa: BLE001 - never fail candidate generation
+        LOG.debug("AST reachability failed for snapshot root %s: %s", source_root, exc)
+        return {}
+
+
+def _ast_call_chain_evidence(
+    reach: ast_index.RouteReach | None,
+    sink_path: str,
+    sink_line: int | None,
+    sink_label: str,
+) -> str | None:
+    """Render an AST ``RouteReach`` cross-file call chain as candidate evidence.
+
+    Only produced for a genuine cross-file reach (chain spanning >= 2 files), so
+    same-file signals and the tree-sitter-unavailable fallback attach no
+    evidence and behave exactly as before. The note is explicit that the chain
+    is an approximation, so a worker never treats it as a confirmed data path.
+    """
+    if reach is None or len(reach.chain) < 2:
+        return None
+    arrow = " → ".join(reach.chain)
+    location = f"{sink_path}:{sink_line}" if sink_line else sink_path
+    return _clip_text(
+        f"跨文件调用链(基于 AST 名称解析，近似)：{arrow}。"
+        f"HTTP 入口 {reach.route}（{reach.entry_path}）经该调用链可达 {location} 的{sink_label}。"
+        "名称解析为近似匹配，worker 需按真实源码确认调用关系与数据是否确实沿此链传递。",
+        MAX_AUDIT_CANDIDATE_DESCRIPTION_CHARS,
+    )
 
 
 def _extract_risk_signals(text: str) -> list[RiskSignal]:
@@ -4183,6 +4634,18 @@ def _collect_input_variables(text: str) -> InputVariableMap:
             ):
                 if _add_input_variable(variables, php_derived.group(1), lineno):
                     changed = True
+                continue
+            if any(sink.pattern.search(stripped) for sink in SINK_PATTERNS):
+                continue
+            for pattern in (SIMPLE_DERIVED_VARIABLE_PATTERN, TYPED_DERIVED_VARIABLE_PATTERN):
+                generic_derived = pattern.search(stripped)
+                if generic_derived is None:
+                    continue
+                if _expression_uses_nearby_input(
+                    generic_derived.group(2), lineno, variables, php=False
+                ) and _add_input_variable(variables, generic_derived.group(1), lineno):
+                    changed = True
+                break
     return variables
 
 

@@ -34,7 +34,10 @@ EITHER a valid session cookie (browser users) OR a valid internal-service token
 presented via the ``X-Cairn-Internal-Token`` header matching the
 ``CAIRN_INTERNAL_TOKEN`` environment variable.
 
-Protected routers are closed by default. Local/test compatibility can be
+Protected routers are closed by default: a request needs a valid browser session
+cookie or, for machine clients, the matching internal token header.  Browser
+sessions work whether or not ``CAIRN_INTERNAL_TOKEN`` is set; without a token,
+machine clients (the dispatcher) are rejected.  Local/test compatibility can be
 explicitly enabled with ``CAIRN_AUTH_OPEN_MODE=1``; production deployments
 should configure ``CAIRN_INTERNAL_TOKEN`` and have the dispatcher send the
 matching header.
@@ -228,11 +231,14 @@ def require_auth(request: Request, response: Response) -> sqlite3.Row:
     # mechanism that lets us protect the browser UI without breaking the
     # dispatcher's cookieless HTTP calls.
     #
-    if _configured_internal_token() is None:
-        if _auth_open_mode_enabled():
-            # Explicit local/test compatibility mode. Do not inject a user.
-            return None  # type: ignore[return-value]
-        raise _reject(request)
+    if _configured_internal_token() is None and _auth_open_mode_enabled():
+        # Explicit local/test compatibility mode. Do not inject a user.
+        return None  # type: ignore[return-value]
+    # ``_has_valid_internal_token`` is False whenever no internal token is
+    # configured, so machine clients stay locked out in that case.  Browser
+    # users must never be: an unset token used to reject every request here,
+    # including requests carrying a valid session cookie, which left the UI in
+    # a login loop (login succeeded, every API call then returned 401).
     if _has_valid_internal_token(request):
         # Trusted machine client (e.g. dispatcher) presenting the shared secret.
         return None  # type: ignore[return-value]
@@ -287,18 +293,19 @@ def require_auth(request: Request, response: Response) -> sqlite3.Row:
     if user_row is None:
         raise _reject(request)
 
-    if refresh_session:
-        # Reflect the renewed server-side expiry in the browser cookie too,
-        # preserving the HTTP-only/Secure/SameSite attributes.
-        response.set_cookie(
-            key=SESSION_COOKIE_NAME,
-            value=token,
-            max_age=int(session_duration.total_seconds()),
-            httponly=True,
-            secure=cookie_secure_for_request(request),
-            samesite="strict",
-            path="/",
-        )
+    # Always refresh the browser cookie's Max-Age on a valid session so
+    # the browser does not drop the cookie while the server-side session
+    # is still alive.  The SQLite expiry extension is throttled separately
+    # above to avoid write contention.
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=int(session_duration.total_seconds()),
+        httponly=True,
+        secure=cookie_secure_for_request(request),
+        samesite="strict",
+        path="/",
+    )
 
     request.state.user = {
         "id": user_row["id"],

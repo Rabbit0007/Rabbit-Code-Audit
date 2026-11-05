@@ -52,27 +52,42 @@ def _ratio(numerator: int, denominator: int) -> float:
     return round(numerator / denominator, 4) if denominator else 1.0
 
 
+def _resolve_benchmark_snapshot_id(conn, project_id: str, requested_id: str | None) -> str:
+    if requested_id:
+        snapshot = conn.execute(
+            "SELECT id FROM source_snapshots WHERE id = ? AND project_id = ? AND status = 'ready'",
+            (requested_id, project_id),
+        ).fetchone()
+    else:
+        snapshot = conn.execute(
+            """
+            SELECT id
+            FROM source_snapshots
+            WHERE project_id = ? AND status = 'ready'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+    if snapshot is None:
+        raise ValueError("ready snapshot not found")
+    return str(snapshot["id"])
+
+
 def run_quality_benchmark(project_id: str, body: BenchmarkRunRequest) -> BenchmarkRunResult:
     with get_conn() as conn:
         project = conn.execute("SELECT id FROM projects WHERE id = ?", (project_id,)).fetchone()
         if project is None:
             raise ValueError("project not found")
-        if body.snapshot_id:
-            snapshot = conn.execute(
-                "SELECT id FROM source_snapshots WHERE id = ? AND project_id = ? AND status = 'ready'",
-                (body.snapshot_id, project_id),
-            ).fetchone()
-            if snapshot is None:
-                raise ValueError("ready snapshot not found")
+        snapshot_id = _resolve_benchmark_snapshot_id(conn, project_id, body.snapshot_id)
         rows = conn.execute(
             """
             SELECT id, title, category, cwe, file_path, entry_point
             FROM audit_findings
-            WHERE project_id = ? AND status = 'confirmed'
-              AND (? IS NULL OR snapshot_id = ?)
+            WHERE project_id = ? AND snapshot_id = ? AND status = 'confirmed'
             ORDER BY created_at, id
             """,
-            (project_id, body.snapshot_id, body.snapshot_id),
+            (project_id, snapshot_id),
         ).fetchall()
         findings = [dict(row) for row in rows]
         node_rows = conn.execute(
@@ -80,8 +95,9 @@ def run_quality_benchmark(project_id: str, body: BenchmarkRunRequest) -> Benchma
             SELECT title, description, evidence_json
             FROM business_nodes
             WHERE project_id = ? AND node_type = 'endpoint'
+              AND (source_snapshot_id IS NULL OR source_snapshot_id = ?)
             """,
-            (project_id,),
+            (project_id, snapshot_id),
         ).fetchall()
 
     candidates: list[tuple[float, int, int, list[str]]] = []
@@ -138,7 +154,7 @@ def run_quality_benchmark(project_id: str, body: BenchmarkRunRequest) -> Benchma
     result = BenchmarkRunResult(
         id=run_id,
         project_id=project_id,
-        snapshot_id=body.snapshot_id,
+        snapshot_id=snapshot_id,
         suite_name=body.suite_name,
         created_at=created_at,
         status=status,
@@ -185,4 +201,3 @@ def list_quality_benchmarks(project_id: str, limit: int = 50) -> list[BenchmarkR
             (project_id, limit),
         ).fetchall()
     return [BenchmarkRunResult.model_validate(json.loads(row["result_json"])) for row in rows]
-

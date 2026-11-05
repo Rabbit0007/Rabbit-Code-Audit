@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
+from cairn.server import replay_service
 from cairn.server.db import get_conn
+
+LOG = logging.getLogger(__name__)
 from cairn.server.finding_taxonomy import (
     canonical_cwe,
     canonical_finding_category,
@@ -16,6 +21,7 @@ from cairn.server.services import (
     activate_business_node_conclusion,
     get_project_or_404,
     next_fact_id,
+    next_hint_id,
     sync_business_node_coverage_from_conclusion,
     utcnow,
 )
@@ -154,10 +160,10 @@ def create_audit_finding(project_id: str, body: CreateAuditFindingRequest):
                 id, project_id, snapshot_id, cluster_key, title, category, severity, status,
                 evidence_level, cwe, file_path, line_start, line_end, symbol, entry_point,
                 business_node_id, description, impact, evidence,
-                proof_packets_json, reproduction_poc_json, remediation,
-                discovered_by, created_at
+                proof_packets_json, reproduction_poc_json, verification_plan_json,
+                remediation, discovered_by, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 finding_id,
@@ -181,6 +187,7 @@ def create_audit_finding(project_id: str, body: CreateAuditFindingRequest):
                 body.evidence,
                 json.dumps(body.proof_packets, ensure_ascii=False),
                 json.dumps(body.reproduction_poc, ensure_ascii=False),
+                json.dumps(body.verification_plan, ensure_ascii=False),
                 body.remediation,
                 body.discovered_by,
                 created_at,
@@ -197,6 +204,50 @@ def create_audit_finding(project_id: str, body: CreateAuditFindingRequest):
         row = conn.execute("SELECT * FROM audit_findings WHERE id = ?", (finding_id,)).fetchone()
     assert row is not None
     return _audit_finding_from_row(row)
+
+
+@router.get("/audit-validation-target")
+def get_audit_validation_target(project_id: str):
+    with get_conn() as conn:
+        get_project_or_404(conn, project_id)
+    config = replay_service.get_validation_target(project_id)
+    if config is None:
+        return {"configured": False, "target": None}
+    return {"configured": True, "target": replay_service.redact_target_config(config)}
+
+
+@router.put("/audit-validation-target")
+def put_audit_validation_target(project_id: str, body: dict[str, Any]):
+    with get_conn() as conn:
+        get_project_or_404(conn, project_id)
+    updated_by = str(body.get("updated_by") or "operator")
+    config = {key: value for key, value in body.items() if key != "updated_by"}
+    try:
+        stored = replay_service.set_validation_target(project_id, config, updated_by=updated_by)
+    except replay_service.TargetConfigError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"configured": True, "target": replay_service.redact_target_config(stored)}
+
+
+@router.delete("/audit-validation-target", status_code=204)
+def delete_audit_validation_target(project_id: str):
+    with get_conn() as conn:
+        get_project_or_404(conn, project_id)
+    replay_service.delete_validation_target(project_id)
+    return None
+
+
+@router.post("/audit-findings/{finding_id}/replay")
+def replay_audit_finding(project_id: str, finding_id: str):
+    result = replay_service.verify_finding(project_id, finding_id)
+    status = result.get("status")
+    if status == "finding_not_found":
+        raise HTTPException(404, "Audit finding not found")
+    if status == "no_plan":
+        raise HTTPException(409, result.get("detail") or "finding has no verification_plan")
+    if status == "no_target":
+        raise HTTPException(409, result.get("detail") or "no validation target configured for this project")
+    return result
 
 
 @router.get("/audit-candidates", response_model=list[AuditCandidate])
@@ -368,6 +419,7 @@ def _apply_audit_finding_review(
             reviewed_at,
         )
         _ensure_report_enrichment_task(conn, project_id, finding_id, reviewer)
+        _record_variant_sweep_hint(conn, project_id, row)
     _complete_related_review_tasks(conn, project_id, finding_id, reviewer, reviewed_at)
     _conclude_legacy_review_intents(conn, project_id, finding_id, reviewer, decision, reviewed_at)
     updated = conn.execute(
@@ -649,6 +701,8 @@ def _audit_finding_from_row(row) -> AuditFinding:
     data = dict(row)
     data["proof_packets"] = _decode_json_list(data.pop("proof_packets_json", None))
     data["reproduction_poc"] = _decode_json_dict(data.pop("reproduction_poc_json", None))
+    data["verification_plan"] = _decode_json_dict(data.pop("verification_plan_json", None))
+    data["replay_result"] = _decode_json_dict(data.pop("replay_result_json", None))
     return AuditFinding(**data)
 
 
@@ -1163,6 +1217,80 @@ def _conclude_legacy_review_intents(
         )
 
 
+def _record_variant_sweep_hint(conn, project_id: str, row) -> None:
+    """Leave a non-blocking focus hint to sweep for variants of a confirmed bug.
+
+    A real bug rarely occurs once.  Confirming one is the moment to look for the
+    same sink family elsewhere.  This is a hint (advisory), not an audit
+    candidate, so it never gates completion.  De-duplicated per finding and
+    strictly non-fatal: a failure here must not affect the review outcome.
+    """
+    try:
+        finding_id = row["id"]
+        existing = conn.execute(
+            "SELECT 1 FROM hints WHERE project_id = ? AND creator = 'variant_analysis' AND content LIKE ?",
+            (project_id, f"%{finding_id}%"),
+        ).fetchone()
+        if existing is not None:
+            return
+        location = row["file_path"] or ""
+        if row["line_start"]:
+            location = f"{location}:{row['line_start']}" if location else str(row["line_start"])
+        category = row["category"] or "该类漏洞"
+        content = (
+            f"已确认漏洞 {finding_id}（{category}，位于 {location or '见证据'}）。"
+            "请在当前快照中检索同一 sink 家族（相同危险调用、相同不安全封装、相同缺失的校验或中间件）"
+            "的其它调用点与兄弟路由，确认是否存在同类未修复问题（变体分析）。"
+        )
+        hint_id = next_hint_id(conn, project_id)
+        conn.execute(
+            """
+            INSERT INTO hints (
+                id, project_id, content, creator, created_at,
+                hint_type, target, priority, expires_at, max_uses
+            )
+            VALUES (?, ?, ?, 'variant_analysis', ?, 'focus', ?, 1, NULL, NULL)
+            """,
+            (hint_id, project_id, content, utcnow(), row["entry_point"]),
+        )
+    except Exception:
+        LOG.warning("could not record variant sweep hint project=%s", project_id, exc_info=True)
+
+
+def _report_process_steps(row, source_location: str) -> list[dict]:
+    """Provenance trail shown in the report for a confirmed finding.
+
+    Records discovery, independent review, and — when present — the server-side
+    replay verdict, so a reader can tell machine-verified evidence (server_replay
+    = confirmed) from a model-authored claim.
+    """
+    steps = [
+        {
+            "type": "audit_finding",
+            "id": row["id"],
+            "description": source_location or row["category"],
+            "worker": row["discovered_by"],
+        },
+        {
+            "type": "independent_review",
+            "id": row["id"],
+            "description": "confirmed",
+            "worker": row["reviewed_by"] or "",
+        },
+    ]
+    verdict = row["replay_verdict"] if "replay_verdict" in row.keys() else None
+    if verdict:
+        steps.append(
+            {
+                "type": "server_replay",
+                "id": row["id"],
+                "description": str(verdict),
+                "worker": "server_replay",
+            }
+        )
+    return steps
+
+
 def _sync_reportable_finding(conn, finding_id: str) -> None:
     row = conn.execute("SELECT * FROM audit_findings WHERE id = ?", (finding_id,)).fetchone()
     if row is None:
@@ -1179,20 +1307,7 @@ def _sync_reportable_finding(conn, finding_id: str) -> None:
         source_location += f":{row['line_start']}"
     if row["symbol"]:
         source_location = f"{source_location}#{row['symbol']}" if source_location else row["symbol"]
-    process = [
-        {
-            "type": "audit_finding",
-            "id": row["id"],
-            "description": source_location or row["category"],
-            "worker": row["discovered_by"],
-        },
-        {
-            "type": "independent_review",
-            "id": row["id"],
-            "description": "confirmed",
-            "worker": row["reviewed_by"] or "",
-        },
-    ]
+    process = _report_process_steps(row, source_location)
     conn.execute(
         """
         INSERT INTO vulnerabilities (

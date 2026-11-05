@@ -26,6 +26,7 @@ import csv
 import hashlib
 import io
 import json
+from types import SimpleNamespace
 import zipfile
 
 import pytest
@@ -951,6 +952,82 @@ def test_export_delivery_bundle_contains_verified_multiformat_reports(client, po
             body = archive.read(item["path"])
             assert item["size_bytes"] == len(body)
             assert item["sha256"] == hashlib.sha256(body).hexdigest()
+
+
+def test_delivery_coverage_ignores_stale_snapshot_work(temp_db):
+    from cairn.server.routers import vulnerabilities
+
+    _insert_project("snapshot-scope", "Snapshot Scope")
+    with db.get_conn() as conn:
+        conn.executemany(
+            """
+            INSERT INTO source_snapshots (
+                id, project_id, source_type, original_name, status,
+                snapshot_sha256, created_at
+            ) VALUES (?, 'snapshot-scope', 'zip', ?, 'ready', ?, ?)
+            """,
+            [
+                ("snap-old", "old.zip", "a" * 64, "2026-01-01T00:00:01Z"),
+                ("snap-new", "new.zip", "b" * 64, "2026-01-02T00:00:01Z"),
+            ],
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_candidates (
+                id, project_id, snapshot_id, source, candidate_type, severity,
+                title, description, status, created_by, created_at, updated_at
+            ) VALUES (
+                'candidate-old', 'snapshot-scope', 'snap-old', 'index',
+                'data_flow', 'high', '旧快照候选', '仅存在于旧快照', 'candidate',
+                'indexer', '2026-01-01T00:00:02Z', '2026-01-01T00:00:02Z'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO business_nodes (
+                id, project_id, node_type, title, risk_level, review_status,
+                source_snapshot_id, created_by, created_at, updated_at
+            ) VALUES (
+                'node-old', 'snapshot-scope', 'feature', '旧快照业务节点',
+                'high', 'unreviewed', 'snap-old', 'indexer',
+                '2026-01-01T00:00:02Z', '2026-01-01T00:00:02Z'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_findings (
+                id, project_id, snapshot_id, title, category, severity, status,
+                description, discovered_by, created_at
+            ) VALUES (
+                'finding-old', 'snapshot-scope', 'snap-old', '旧快照 Finding',
+                'authorization', 'high', 'pending_review', '旧版本问题',
+                'worker-old', '2026-01-01T00:00:03Z'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO report_enrichment_tasks (
+                id, project_id, finding_id, status, created_by, created_at
+            ) VALUES (
+                'report-old', 'snapshot-scope', 'finding-old', 'pending',
+                'report.auto', '2026-01-01T00:00:04Z'
+            )
+            """
+        )
+
+    coverage = vulnerabilities._load_delivery_coverage(
+        [SimpleNamespace(project_id="snapshot-scope")]
+    )
+
+    assert coverage == {
+        "open_required_candidates": 0,
+        "open_high_risk_business_nodes": 0,
+        "pending_review_findings": 0,
+        "pending_report_tasks": 0,
+    }
 
 
 # ---------------------------------------------------------------------------

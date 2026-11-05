@@ -608,6 +608,11 @@ AUDIT_FINDING_COLUMNS: dict[str, str] = {
     "business_node_id": "TEXT REFERENCES business_nodes(id) ON DELETE SET NULL",
     "proof_packets_json": "TEXT NOT NULL DEFAULT '[]'",
     "reproduction_poc_json": "TEXT NOT NULL DEFAULT '{}'",
+    # Server-side replay verification (see cairn.server.replay_validation).
+    "verification_plan_json": "TEXT NOT NULL DEFAULT '{}'",
+    "replay_verdict": "TEXT",
+    "replay_result_json": "TEXT NOT NULL DEFAULT '{}'",
+    "replay_ran_at": "TEXT",
 }
 
 BUSINESS_NODE_COLUMNS: dict[str, str] = {
@@ -854,6 +859,7 @@ def configure_product_db() -> None:
         _ensure_columns(conn, "audit_findings", AUDIT_FINDING_COLUMNS)
         _normalize_and_merge_audit_findings(conn)
         _ensure_audit_finding_indexes(conn)
+        _ensure_validation_targets(conn)
         _ensure_columns(conn, "business_nodes", BUSINESS_NODE_COLUMNS)
         _ensure_columns(
             conn,
@@ -882,6 +888,26 @@ def _ensure_audit_finding_indexes(conn) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_audit_findings_cluster
             ON audit_findings(project_id, snapshot_id, cluster_key, status)
+        """
+    )
+
+
+def _ensure_validation_targets(conn) -> None:
+    """One lab-target configuration per project for server-side replay.
+
+    ``config_json`` holds the base URL, whether state-changing methods are
+    allowed, named credential profiles, and an optional SSRF callback.  It can
+    contain operator secrets (session cookies), so it is never exposed to
+    workers and is only reachable through the authenticated product API.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS validation_targets (
+            project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+            config_json TEXT NOT NULL DEFAULT '{}',
+            updated_by TEXT,
+            updated_at TEXT NOT NULL
+        )
         """
     )
 

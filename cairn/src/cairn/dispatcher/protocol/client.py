@@ -190,6 +190,14 @@ class CairnClient:
             json=payload,
         )
 
+    def replay_finding(self, project_id: str, finding_id: str) -> ApiResult:
+        """Ask the server to replay a finding's verification plan against its lab target."""
+        return self._request_json(
+            "POST",
+            f"/api/projects/{project_id}/audit-findings/{finding_id}/replay",
+            json={},
+        )
+
     def list_audit_findings(self, project_id: str, status: str | None = None) -> list[dict[str, Any]]:
         params: dict[str, str] = {}
         if status:

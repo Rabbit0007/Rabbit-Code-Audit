@@ -633,6 +633,45 @@ def validate_project_ready_to_complete(conn: sqlite3.Connection, project_id: str
             },
         )
 
+    target_configured = conn.execute(
+        "SELECT 1 FROM validation_targets WHERE project_id = ?",
+        (project_id,),
+    ).fetchone() is not None
+    if target_configured:
+        unverified_plan_findings = conn.execute(
+            """
+            SELECT id, title, severity, file_path, entry_point
+            FROM audit_findings
+            WHERE project_id = ?
+              AND (? IS NULL OR snapshot_id = ?)
+              AND severity IN ('critical', 'high')
+              AND status = 'confirmed'
+              AND verification_plan_json IS NOT NULL
+              AND TRIM(verification_plan_json) NOT IN ('', '{}')
+              AND (replay_verdict IS NULL OR TRIM(replay_verdict) = '')
+            ORDER BY created_at, id
+            LIMIT 20
+            """,
+            (project_id, latest_snapshot_id, latest_snapshot_id),
+        ).fetchall()
+        if unverified_plan_findings:
+            raise HTTPException(
+                409,
+                {
+                    "message": "Findings with a verification plan must be replayed before completion",
+                    "audit_findings": [
+                        {
+                            "id": row["id"],
+                            "title": row["title"],
+                            "severity": row["severity"],
+                            "file_path": row["file_path"],
+                            "entry_point": row["entry_point"],
+                        }
+                        for row in unverified_plan_findings
+                    ],
+                },
+            )
+
     confirmed_high_findings = conn.execute(
         """
         SELECT id, title, severity, status, file_path, line_start, entry_point,

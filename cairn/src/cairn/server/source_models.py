@@ -243,6 +243,47 @@ CandidateStatus = Literal[
 ]
 
 
+# Oracle names a verification plan may request.  Kept in sync with
+# ``cairn.server.replay_validation.ORACLE_NAMES`` via the import below so the
+# two never drift.
+try:
+    from cairn.server.replay_validation import ORACLE_NAMES as _REPLAY_ORACLE_NAMES
+except Exception:  # pragma: no cover - replay module optional at import time
+    _REPLAY_ORACLE_NAMES = (
+        "sql_error",
+        "boolean_diff",
+        "reflected_raw",
+        "computed_marker",
+        "file_signature",
+        "redirect_host",
+        "access_control",
+        "ssrf_callback",
+    )
+
+
+def _normalize_verification_plan(value) -> dict[str, object]:
+    """Validate an optional server-replay verification plan.
+
+    A plan is advisory: it tells the server which requests to replay and which
+    program oracle should judge the responses.  It never carries results.  An
+    empty value is dropped; a malformed one is rejected so junk never reaches
+    the replay engine.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("verification_plan must be an object")
+    if not value:
+        return {}
+    oracle = value.get("oracle")
+    if oracle not in _REPLAY_ORACLE_NAMES:
+        raise ValueError(f"verification_plan.oracle must be one of {', '.join(_REPLAY_ORACLE_NAMES)}")
+    requests = value.get("requests")
+    if not isinstance(requests, dict) or not requests:
+        raise ValueError("verification_plan.requests must be a non-empty object")
+    return value
+
+
 def _normalize_reproduction_poc(value) -> dict[str, object]:
     if value is None:
         return {}
@@ -303,6 +344,10 @@ class AuditFinding(BaseModel):
     evidence: str | None = None
     proof_packets: list[dict[str, str]] = Field(default_factory=list)
     reproduction_poc: dict[str, object] = Field(default_factory=dict)
+    verification_plan: dict[str, object] = Field(default_factory=dict)
+    replay_verdict: str | None = None
+    replay_result: dict[str, object] = Field(default_factory=dict)
+    replay_ran_at: str | None = None
     remediation: str | None = None
     discovered_by: str
     reviewed_by: str | None = None
@@ -481,6 +526,7 @@ class CreateAuditFindingRequest(BaseModel):
     evidence: str | None = None
     proof_packets: list[dict[str, str]] = Field(default_factory=list)
     reproduction_poc: dict[str, object] = Field(default_factory=dict)
+    verification_plan: dict[str, object] = Field(default_factory=dict)
     remediation: str | None = None
     discovered_by: str
 
@@ -536,6 +582,11 @@ class CreateAuditFindingRequest(BaseModel):
     @classmethod
     def normalize_reproduction_poc(cls, value) -> dict[str, object]:
         return _normalize_reproduction_poc(value)
+
+    @field_validator("verification_plan")
+    @classmethod
+    def normalize_verification_plan(cls, value) -> dict[str, object]:
+        return _normalize_verification_plan(value)
 
 
 class CreateAuditCandidateRequest(BaseModel):
