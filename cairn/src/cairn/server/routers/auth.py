@@ -44,11 +44,6 @@ CAPTCHA_DURATION = timedelta(minutes=5)
 # (task 2.1) reads the token from this cookie.
 SESSION_COOKIE_NAME = "session_token"
 
-# Browsers reject or refuse to resend ``Secure`` cookies on plain HTTP. Keep the
-# production default secure, but allow local HTTP development origins to retain
-# the session cookie when the UI runs at http://127.0.0.1 or http://localhost.
-LOCAL_HTTP_COOKIE_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-
 # Timestamp format used throughout the codebase (see services.utcnow).
 _TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -105,9 +100,20 @@ def _create_session(conn, user_id: str, now: datetime, session_duration: timedel
 
 
 def cookie_secure_for_request(request: Request) -> bool:
-    """Return whether the session cookie should use the Secure attribute."""
-    host = request.url.hostname or ""
-    return not (request.url.scheme == "http" and host in LOCAL_HTTP_COOKIE_HOSTS)
+    """Return whether the session cookie should use the Secure attribute.
+
+    A ``Secure`` cookie is only stored/resent by browsers over HTTPS; set over
+    plain HTTP it is silently dropped, which breaks login (the cookie never comes
+    back, so every following request is unauthenticated). So mark the cookie
+    ``Secure`` only when the request actually arrived over HTTPS. Over HTTP — on
+    any host, whether ``localhost``, a LAN IP, or a hostname — the cookie is
+    non-Secure so the browser keeps and resends it.
+
+    Behind a TLS-terminating reverse proxy, run the app with proxy headers
+    enabled (e.g. ``uvicorn --proxy-headers``) so ``request.url.scheme`` reflects
+    the external HTTPS scheme rather than the internal HTTP hop.
+    """
+    return request.url.scheme == "https"
 
 
 def _set_session_cookie(
