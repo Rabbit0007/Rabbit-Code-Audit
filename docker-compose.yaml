@@ -28,7 +28,11 @@ services:
     ports:
       - "8765:8000"
     volumes:
-      - ${CAIRN_DATA_DIR:-${HOME}/.local/share/cairn}:/root/.local/share/cairn/
+      # Code-audit data (SQLite DB) lives in this repo's ./datas/cairn (gitignored),
+      # isolated from other cairn-based systems such as the pentest stack. Override
+      # with RABBIT_AUDIT_DATA_DIR — deliberately NOT the shared CAIRN_DATA_DIR name,
+      # and never point it at another system's data dir (e.g. ~/.local/share/cairn).
+      - ${RABBIT_AUDIT_DATA_DIR:-./datas/cairn}:/root/.local/share/cairn/
       - audit-artifacts:/Users/rabbit/.rabbit-code-audit-preview
       # Dev convenience: mount the live source tree (read-only) over the image's
       # editable install. This serves the freshly built frontend (vite output
@@ -77,7 +81,8 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./dispatch.yaml:/cairn/dispatch.yaml
-      - ${CAIRN_DATA_DIR:-${HOME}/.local/share/cairn}:/root/.local/share/cairn/
+      # Same isolated data dir as audit-server (see the comment there).
+      - ${RABBIT_AUDIT_DATA_DIR:-./datas/cairn}:/root/.local/share/cairn/
     environment:
       CAIRN_INTERNAL_TOKEN: "${CAIRN_INTERNAL_TOKEN:?Set CAIRN_INTERNAL_TOKEN for server/dispatcher API auth}"
       CAIRN_DISPATCHER_INTERNAL_API: "1"

@@ -80,6 +80,8 @@ http://127.0.0.1:8765/
 
 首次使用时在登录页注册账号，然后创建代码审计项目并导入公开 Git 仓库或 ZIP 文件。
 
+数据目录：审计系统的 SQLite 数据库默认保存在仓库内的 `datas/cairn/`（已被 `.gitignore` 忽略，不会提交），与渗透测试等其它基于 cairn 的系统相互隔离。可用 `RABBIT_AUDIT_DATA_DIR` 指定其它目录，但不要指向其它系统的数据目录（例如 cairn 通用默认目录 `~/.local/share/cairn`）。
+
 `dispatch.yaml` 默认已启用 5 个 GLM-5.3 Worker（3 个审计、1 个报告增强、1 个复核），只需提供 `GLM_API_KEY` 即可运行；需要调度联调时可改用 `dispatch_mock.yaml`。
 
 ## 本地开发
@@ -89,12 +91,14 @@ cd cairn
 uv sync
 # 业务接口默认拒绝访问：只有配置了 CAIRN_INTERNAL_TOKEN，或者用户已登录，请求才会通过。
 export CAIRN_INTERNAL_TOKEN="$(openssl rand -hex 32)"
-uv run cairn serve --host 127.0.0.1 --port 8765 --log-level info
+# 显式指定独立数据库；不加 --db-path 会落到 cairn 通用默认目录 ~/.local/share/cairn，可能与其它系统共用。
+uv run cairn serve --host 127.0.0.1 --port 8765 --log-level info --db-path ../datas/cairn/cairn.db
 ```
 
 > 如果登录后页面立刻退回登录页，说明业务接口返回了 401。升级到包含认证中间件修复的版本后，
 > 未设置 `CAIRN_INTERNAL_TOKEN` 时登录会话也可以正常访问；dispatcher 等机器客户端仍需要该 token。
 > 不要用 `CAIRN_AUTH_OPEN_MODE=1` 绕过：它会关闭业务接口的全部鉴权，仅用于自动化测试。
+> 通过局域网 IP 或主机名以 HTTP 访问时，旧版本会把会话 cookie 标记为 `Secure`，浏览器因此丢弃它，表现为“登录后点任何地方都退回登录页”；当前版本只在 HTTPS 下设置 `Secure`。
 
 前端构建：
 
